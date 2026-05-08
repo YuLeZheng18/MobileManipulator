@@ -1,0 +1,51 @@
+import os
+import time
+
+import launch
+import launch_ros
+from ament_index_python.packages import get_package_share_directory
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+
+
+def generate_launch_description():
+    package_dir = get_package_share_directory('mm_description')
+    gazebo_ros_dir = get_package_share_directory('gazebo_ros')
+    default_model_path = os.path.join(package_dir, 'urdf', 'omni_base.urdf.xacro')
+    default_world_path = os.path.join(package_dir, 'world', 'room.word')  # 恢复使用room.world文件
+
+    model_arg = launch.actions.DeclareLaunchArgument(
+        name='model',
+        default_value=default_model_path,
+        description='URDF/Xacro model path',
+    )
+
+    robot_description = launch_ros.parameter_descriptions.ParameterValue(
+        launch.substitutions.Command(['xacro ', launch.substitutions.LaunchConfiguration('model')]),
+        value_type=str,
+    )
+
+    robot_state_publisher_node = launch_ros.actions.Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        parameters=[{'robot_description': robot_description}, {'use_sim_time': True}],
+        output='screen',
+    )
+
+    gazebo = launch.actions.IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(os.path.join(gazebo_ros_dir, 'launch', 'gazebo.launch.py')),
+        launch_arguments={'world': default_world_path}.items(),
+    )
+
+    spawn_entity = launch_ros.actions.Node(
+        package='gazebo_ros',
+        executable='spawn_entity.py',
+        arguments=['-topic', '/robot_description', '-entity', 'mm_omni_base', '-x', '0.0', '-y', '0.0', '-z', '0.2'],
+        output='screen',
+    )
+
+    return launch.LaunchDescription([
+        model_arg,
+        robot_state_publisher_node,
+        gazebo,
+        spawn_entity,
+    ])

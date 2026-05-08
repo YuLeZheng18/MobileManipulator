@@ -1,0 +1,40 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 100
+    use_sim_time: true
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    front_left_wheel_controller:
+      type: velocity_controllers/JointGroupVelocityController
+    front_right_wheel_controller:
+      type: velocity_controllers/JointGroupVelocityController
+    rear_left_wheel_controller:
+      type: velocity_controllers/JointGroupVelocityController
+    rear_right_wheel_controller:
+      type: velocity_controllers/JointGroupVelocityController
+
+front_left_wheel_controller:
+  ros__parameters:
+    joints:
+      - joint_wheel1
+    interface_name: velocity
+
+front_right_wheel_controller:
+  ros__parameters:
+    joints:
+      - joint_wheel2
+    interface_name: velocity
+
+rear_left_wheel_controller:
+  ros__parameters:
+    joints:
+      - joint_wheel3
+    interface_name: velocity
+
+rear_right_wheel_controller:
+  ros__parameters:
+    joints:
+      - joint_wheel4
+    interface_name: velocity

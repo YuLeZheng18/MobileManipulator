@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:macro name="omni_base_ros2_control">
+    <ros2_control name="OmniBaseGazeboSystem" type="system">
+      <hardware>
+        <plugin>gazebo_ros2_control/GazeboSystem</plugin>
+      </hardware>
+
+      <joint name="joint_wheel1">
+        <command_interface name="velocity">
+          <param name="min">-30.0</param>
+          <param name="max">30.0</param>
+        </command_interface>
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+      </joint>
+      <joint name="joint_wheel2">
+        <command_interface name="velocity">
+          <param name="min">-30.0</param>
+          <param name="max">30.0</param>
+        </command_interface>
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+      </joint>
+      <joint name="joint_wheel3">
+        <command_interface name="velocity">
+          <param name="min">-30.0</param>
+          <param name="max">30.0</param>
+        </command_interface>
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+      </joint>
+      <joint name="joint_wheel4">
+        <command_interface name="velocity">
+          <param name="min">-30.0</param>
+          <param name="max">30.0</param>
+        </command_interface>
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+      </joint>
+    </ros2_control>
+
+    <gazebo>
+      <plugin filename="libgazebo_ros2_control.so" name="gazebo_ros2_control">
+        <parameters>$(find mm_description)/config/omni_ros2_controllers.yaml</parameters>
+        <robot_param>robot_description</robot_param>
+        <robot_param_node>robot_state_publisher</robot_param_node>
+      </plugin>
+    </gazebo>
+  </xacro:macro>
+</robot>
