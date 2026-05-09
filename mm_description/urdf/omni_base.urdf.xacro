@@ -12,9 +12,9 @@
     <color rgba="0.9 0.1 0.1 1.0"/>
   </material>
 
-  <!-- 底盘参数 - 400mm x 400mm -->
-  <xacro:property name="body_length" value="0.40"/>
-  <xacro:property name="body_width" value="0.40"/>
+  <!-- 底盘参数 - 整车投影约 400mm x 400mm -->
+  <xacro:property name="body_length" value="0.30"/>
+  <xacro:property name="body_width" value="0.30"/>
   <xacro:property name="body_height" value="0.03"/>
   
   <!-- 轮子参数 -->
@@ -41,14 +41,14 @@
       <inertia ixx="0.08" iyy="0.08" izz="0.08" ixy="0.0" ixz="0.0" iyz="0.0"/>
     </inertial>
   </link>
-
+  
   <!-- base_footprint用于TF发布 -->
   <link name="base_footprint"/>
 
   <joint name="base_footprint_joint" type="fixed">
-    <parent link="base_link"/>
-    <child link="base_footprint"/>
-    <origin xyz="0 0 -${wheel_radius}" rpy="0 0 0"/>
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 ${wheel_radius}" rpy="0 0 0"/>
   </joint>
 
   <!-- 激光雷达链接 -->
@@ -58,6 +58,13 @@
         <cylinder radius="0.04" length="0.04"/>
       </geometry>
       <material name="red"/>
+    </visual>
+    <visual>
+      <origin xyz="-0.035 0 0.015" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.025 0.09 0.03"/>
+      </geometry>
+      <material name="black"/>
     </visual>
     <collision>
       <geometry>
@@ -213,8 +220,8 @@
           <horizontal>
             <samples>720</samples>
             <resolution>1</resolution>
-            <min_angle>-3.14159</min_angle>
-            <max_angle>3.14159</max_angle>
+            <min_angle>-2.35619</min_angle>
+            <max_angle>2.35619</max_angle>
           </horizontal>
         </scan>
         <range>
@@ -236,7 +243,7 @@
   <!-- planar_move控制器 -->
   <gazebo>
     <plugin name="object_controller" filename="libgazebo_ros_planar_move.so">
-      <commandTopic>cmd_vel</commandTopic>
+      <commandTopic>cmd_vel_smoothed</commandTopic>
       <odometryTopic>odom</odometryTopic>
       <odometryFrame>odom</odometryFrame>
       <odometryRate>50.0</odometryRate>
