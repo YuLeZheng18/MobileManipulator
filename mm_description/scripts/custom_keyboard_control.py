@@ -32,13 +32,14 @@ class CustomKeyboardControl(Node):
         self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
         
         # 速度参数
-        self.linear_speed = 0.5  # 线速度 (m/s)
-        self.angular_speed = 1.0  # 角速度 (rad/s)
+        self.linear_speed = 0.15  # 线速度 (m/s)
+        self.angular_speed = 0.4  # 角速度 (rad/s)
         self.speed_step = 0.1  # 速度调整步长
         self.max_speed = 2.0
         self.min_speed = 0.1
         
         self.get_logger().info('自定义键盘控制节点已启动')
+        self.angular_step = 0.1  # 角速度调整步长
         self.get_logger().info(f'当前线速度: {self.linear_speed} m/s')
         self.get_logger().info(f'当前角速度: {self.angular_speed} rad/s')
         self.print_help()
@@ -53,6 +54,7 @@ class CustomKeyboardControl(Node):
         print('  z   s   c    - 左斜后 | 后退 | 右斜后')
         print('  ←  左旋转    →  右旋转')
         print('  ↑  加速       ↓  减速')
+        print('  +  增加角速度  -  减小角速度')
         print('  空格/其他键  - 停止')
         print('  CTRL-C       - 退出')
         print('================================\n')
@@ -107,6 +109,14 @@ class CustomKeyboardControl(Node):
                         twist.angular.z = -self.angular_speed
                     else:
                         twist = Twist()
+                elif key == '+' or key == '=':  # 增加角速度
+                    self.angular_speed = min(self.angular_speed + self.angular_step, self.max_speed)
+                    self.get_logger().info(f'角速度: {self.angular_speed:.2f} rad/s')
+                    continue
+                elif key == '-':  # 减小角速度
+                    self.angular_speed = max(self.angular_speed - self.angular_step, 0.1)
+                    self.get_logger().info(f'角速度: {self.angular_speed:.2f} rad/s')
+                    continue
                 elif key == 'w':  # 前进
                     twist.linear.x = self.linear_speed
                     twist.linear.y = 0.0

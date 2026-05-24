@@ -43,18 +43,6 @@ def generate_launch_description():
         launch_arguments={'world': default_world_path}.items(),  # 使用room.world文件
     )
 
-    cmd_vel_smoother_node = launch_ros.actions.Node(
-        package='mm_description',
-        executable='cmd_vel_smoother.py',
-        parameters=[{
-            'use_sim_time': True,
-            'linear_acceleration': 0.25,
-            'angular_acceleration': 0.6,
-            'command_timeout': 0.3,
-        }],
-        output='screen',
-    )
-
     spawn_entity = launch_ros.actions.Node(
         package='gazebo_ros',
         executable='spawn_entity.py',
@@ -67,6 +55,5 @@ def generate_launch_description():
         joint_state_publisher_node,
         robot_state_publisher_node,
         gazebo,
-        cmd_vel_smoother_node,
         spawn_entity,
     ])
