@@ -1,20 +1,18 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>mm_navigation</name>
+  <name>mm_bringup</name>
   <version>0.0.0</version>
-  <description>Mobile Manipulator Navigation Package</description>
+  <description>一键启动总包:聚合仿真/真机全栈 launch(描述、导航、MoveIt、感知、任务)。</description>
   <maintainer email="a2715187136@qq.com">fishros</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
-  <exec_depend>nav2_bringup</exec_depend>
-  <exec_depend>nav2_common</exec_depend>
-  <exec_depend>rclpy</exec_depend>
-  <exec_depend>geometry_msgs</exec_depend>
-  <exec_depend>nav2_msgs</exec_depend>
-  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>mm_description</exec_depend>
+  <exec_depend>mm_navigation</exec_depend>
+  <exec_depend>mm_perception</exec_depend>
+  <exec_depend>mm_task</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

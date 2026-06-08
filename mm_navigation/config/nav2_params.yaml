@@ -246,7 +246,7 @@ global_costmap:
 map_server:
   ros__parameters:
     use_sim_time: True
-    yaml_filename: "/home/fishros/MobileManipulator/workplace/src/mm_navigation/maps/room.yaml"
+    yaml_filename: ""
 
 map_saver:
   ros__parameters:

@@ -1,7 +1,0 @@
-<class_libraries>
-  <library path="omni_line_controller">
-    <class type="mm_navigation::OmniLineController" base_class_type="nav2_core::Controller">
-      <description>Omni straight-line patrol controller with costmap-based slowing, stopping, and local avoidance.</description>
-    </class>
-  </library>
-</class_libraries>
