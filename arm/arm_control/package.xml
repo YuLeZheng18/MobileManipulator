@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd"?>
+<package format="3">
+  <name>arm_control</name>
+  <version>1.0.0</version>
+  <description>
+    Arm control GUI package using PyQt to display joint states
+  </description>
+  <maintainer email="TODO@email.com">
+    TODO
+  </maintainer>
+  <license>BSD</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>PyQt5</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
