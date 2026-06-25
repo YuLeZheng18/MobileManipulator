@@ -122,28 +122,29 @@ controller_server:
     controller_plugins: ["FollowPath"]
 
     # Progress checker parameters
-    # 注意: SimpleProgressChecker 分不清"到点减速"和"被卡蠕动", 阈值太紧会误杀拐角前的
-    # 正常减速(GoalCritic 离终点 1.4m 就开始收速) -> 还没到拐角就 ABORT. 故设宽松安全值;
-    # "遇障要快"靠 MPPI 提前横移(ObstaclesCritic/vy) + lane_navigator 0.2s 快速重试, 不靠这里扳机.
+    # 注意: SimpleProgressChecker 分不清"到点减速/蠕动"和"被卡". 既要 xy 容差收紧(到点更准)
+    # 又接受终端蠕动, 就必须放宽时间窗, 否则收紧后最后几 cm 的低速爬行(<0.8cm/s)会在 ~3s 内
+    # 挪不够 required_movement_radius 而 ABORT -> 触发 lane_navigator 重试/重规划在终点反复打转.
+    # movement_time_allowance 3.0->10.0: 给末端蠕动充足时间走完, 不误判(代价: 真卡死要 10s 才察觉,
+    # 可接受). "遇障要快"靠 MPPI 提前横移(ObstaclesCritic/vy)绕障, 不靠这个扳机.
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
       required_movement_radius: 0.08
-      movement_time_allowance: 3.0
+      movement_time_allowance: 10.0
     # Goal checker parameters
     #precise_goal_checker:
     #  plugin: "nav2_controller::SimpleGoalChecker"
     #  xy_goal_tolerance: 0.25
     #  yaw_goal_tolerance: 0.25
     #  stateful: True
-    # xy 容差放宽到 0.25: lane_navigator 每个 leg 终点是"中间车道节点"不需精确到点,
-    # 下一段 build_leg_path 从车实际位姿重建会自动纠偏 -> 25cm 误差不累积. 这是杀
-    # "终端蠕动"(MPPI 离散节点目标 + 紧容差时最后 1cm/s 爬 12s, 还触发 progress 失败反复
-    # 重试)的关键: 车一进 25cm 圈立刻判完成、直接进下一段 spin+drive, 不再爬行.
-    # 最终目标精定位靠 ArUco 伺服(架构既定), 不依赖 nav 到点精度.
+    # xy 容差 0.25->0.10: 用户要到点位置更准, 由 MPPI 负责开到目标(不再用节点闭环平移接管).
+    # 代价是终点附近 MPPI 会低速蠕动收尾(已接受), 故上面 progress_checker 时间窗放宽到 10s
+    # 防蠕动被误判 ABORT. yaw 容差留 0.1 但终点朝向实际由 lane_navigator 的 cspin 闭环精对(~1°),
+    # 这里只作 MPPI drive 段的退出条件. 更高精定位仍与 ArUco 伺服互补.
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.25
+      xy_goal_tolerance: 0.10
       yaw_goal_tolerance: 0.1
     # MPPI 全向局部控制器: 保留横移避障, 软约束车头朝向路径方向(雷达 180° 需求)
     FollowPath:

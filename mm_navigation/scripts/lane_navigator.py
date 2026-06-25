@@ -33,7 +33,7 @@ from rclpy.duration import Duration
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
 
 from action_msgs.msg import GoalStatus
-from nav2_msgs.action import FollowPath, Spin, ComputePathToPose
+from nav2_msgs.action import FollowPath, ComputePathToPose
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped, Twist
 from std_msgs.msg import String
@@ -56,9 +56,13 @@ class LaneNavigator(Node):
         self.declare_parameter('lane_graph', '')
         # 到达判定半径(米): 触发的目标若已在此范围内, 直接忽略
         self.declare_parameter('arrival_tolerance', 0.2)
-        # 自转对齐死区(弧度): 朝向误差小于此值则跳过该 Spin. 0.5≈30°: 小误差让 MPPI 边走边
-        # 对齐(顺滑无 spin 过冲), 仅大转/掉头才预 spin, 避免 MPPI 边走边翻头 wz 顶满振荡甩头.
-        self.declare_parameter('spin_tolerance', 0.5)
+        # 起步朝向对齐(闭环 cspin): 误差 < start_yaw_tol 跳过(残差极小, 交 MPPI 边走边顺, 看不出);
+        # 否则用 P 闭环转到首段切线并"沉降"(连续几拍零速且落容差内)再放行 drive -> 保证转停稳了才跑,
+        # 杜绝"没转完就跑/起步划弧甩头". 旧版用开环 Nav2 Spin: 报完成时车身还在泄角速度, 同一拍 MPPI
+        # 已发前进 -> 残余自转+前进叠加成起步甩头; 闭环+沉降根治. 门限收到 5°(旧 28°)让中等误差也转
+        # 到位再走, 不再边跑边扭.
+        self.declare_parameter('start_yaw_tol', 0.087)   # ~5°: 起步对齐到位阈值(同时作跳过门限)
+        self.declare_parameter('start_wz_max', 0.5)      # 起步转速上限(rad/s): 比终点精对 0.4 略快, 大角度起步不肉但不甩
         # 横向并入阈值(米): 车到车道横向距离小于此值视为已在道上, 跳过垂足 Q 直连
         # 第一个车道节点 -> 一次转到位, 残余横移交 MPPI PathAlign 拉正(避免 90+90 折线掉头)
         self.declare_parameter('merge_skip_dist', 0.25)
@@ -66,18 +70,13 @@ class LaneNavigator(Node):
         # 不在拐点停车. 越大越顺但越占走廊内侧空间; 机器人半径 0.20. 0.8: 弯更缓, 进弯前
         # MPPI 高速样本不被甩出弯 -> 减速/重规划消失; 代价是占内侧 0.8m, 走廊须够宽.
         self.declare_parameter('corner_radius', 0.8)
-        # 终点闭环位姿伺服参数(cspin): drive 段在 xy_goal_tolerance(0.25m)处交棒后, 本节点读
-        # TF 真实位姿, 把"位置+yaw"一起 P 闭环精确开到目标. 全向底盘直接平移(世界系误差转车
-        # 体系 -> vx/vy), 同时转 yaw. 过冲自动反向修回 -> 精度不受底盘 cmd_vel 斜坡滞后影响,
-        # 也绕开"收紧 xy_goal_tolerance 会触发 MPPI 末端蠕动"的坑(让 MPPI 早早撒手).
-        self.declare_parameter('final_xy_tol', 0.03)     # 3cm: 终点位置到位阈值
+        # 终点 yaw 闭环对齐参数(cspin): Nav2 Spin 是开环(到点停发命令), 底盘 cmd_vel 有加速度
+        # 斜坡+惯性 -> 停发后滑过目标留残差. 改用本节点读 TF 真实 yaw 的 P 闭环, 过冲自动反向
+        # 修回, 落在 final_yaw_tol 内. (位置精度交 MPPI drive 段的 xy_goal_tolerance, 不在此处)
         self.declare_parameter('final_yaw_tol', 0.017)   # ~1°: 终点朝向到位阈值
         self.declare_parameter('cspin_kp', 1.2)          # 角 P 增益: wz = kp*yaw_err
         self.declare_parameter('cspin_wz_max', 0.4)      # 角速度上限(rad/s)
         self.declare_parameter('cspin_wz_min', 0.06)     # yaw 误差>tol 时最小转速地板, 克服静摩擦
-        self.declare_parameter('cspin_kp_lin', 1.0)      # 线 P 增益: v = kp_lin*pos_err
-        self.declare_parameter('cspin_vx_max', 0.25)     # 线速度上限(m/s), 收尾比巡航 0.36 更稳
-        self.declare_parameter('cspin_vx_min', 0.04)     # 位置误差>tol 时最小线速地板, 克服静摩擦
         self.declare_parameter('cspin_timeout', 15.0)    # 超时(秒): 防卡死, 到点放弃微调直接完成
         # drive 段失败(如动态障碍逼停)的"快重试"次数; 每次重取位姿重规划绕障路径重发
         self.declare_parameter('drive_max_retries', 3)
@@ -88,14 +87,14 @@ class LaneNavigator(Node):
         self.declare_parameter('recovery_retry_delay', 2.0)
         self.arrival_tol = self.get_parameter(
             'arrival_tolerance').get_parameter_value().double_value
-        self.spin_tol = self.get_parameter(
-            'spin_tolerance').get_parameter_value().double_value
+        self.start_yaw_tol = self.get_parameter(
+            'start_yaw_tol').get_parameter_value().double_value
+        self.start_wz_max = self.get_parameter(
+            'start_wz_max').get_parameter_value().double_value
         self.merge_skip_dist = self.get_parameter(
             'merge_skip_dist').get_parameter_value().double_value
         self.corner_radius = self.get_parameter(
             'corner_radius').get_parameter_value().double_value
-        self.final_xy_tol = self.get_parameter(
-            'final_xy_tol').get_parameter_value().double_value
         self.final_yaw_tol = self.get_parameter(
             'final_yaw_tol').get_parameter_value().double_value
         self.cspin_kp = self.get_parameter(
@@ -104,12 +103,6 @@ class LaneNavigator(Node):
             'cspin_wz_max').get_parameter_value().double_value
         self.cspin_wz_min = self.get_parameter(
             'cspin_wz_min').get_parameter_value().double_value
-        self.cspin_kp_lin = self.get_parameter(
-            'cspin_kp_lin').get_parameter_value().double_value
-        self.cspin_vx_max = self.get_parameter(
-            'cspin_vx_max').get_parameter_value().double_value
-        self.cspin_vx_min = self.get_parameter(
-            'cspin_vx_min').get_parameter_value().double_value
         self.cspin_timeout = self.get_parameter(
             'cspin_timeout').get_parameter_value().double_value
         self.drive_max_retries = self.get_parameter(
@@ -140,7 +133,6 @@ class LaneNavigator(Node):
         self.go_sub = self.create_subscription(String, 'go_to', self.on_go_to, 10)
 
         self._follow_client = ActionClient(self, FollowPath, 'follow_path')
-        self._spin_client = ActionClient(self, Spin, 'spin')
         # 堵死重规划用: 调 planner_server(Theta*) 算绕障路径
         self._planner_client = ActionClient(self, ComputePathToPose, 'compute_path_to_pose')
 
@@ -427,11 +419,11 @@ class LaneNavigator(Node):
             return
 
         # 圆角连续路径: 顶点序列倒圆角 -> 一条加密 Path(每点切线朝向). 整条当一个 drive 步骤, 拐角不停.
-        # 起步 spin 门限化(spin_tolerance≈30°): 朝向误差小 -> 跳过 spin, 交 MPPI(PathAlignCritic
-        # use_path_orientations)边走边把车头拉到路径切线, 顺滑无过冲; 误差大(如掉头出节点, 节点 yaw
-        # 与首段方向相反)-> 先一次 gentle spin 预对齐, 否则 MPPI 边走边翻 180° 会把 wz 顶到 max 来回振荡甩头.
-        # 终点用闭环 cspin 对齐目标 yaw: 读 TF 真实 yaw 做 P 控制直接发 /cmd_vel, 过冲自动
-        # 反向修回, 落在 final_yaw_tol(~1°)内 -> 不受底盘 cmd_vel 斜坡滞后影响(开环 Spin 会滑过).
+        # 起步用闭环 cspin 对齐首段切线(start_yaw_tol~5°/start_wz_max~0.8): P 闭环转到切线并沉降
+        # (连续几拍零速落容差)再放行 drive -> 转停稳了才跑, 不会没转完就被 MPPI 前进抢走而起步甩头.
+        # 终点同样用闭环 cspin 对齐目标 yaw(final_yaw_tol~1°/cspin_wz_max 0.4, 紧而稳): 读 TF 真实
+        # yaw 做 P 控制直接发 /cmd_vel, 过冲自动反向修回(开环 Spin 会被底盘斜坡滑过). 位置精度交 MPPI
+        # drive 段的 xy_goal_tolerance(收紧它=更准, 代价是终点附近 MPPI 会蠕动收尾, 已接受).
         xy = self.build_rounded_xy(pts, self.corner_radius)
         if len(xy) < 2:
             self.get_logger().info('Degenerate route, nothing to do')
@@ -441,9 +433,9 @@ class LaneNavigator(Node):
         last_heading = math.atan2(xy[-1][1] - xy[-2][1], xy[-1][0] - xy[-2][0])
         goal_xy = (pts[-1][0], pts[-1][1])
         steps = [
-            ('spin', first_heading),
+            ('cspin', first_heading, self.start_yaw_tol, self.start_wz_max),
             ('drive', path, goal_xy, last_heading),
-            ('cspin', self.nodes[target][2]),
+            ('cspin', self.nodes[target][2], self.final_yaw_tol, self.cspin_wz_max),
         ]
 
         # 可视化整条圆角路线
@@ -477,50 +469,30 @@ class LaneNavigator(Node):
             self._steps = []
             return
         step = self._steps[self._step_idx]
-        if step[0] == 'spin':
-            self.do_spin(step[1], ep)
-        elif step[0] == 'cspin':
-            self.do_cspin(step[1], ep)
+        if step[0] == 'cspin':
+            self.do_cspin(step[1], step[2], step[3], ep)
         else:
             # step = ('drive', path, goal_xy, last_heading)
             self.get_logger().info(
                 f'[step {self._step_idx}] Drive rounded route, {len(step[1].poses)} poses')
             self.follow_path(step[1], ep)
 
-    def do_spin(self, target_heading, ep):
-        pose = self.get_robot_pose()
-        if pose is None:
-            self.fail_route(ep, 'no pose for spin')
-            return
-        delta = norm_angle(target_heading - pose[2])
-        if abs(delta) < self.spin_tol:
-            # 已对齐, 跳过本步
-            self.advance_step(ep)
-            return
-        if not self._spin_client.wait_for_server(timeout_sec=2.0):
-            self.fail_route(ep, 'spin action server not available')
-            return
-        goal = Spin.Goal()
-        goal.target_yaw = float(delta)
-        goal.time_allowance = Duration(seconds=15.0).to_msg()
-        self.get_logger().info(
-            f'[step {self._step_idx}] Spin {math.degrees(delta):+.0f}deg '
-            f'-> heading {math.degrees(target_heading):.0f}deg')
-        fut = self._spin_client.send_goal_async(goal)
-        fut.add_done_callback(lambda f: self.on_goal_accept(f, ep))
-
-    def do_cspin(self, target_yaw, ep):
-        """终点 yaw 闭环对齐: 起一个 20Hz 控制定时器, 读 TF 真实 yaw 做 P 控制发 /cmd_vel,
-        过冲自动反向修回, 落入 final_yaw_tol 内连续保持几拍判完成 -> 推进下一步."""
+    def do_cspin(self, target_yaw, tol, wz_max, ep):
+        """yaw 闭环对齐(起步对首段切线 / 终点对目标 yaw 共用): 起一个 20Hz 控制定时器, 读 TF 真实
+        yaw 做 P 控制发 /cmd_vel, 过冲自动反向修回; 连续几拍落 tol 内且零速(沉降)才推进下一步
+        -> 保证"转停稳了才跑", 不会没转完就被 drive 抢走. 起步松而快(start_yaw_tol/start_wz_max),
+        终点紧而稳(final_yaw_tol/cspin_wz_max). (位置精度交 MPPI drive 段, 这里只对朝向)"""
         self._cancel_cspin_timer()
+        self._cspin_tol = tol
+        self._cspin_wzmax = wz_max
         pose = self.get_robot_pose()
-        if pose is not None and abs(norm_angle(target_yaw - pose[2])) < self.final_yaw_tol:
+        if pose is not None and abs(norm_angle(target_yaw - pose[2])) < tol:
             self.advance_step(ep)  # 已对齐, 跳过
             return
         self.get_logger().info(
-            f'[step {self._step_idx}] Closed-loop spin -> yaw {math.degrees(target_yaw):.0f}deg')
+            f'[step {self._step_idx}] Closed-loop spin -> yaw {math.degrees(target_yaw):.0f}deg '
+            f'(tol={math.degrees(tol):.0f}deg)')
         self._cspin_target = target_yaw
-        self._cspin_ep = ep
         self._cspin_t0 = self.get_clock().now()
         self._cspin_dwell = 0
         self._cspin_timer = self.create_timer(0.05, lambda: self._cspin_tick(ep))
@@ -537,7 +509,7 @@ class LaneNavigator(Node):
         err = norm_angle(self._cspin_target - pose[2])
         elapsed = (self.get_clock().now() - self._cspin_t0).nanoseconds / 1e9
         # 到位: 连续 3 拍(~0.15s)在容差内才算稳, 防过冲瞬间穿越误判
-        if abs(err) < self.final_yaw_tol:
+        if abs(err) < self._cspin_tol:
             self._cspin_dwell += 1
             self.cmd_pub.publish(Twist())
             if self._cspin_dwell >= 3:
@@ -555,7 +527,7 @@ class LaneNavigator(Node):
             self.advance_step(ep)
             return
         wz = self.cspin_kp * err
-        wz = max(-self.cspin_wz_max, min(self.cspin_wz_max, wz))
+        wz = max(-self._cspin_wzmax, min(self._cspin_wzmax, wz))
         if abs(wz) < self.cspin_wz_min:  # 误差仍超容差但 P 输出太小 -> 抬到地板克服静摩擦
             wz = math.copysign(self.cspin_wz_min, err)
         cmd = Twist()

@@ -323,29 +323,26 @@
       </geometry>
     </collision>
   </link>
-  <joint name="Joint_1" type="continuous">
+  <!-- 全向轮: planar_move 整体驱动底盘, 轮子不靠转动出力(mu=0); 改 fixed 使 MoveIt 不把其当可动关节(否则 move_group 等不到轮子 joint_states) -->
+  <joint name="Joint_1" type="fixed">
     <parent link="base_link"/>
     <child link="Link_6"/>
     <origin xyz="0.13876701 0.13896794 -0.00648044" rpy="1.57040288 0 -0.78540196"/>
-    <axis xyz="0 0 1"/>
   </joint>
-  <joint name="Joint_2" type="continuous">
+  <joint name="Joint_2" type="fixed">
     <parent link="base_link"/>
     <child link="Link_7"/>
     <origin xyz="0.13876599 -0.13892873 -0.00659893" rpy="1.56480903 0 -2.35618029"/>
-    <axis xyz="0 0 1"/>
   </joint>
-  <joint name="Joint_3" type="continuous">
+  <joint name="Joint_3" type="fixed">
     <parent link="base_link"/>
     <child link="Link_9"/>
     <origin xyz="-0.13868266 0.13899535 -0.00659888" rpy="1.56481236 0 0.78541237"/>
-    <axis xyz="0 0 1"/>
   </joint>
-  <joint name="Joint_4" type="continuous">
+  <joint name="Joint_4" type="fixed">
     <parent link="base_link"/>
     <child link="Link_10"/>
     <origin xyz="-0.13868369 -0.13890131 -0.0064805" rpy="1.57039955 0 2.3561907"/>
-    <axis xyz="0 0 1"/>
   </joint>
   <joint name="Joint_5" type="fixed">
     <parent link="base_link"/>
