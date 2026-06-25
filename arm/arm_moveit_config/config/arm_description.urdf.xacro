@@ -1,14 +1,16 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="arm_description">
     <xacro:arg name="initial_positions_file" default="initial_positions.yaml" />
+    <!-- hw: mock(默认,RViz假硬件) 或 real(实车CAN桥接,topic_based) -->
+    <xacro:arg name="hw" default="mock" />
 
-    <!-- Import arm_description urdf file -->
-    <xacro:include filename="$(find arm_description)/urdf/arm_description.urdf" />
+    <!-- Import full mobile-manipulator urdf (chassis + arm) -->
+    <xacro:include filename="$(find mm_description)/urdf/mm_robot.urdf" />
 
     <!-- Import control_xacro -->
     <xacro:include filename="arm_description.ros2_control.xacro" />
 
 
-    <xacro:arm_description_ros2_control name="FakeSystem" initial_positions_file="$(arg initial_positions_file)"/>
+    <xacro:arm_description_ros2_control name="FakeSystem" initial_positions_file="$(arg initial_positions_file)" hw="$(arg hw)"/>
 
 </robot>

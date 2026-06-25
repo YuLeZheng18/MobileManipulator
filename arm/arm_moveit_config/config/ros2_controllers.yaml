@@ -13,12 +13,12 @@ controller_manager:
 arm_controller:
   ros__parameters:
     joints:
-      - Joint_1
-      - Joint_2
-      - Joint_3
-      - Joint_4
-      - Joint_5
-      - Joint_6
+      - Joint_11
+      - Joint_12
+      - Joint_13
+      - Joint_14
+      - Joint_15
+      - Joint_16
     command_interfaces:
       - position
     state_interfaces:

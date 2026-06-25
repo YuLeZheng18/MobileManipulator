@@ -22,8 +22,8 @@ def generate_launch_description():
     )
 
     joint_state_publisher_node = launch_ros.actions.Node(
-        package='joint_state_publisher',
-        executable='joint_state_publisher',
+        package='joint_state_publisher_gui',
+        executable='joint_state_publisher_gui',
     )
 
     robot_state_publisher_node = launch_ros.actions.Node(

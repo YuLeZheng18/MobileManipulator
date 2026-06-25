@@ -14,7 +14,9 @@ endif()
 install(DIRECTORY launch maps config
   DESTINATION share/${PROJECT_NAME}
 )
-install(PROGRAMS scripts/waypoint_patrol.py
+install(PROGRAMS
+  scripts/waypoint_patrol.py
+  scripts/lane_navigator.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

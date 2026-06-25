@@ -20,6 +20,12 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}/
 )
 
+# 安装meshes文件
+install(DIRECTORY
+  meshes
+  DESTINATION share/${PROJECT_NAME}/
+)
+
 # 安装config文件
 install(DIRECTORY
   config

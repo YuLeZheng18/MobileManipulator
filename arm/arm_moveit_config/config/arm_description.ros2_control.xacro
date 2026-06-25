@@ -1,52 +1,62 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
-    <xacro:macro name="arm_description_ros2_control" params="name initial_positions_file">
+    <!-- hw: mock = mock_components(纯RViz假硬件); real = 实车 topic_based(CAN桥接) -->
+    <xacro:macro name="arm_description_ros2_control" params="name initial_positions_file hw:=^mock">
         <xacro:property name="initial_positions" value="${load_yaml(initial_positions_file)['initial_positions']}"/>
 
         <ros2_control name="${name}" type="system">
             <hardware>
-                <!-- By default, set up controllers for simulation. This won't work on real hardware -->
-                <plugin>mock_components/GenericSystem</plugin>
+                <xacro:if value="${hw == 'real'}">
+                    <!-- 实车: JTC 把 100Hz 稠密位置流发到 joint_commands_topic, CAN桥接节点订阅发0xFD;
+                         桥接节点读CAN反馈发到 joint_states_topic 供闭环. 名字映射 Joint_11~16<->电机1~6 在桥接节点里做. -->
+                    <plugin>topic_based_ros2_control/TopicBasedSystem</plugin>
+                    <param name="joint_commands_topic">/arm_joint_commands</param>
+                    <param name="joint_states_topic">/arm_joint_states</param>
+                </xacro:if>
+                <xacro:unless value="${hw == 'real'}">
+                    <!-- mock: 仅 RViz 演示, 无物理 -->
+                    <plugin>mock_components/GenericSystem</plugin>
+                </xacro:unless>
             </hardware>
-            <joint name="Joint_1">
+            <joint name="Joint_11">
                 <command_interface name="position"/>
                 <state_interface name="position">
-                  <param name="initial_value">${initial_positions['Joint_1']}</param>
+                  <param name="initial_value">${initial_positions['Joint_11']}</param>
                 </state_interface>
                 <state_interface name="velocity"/>
             </joint>
-            <joint name="Joint_2">
+            <joint name="Joint_12">
                 <command_interface name="position"/>
                 <state_interface name="position">
-                  <param name="initial_value">${initial_positions['Joint_2']}</param>
+                  <param name="initial_value">${initial_positions['Joint_12']}</param>
                 </state_interface>
                 <state_interface name="velocity"/>
             </joint>
-            <joint name="Joint_3">
+            <joint name="Joint_13">
                 <command_interface name="position"/>
                 <state_interface name="position">
-                  <param name="initial_value">${initial_positions['Joint_3']}</param>
+                  <param name="initial_value">${initial_positions['Joint_13']}</param>
                 </state_interface>
                 <state_interface name="velocity"/>
             </joint>
-            <joint name="Joint_4">
+            <joint name="Joint_14">
                 <command_interface name="position"/>
                 <state_interface name="position">
-                  <param name="initial_value">${initial_positions['Joint_4']}</param>
+                  <param name="initial_value">${initial_positions['Joint_14']}</param>
                 </state_interface>
                 <state_interface name="velocity"/>
             </joint>
-            <joint name="Joint_5">
+            <joint name="Joint_15">
                 <command_interface name="position"/>
                 <state_interface name="position">
-                  <param name="initial_value">${initial_positions['Joint_5']}</param>
+                  <param name="initial_value">${initial_positions['Joint_15']}</param>
                 </state_interface>
                 <state_interface name="velocity"/>
             </joint>
-            <joint name="Joint_6">
+            <joint name="Joint_16">
                 <command_interface name="position"/>
                 <state_interface name="position">
-                  <param name="initial_value">${initial_positions['Joint_6']}</param>
+                  <param name="initial_value">${initial_positions['Joint_16']}</param>
                 </state_interface>
                 <state_interface name="velocity"/>
             </joint>

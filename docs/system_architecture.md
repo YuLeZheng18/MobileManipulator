@@ -81,8 +81,8 @@ move_group    订阅 /joint_states + 规划场景 → 输出规划轨迹
 
 ### 感知(队友,见 interface_contract.md)
 ```
-/perception/grasp_pose   PoseStamped  ← 盒子识别 → 你的 MoveIt 抓取订阅
-aruco_<id> 的 TF                       ← 车体相机 → 你的定位/对位用
+/perception/object_pose  PoseStamped  ← 盒子识别(顶面中心+yaw, 4-DOF top-down) → MoveIt 抓取订阅
+aruco_<id> 的 TF                       ← 车体相机(Link_13) → 你的定位/对位用
 ```
 
 ### 任务层 mm_task 编排
@@ -195,7 +195,7 @@ STM32 发布:
 ```
 mm_task: ArUco初始化 → /initialpose 给 AMCL
 mm_task: goToPose(货架) → Nav2 → /cmd_vel → 底盘 → 到位
-mm_task: 触发感知 → /perception/grasp_pose
+mm_task: 触发感知 → /perception/object_pose
 mm_task: setPoseTarget → MoveIt 规划执行 → 气泵吸 → 放 tray
 mm_task: goToPose(目标货架) → 放下 → 循环
 ```

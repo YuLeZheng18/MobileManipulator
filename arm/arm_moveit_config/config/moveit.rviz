@@ -19,6 +19,12 @@ Visualization Manager:
         Loop Animation: true
         State Display Time: 0.05 s
         Trajectory Topic: display_planned_path
+      Planning Request:
+        Planning Group: arm
+        Interactive Marker Size: 0.2
+        Query Start State: false
+        Query Goal State: true
+        Show Workspace: false
       Planning Scene Topic: monitored_planning_scene
       Robot Description: robot_description
       Scene Geometry:

@@ -1,0 +1,112 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="mm_robot">
+    <!-- 整车 CAD 几何 (底盘+4轮+机械臂, 含烘焙初始姿态P) -->
+    <xacro:include filename="$(find mm_description)/urdf/mm_robot.urdf"/>
+
+    <!-- 机械臂 ros2_control (GazeboSystem) + gazebo_ros2_control 插件 -->
+    <xacro:include filename="$(find mm_description)/urdf/mm_arm_ros2_control_gazebo.xacro"/>
+    <xacro:mm_arm_ros2_control_gazebo/>
+
+    <!-- 全向底盘 planar_move 控制器: 接收 cmd_vel, 发布 odom 和 odom->base_link TF -->
+    <gazebo>
+        <plugin name="object_controller" filename="libgazebo_ros_planar_move.so">
+            <!-- 底盘改订 cmd_vel_smoothed: 所有速度指令(nav2 Drive + behavior Spin)都先经
+                 cmd_vel_smoother 做加速度限幅再到电机. 因自研电机为速度环闭环、无加减速斜坡,
+                 加减速整形只能在上位机这一级做(否则 Spin 起转 0->0.45 阶跃直接打到电机). -->
+            <ros>
+                <remapping>cmd_vel:=cmd_vel_smoothed</remapping>
+            </ros>
+            <!-- ROS2 只认 snake_case; topic 默认即 cmd_vel / odom -->
+            <odometry_frame>odom</odometry_frame>
+            <robot_base_frame>base_link</robot_base_frame>
+            <odometry_rate>50.0</odometry_rate>
+            <publish_odom>true</publish_odom>
+            <publish_odom_tf>true</publish_odom_tf>
+        </plugin>
+    </gazebo>
+
+    <!-- ===== 方案A: 走直+防漂方案 =====
+         真实 Omni 轮靠轮缘滚子侧向自由滑动; 但 URDF 里四轮是普通 continuous 轮,
+         分布在底盘四角, planar_move 平移时各轮接触力不对称 -> 产生偏转力矩 -> 车走偏.
+         解法: 四轮 mu=0 消除其切向力矩, 改由一个"居中对称"的贴地碰撞块 (base_pad)
+         提供水平静摩擦约束. pad 居中, 平移时摩擦均匀, 不产生偏转; 静止时摩擦压住质心偏移
+         引起的蠕动, 故车走直且静止不漂. 自转转速由 Nav2 controller/velocity_smoother 参数决定. -->
+
+    <!-- 居中贴地碰撞块: base_link 原点离地约 0.0476m, pad 厚 0.02m, 中心 z=-0.0376 使底面贴地 -->
+    <link name="base_pad">
+        <inertial>
+            <mass value="0.01"/>
+            <inertia ixx="1e-5" ixy="0" ixz="0" iyy="1e-5" iyz="0" izz="1e-5"/>
+        </inertial>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0"/>
+            <geometry>
+                <box size="0.03 0.03 0.02"/>
+            </geometry>
+        </collision>
+    </link>
+    <joint name="base_pad_joint" type="fixed">
+        <parent link="base_link"/>
+        <child link="base_pad"/>
+        <origin xyz="0 0 -0.0376" rpy="0 0 0"/>
+    </joint>
+
+    <!-- pad: 高摩擦但缩成中心小块(0.03x0.03). 抗漂移靠摩擦力 mu*N(与面积无关),
+         阻转靠摩擦力矩 ~mu*N*接触半径(与尺寸成正比). 大 pad(0.26)把自转力矩放大约30倍
+         压死转速; 缩到中心小块后抗漂移力不变, 阻转力矩趋近0 -> 既不漂又能原地自转.
+         防侧翻由四轮法向支撑保证(与 mu 无关). -->
+    <gazebo reference="base_pad">
+        <mu1>1.0</mu1>
+        <mu2>1.0</mu2>
+    </gazebo>
+
+    <!-- 四轮零摩擦: 消除四角不对称切向力矩, 只保留视觉与法向支撑 -->
+    <xacro:macro name="wheel_frictionless" params="link">
+        <gazebo reference="${link}">
+            <mu1>0.0</mu1>
+            <mu2>0.0</mu2>
+        </gazebo>
+    </xacro:macro>
+    <xacro:wheel_frictionless link="Link_6"/>
+    <xacro:wheel_frictionless link="Link_7"/>
+    <xacro:wheel_frictionless link="Link_9"/>
+    <xacro:wheel_frictionless link="Link_10"/>
+
+    <!-- 雷达 sensor: 挂在整车雷达 link (Link_12). Link_12 在 base_link 中 X=前/Y=右/Z=下,
+         扫描平面水平、0°对准车头; Z 朝下只影响角度手性, frame_id=Link_12 + TF 自洽.
+         ±150°(总300°) 盲区落在车后. (参数移植自旧 omni_base.urdf.xacro) -->
+    <gazebo reference="Link_12">
+        <sensor name="lidar_sensor" type="ray">
+            <pose>0 0 0 0 0 0</pose>
+            <visualize>true</visualize>
+            <update_rate>10</update_rate>
+            <ray>
+                <scan>
+                    <horizontal>
+                        <samples>1200</samples>
+                        <resolution>1</resolution>
+                        <min_angle>-2.61799</min_angle>
+                        <max_angle>2.61799</max_angle>
+                    </horizontal>
+                </scan>
+                <range>
+                    <min>0.12</min>
+                    <max>25.0</max>
+                    <resolution>0.01</resolution>
+                </range>
+                <noise>
+                    <type>gaussian</type>
+                    <mean>0.0</mean>
+                    <stddev>0.01</stddev>
+                </noise>
+            </ray>
+            <plugin name="laser_plugin" filename="libgazebo_ros_ray_sensor.so">
+                <ros>
+                    <remapping>~/out:=scan</remapping>
+                </ros>
+                <output_type>sensor_msgs/LaserScan</output_type>
+                <frame_name>Link_12</frame_name>
+            </plugin>
+        </sensor>
+    </gazebo>
+</robot>

@@ -18,6 +18,7 @@ setup(
     entry_points={
         'console_scripts': [
             'joint_gui = arm_control.joint_gui:main',
+            'can_bridge = arm_control.can_bridge:main',
         ],
     },
 )

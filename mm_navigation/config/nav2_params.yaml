@@ -6,7 +6,7 @@ amcl:
     alpha3: 0.05
     alpha4: 0.05
     alpha5: 0.05
-    base_frame_id: "base_footprint"
+    base_frame_id: "base_link"
     beam_skip_distance: 0.5
     beam_skip_error_threshold: 0.9
     beam_skip_threshold: 0.3
@@ -116,60 +116,129 @@ controller_server:
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
-    failure_tolerance: 5.0
+    failure_tolerance: 1.5
     progress_checker_plugin: "progress_checker"
     goal_checker_plugins: ["general_goal_checker"] # "precise_goal_checker"
     controller_plugins: ["FollowPath"]
 
     # Progress checker parameters
+    # 注意: SimpleProgressChecker 分不清"到点减速"和"被卡蠕动", 阈值太紧会误杀拐角前的
+    # 正常减速(GoalCritic 离终点 1.4m 就开始收速) -> 还没到拐角就 ABORT. 故设宽松安全值;
+    # "遇障要快"靠 MPPI 提前横移(ObstaclesCritic/vy) + lane_navigator 0.2s 快速重试, 不靠这里扳机.
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.05
-      movement_time_allowance: 8.0
+      required_movement_radius: 0.08
+      movement_time_allowance: 3.0
     # Goal checker parameters
     #precise_goal_checker:
     #  plugin: "nav2_controller::SimpleGoalChecker"
     #  xy_goal_tolerance: 0.25
     #  yaw_goal_tolerance: 0.25
     #  stateful: True
+    # xy 容差放宽到 0.25: lane_navigator 每个 leg 终点是"中间车道节点"不需精确到点,
+    # 下一段 build_leg_path 从车实际位姿重建会自动纠偏 -> 25cm 误差不累积. 这是杀
+    # "终端蠕动"(MPPI 离散节点目标 + 紧容差时最后 1cm/s 爬 12s, 还触发 progress 失败反复
+    # 重试)的关键: 车一进 25cm 圈立刻判完成、直接进下一段 spin+drive, 不再爬行.
+    # 最终目标精定位靠 ArUco 伺服(架构既定), 不依赖 nav 到点精度.
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.15
-      yaw_goal_tolerance: 1.57
-    # DWB omnidirectional local controller with small angular velocity and recovery
+      xy_goal_tolerance: 0.25
+      yaw_goal_tolerance: 0.1
+    # MPPI 全向局部控制器: 保留横移避障, 软约束车头朝向路径方向(雷达 180° 需求)
     FollowPath:
-      plugin: "dwb_core::DWBLocalPlanner"
-      debug_trajectory_details: true
-      min_vel_x: -0.36
-      min_vel_y: -0.36
-      max_vel_x: 0.36
-      max_vel_y: 0.36
-      max_vel_theta: 0.35
-      min_speed_xy: 0.12
-      max_speed_xy: 0.36
-      min_speed_theta: 0.0
-      acc_lim_x: 2.5
-      acc_lim_y: 2.5
-      acc_lim_theta: 1.2
-      decel_lim_x: -2.5
-      decel_lim_y: -2.5
-      decel_lim_theta: -1.2
-      vx_samples: 9
-      vy_samples: 9
-      vtheta_samples: 7
-      sim_time: 1.2
-      linear_granularity: 0.03
-      angular_granularity: 0.025
+      plugin: "nav2_mppi_controller::MPPIController"
+      time_steps: 56
+      model_dt: 0.05
+      batch_size: 2000
+      vx_std: 0.2
+      vy_std: 0.2
+      wz_std: 0.4
+      vx_max: 0.36
+      vx_min: -0.36
+      vy_max: 0.36
+      wz_max: 1.0
+      iteration_count: 1
+      prune_distance: 1.7
       transform_tolerance: 0.2
-      xy_goal_tolerance: 0.15
-      trans_stopped_velocity: 0.01
-      short_circuit_trajectory_evaluation: true
-      stateful: true
-      critics: ["Oscillation", "BaseObstacle", "PathDist", "GoalDist"]
-      BaseObstacle.scale: 0.05
-      PathDist.scale: 48.0
-      GoalDist.scale: 22.0
+      temperature: 0.3
+      gamma: 0.015
+      motion_model: "Omni"
+      visualize: false
+      reset_period: 1.0
+      TrajectoryVisualizer:
+        trajectory_step: 5
+        time_step: 3
+      AckermannConstraints:
+        min_turning_r: 0.2
+      # 朝向双保险: PathAlignCritic(use_path_orientations) 软锁车头到路径 pose 朝向(=本段
+      # 车道方向); PathAngleCritic(大死区)给"朝目标方向前进"的方向承诺, 防止 MPPI 在含后退段
+      # 的路径上把"原地不动"当最优而冻结. 死区放大 -> 容忍横移绕障, 只在车头偏太多才纠正,
+      # 故绕障仍是定向横移、不跟绕障曲线拐头.
+      critics: ["ConstraintCritic", "ObstaclesCritic", "GoalCritic", "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic", "PathAngleCritic", "TwirlingCritic"]
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+      GoalCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 0.6
+      GoalAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 9.0
+        threshold_to_consider: 0.8
+      # repulsion_weight 决定"靠近软膨胀就减速躲"的强度: 太大 -> 沿墙正常行驶也被拽慢.
+      # 调回小值让车不怕墙的软膨胀; 真碰撞由 critical_weight/collision_margin 兜底(保留).
+      # 把路径推离障碍交给"全局 costmap 大膨胀", 不靠这里(两套 costmap 职责分离).
+      ObstaclesCritic:
+        enabled: true
+        cost_power: 1
+        repulsion_weight: 0.2
+        critical_weight: 20.0
+        consider_footprint: false
+        collision_cost: 10000.0
+        collision_margin_distance: 0.08
+        near_goal_distance: 0.5
+        inflation_radius: 0.22
+        cost_scaling_factor: 8.0
+      PathAlignCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 18.0
+        max_path_occupancy_ratio: 0.05
+        trajectory_point_step: 4
+        threshold_to_consider: 0.5
+        offset_from_furthest: 20
+        use_path_orientations: true
+      # threshold_to_consider 必须 >= GoalCritic.threshold(0.6), 否则出现"死区":
+      # 离终点 0.6~1.4m 时 PathFollow 已关、GoalCritic 还没开 -> 没有任何 critic 推前进,
+      # MPPI 退化成 ~1.5cm/s 蠕动并触发 progress 失败反复重规划(曾导致"没到拐角就卡死").
+      # 设 0.5(< GoalCritic 0.6)使两者首尾相接无缝衔接: 远处 PathFollow 推进, 近终点 GoalCritic 接管减速.
+      PathFollowCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 11.0
+        offset_from_furthest: 5
+        threshold_to_consider: 0.5
+      # 方向承诺(防冻结)+ 横移容忍: mode 0(FORWARD_PREFERRED)看"到最远路径点的方向",
+      # 给"沿路径向目标前进"的承诺 -> 含后退段的路径也不会被优化器判成"原地不动最省".
+      # max_angle_to_furthest 放大到 1.0(~57° 死区): 车头在 ±57° 内不罚 -> 横移绕障被容忍,
+      # 只有偏太多才扳车头(锁头主力仍是 PathAlignCritic use_path_orientations).
+      PathAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 6.0
+        offset_from_furthest: 4
+        threshold_to_consider: 0.5
+        max_angle_to_furthest: 1.0
+        mode: 0
+      TwirlingCritic:
+        enabled: true
+        twirling_cost_power: 1
+        twirling_cost_weight: 0.5
 
 local_costmap:
   local_costmap:
@@ -185,10 +254,12 @@ local_costmap:
       resolution: 0.05
       robot_radius: 0.20
       plugins: ["obstacle_layer", "inflation_layer"]
+      # 局部膨胀只需 ≥ robot_radius(0.20) 防蹭即可; 大了会让沿墙行驶持续吃高代价而减速.
+      # (推离障碍由全局 costmap 大膨胀负责, 见下方 global_costmap)
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.5
-        inflation_radius: 0.24
+        cost_scaling_factor: 8.0
+        inflation_radius: 0.22
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -237,10 +308,13 @@ global_costmap:
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True
+      # 给 NavFn 用: 大半径 + 平缓梯度(cost_scaling 小=代价随距离衰减慢=高代价区更宽),
+      # 让低代价"谷底"落在走廊中线 -> NavFn 沿谷底走, 路径居中、离障碍远.
+      # (cost_scaling 越大梯度越陡, 障碍旁很快归零, 路径反而能贴障 -> 故这里调小)
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.55
+        cost_scaling_factor: 2.5
+        inflation_radius: 0.45
       always_send_full_costmap: True
 
 map_server:
@@ -261,6 +335,9 @@ planner_server:
     expected_planner_frequency: 20.0
     use_sim_time: True
     planner_plugins: ["GridBased"]
+    # 换 NavFn(Dijkstra): 沿代价场梯度走, 天然往低代价(走廊中间)靠 -> 路径离障碍远;
+    # 不像 Theta* 任意角切角贴障. 配合下方全局膨胀梯度调缓, 居中效果更明显.
+    # 保留 plugin id "GridBased" 不变, lane_navigator 的 planner_id='GridBased' 无需改.
     GridBased:
       plugin: "nav2_navfn_planner/NavfnPlanner"
       tolerance: 0.5
@@ -298,9 +375,13 @@ behavior_server:
     transform_tolerance: 0.1
     use_sim_time: true
     simulate_ahead_time: 2.0
-    max_rotational_vel: 0.45
-    min_rotational_vel: 0.15
-    rotational_acc_lim: 1.0
+    # 放缓 Spin: 底盘 cmd_vel 有 ~1s 平滑滞后, Spin 开环急刹时车身惯性会过冲目标 yaw ~10-15°,
+    # 终点没有 MPPI 接管 -> 过冲量直接留成终点 yaw 误差. 降低终端转速 0.45->0.25 使过冲
+    # 按 (0.25/0.45)^2 ≈ 1/3 衰减; acc_lim 1.0->0.5 让收尾减速更缓; min 0.15->0.10 留出
+    # 低速爬到位的余量, 不被速度地板顶着过冲. 代价: 每次终点对齐多花 ~0.5s.
+    max_rotational_vel: 0.25
+    min_rotational_vel: 0.10
+    rotational_acc_lim: 0.5
 
 robot_state_publisher:
   ros__parameters:
@@ -312,14 +393,14 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.36, 0.36, 0.3]
-    min_velocity: [-0.36, -0.36, -0.3]
-    max_accel: [2.5, 2.5, 1.0]
-    max_decel: [-2.5, -2.5, -1.0]
+    max_velocity: [0.36, 0.36, 1.0]
+    min_velocity: [-0.36, -0.36, -1.0]
+    max_accel: [2.5, 2.5, 2.0]
+    max_decel: [-2.5, -2.5, -2.0]
     odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
-    velocity_timeout: 1.0
+    velocity_timeout: 0.2
 
 waypoint_follower:
   ros__parameters:
