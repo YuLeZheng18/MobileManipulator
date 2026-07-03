@@ -70,10 +70,15 @@ class CanBridge(Node):
         # per-motor speed 覆盖(电机内部0xFD的speed字段). 空=用~/.robot_arm_config.json的SPEEDS.
         # 用途: J3减速比最低、每帧位移最小, 默认speed=150相对太快导致"瞬冲+空等"走停, 在此调低.
         self.declare_parameter('motor_speeds', [0, 0, 0, 0, 0, 0])
+        # 发送死区(度): 目标相对上次实发变化<此值的电机不重发.
+        # 目的: 轨迹到位后目标静止时停发, 不再对已到位电机每帧重启梯形规划器
+        # (会触发堵转保护锁死), 同时让查询帧恢复->反馈不再饿死. 对齐 joint_gui「动时发/停时静」.
+        self.declare_parameter('send_deadband_deg', 0.05)
 
         command_topic = self.get_parameter('command_topic').value
         state_topic = self.get_parameter('state_topic').value
         speeds_override = list(self.get_parameter('motor_speeds').value)
+        self._send_deadband_deg = float(self.get_parameter('send_deadband_deg').value)
         # PCAN 通道是 ctypes TPCANHandle, 不适合做 ROS 参数, 直接用常量(与 joint_gui.py 一致)
         self.can_channel = PCAN_USBBUS1
         self.send_rate = float(self.get_parameter('send_rate_hz').value)
@@ -95,6 +100,8 @@ class CanBridge(Node):
         self._can_tx_lock = Lock()
         # 当前目标(度), None 表示尚未收到命令, 不主动驱动电机
         self._target_deg: Optional[list] = None
+        # 上次实际发出的目标(度), None 表示还没发过; 用于死区判重, 静止目标不重发
+        self._last_sent: Optional[list] = None
         # 电机反馈位置(度)
         self._motor_deg = [0.0] * MOTOR_COUNT
 
@@ -173,18 +180,27 @@ class CanBridge(Node):
         period = 1.0 / self.send_rate if self.send_rate > 0 else 0.01
         while self._running:
             target = self._target_or_none()
-            if target is not None and self.can.is_open:
-                # 复刻 joint_gui 的总线纪律, 但电机间隔大幅缩短以提高发送频率:
-                # 防 00 EE 的关键是 _query_paused(发位置时总线无查询帧插入), 不是电机间 sleep.
-                # 电机间隔仅保留 1ms 防 PCAN 队列瞬时溢出; 提频是为了跟上 JTC 100Hz 稠密流, 消除台阶抖.
+            # 仅在目标相对上次实发有变化时才发一轮; 目标静止(轨迹已到位)则整轮跳过,
+            # 既不重启已到位电机的梯形规划器(防堵转锁死), 也不占用总线(查询帧得以恢复->反馈不饿死).
+            if target is not None and self.can.is_open and self._target_changed(target):
+                # 帧构造与总线纪律完全不变: 发位置期间 _query_paused 挡住查询帧插入双帧中间(防 00 EE),
+                # 电机间隔 1ms 防 PCAN 队列瞬时溢出.
                 self._query_paused = True
                 try:
                     for i in range(MOTOR_COUNT):
                         self._send_position_command(i + 1, target[i])
                         time.sleep(0.001)
+                    self._last_sent = list(target)
                 finally:
                     self._query_paused = False
             time.sleep(period)
+
+    def _target_changed(self, target) -> bool:
+        """任一电机目标相对上次实发变化超过死区即需要重发; 首次(未发过)必发."""
+        if self._last_sent is None:
+            return True
+        return any(abs(target[i] - self._last_sent[i]) > self._send_deadband_deg
+                   for i in range(MOTOR_COUNT))
 
     # ---------- 0xFD 梯形位置模式 (joint_gui 验证过的基线协议) ----------
     def _send_position_command(self, motor_id: int, position_deg: float) -> bool:

@@ -29,8 +29,10 @@ joint_limits:
     has_acceleration_limits: false
     max_acceleration: 0.0
   Joint_15:
+    # J5 电机到物理极限, 跟不上 0.8rad/s 同步 -> 压低上限, 让 JTC 把全臂放慢到 J5 节奏一起到位.
+    # 太慢就往上加(0.6->0.7...), 还垫底就再降. 配合 launch motor_speeds[4] 巡航.
     has_velocity_limits: true
-    max_velocity: 1.0
+    max_velocity: 0.6
     has_acceleration_limits: false
     max_acceleration: 0.0
   Joint_16:
