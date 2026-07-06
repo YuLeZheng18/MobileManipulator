@@ -23,12 +23,22 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from sensor_msgs.msg import JointState
+from ament_index_python.packages import get_package_share_directory, PackageNotFoundError
 
 from .can_interface import CANInterface
 from .PCANBasic import PCAN_USBBUS1, PCAN_BAUD_500K
 
 
-CONFIG_PATH = os.path.expanduser('~/.robot_arm_config.json')
+# 标定以仓库内 config 为唯一真源, 团队拉取即一致; home 文件仅作缺失兜底
+HOME_CONFIG_PATH = os.path.expanduser('~/.robot_arm_config.json')
+
+
+def _repo_config_path():
+    try:
+        return os.path.join(
+            get_package_share_directory('arm_control'), 'config', 'robot_arm_config.json')
+    except PackageNotFoundError:
+        return None
 
 # MoveIt/JTC 关节名 (Joint_11~16) 按顺序映射到电机 1~6
 MOVEIT_JOINT_NAMES = ['Joint_11', 'Joint_12', 'Joint_13', 'Joint_14', 'Joint_15', 'Joint_16']
@@ -45,17 +55,20 @@ class MotorConfig:
         self.load()
 
     def load(self):
-        if not os.path.exists(CONFIG_PATH):
-            return
-        try:
-            with open(CONFIG_PATH, 'r') as f:
-                data = json.load(f)
-            self.REDUCTION_RATIOS = data.get('reduction_ratios', self.REDUCTION_RATIOS)
-            self.DIRECTION_MAP = data.get('direction_map', self.DIRECTION_MAP)
-            self.SPEEDS = data.get('speeds', self.SPEEDS)
-            self.ACCELERATIONS = data.get('accelerations', self.ACCELERATIONS)
-        except Exception:
-            pass
+        # 优先级: 仓库 config > home 兜底 > 硬编码默认. 读到任一份即停.
+        for path in (_repo_config_path(), HOME_CONFIG_PATH):
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                self.REDUCTION_RATIOS = data.get('reduction_ratios', self.REDUCTION_RATIOS)
+                self.DIRECTION_MAP = data.get('direction_map', self.DIRECTION_MAP)
+                self.SPEEDS = data.get('speeds', self.SPEEDS)
+                self.ACCELERATIONS = data.get('accelerations', self.ACCELERATIONS)
+                return
+            except Exception:
+                continue
 
 
 class CanBridge(Node):

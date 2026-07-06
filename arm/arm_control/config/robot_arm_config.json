@@ -1,0 +1,34 @@
+{
+  "reduction_ratios": [
+    50.0,
+    50.0,
+    30.0,
+    82.67,
+    62.5,
+    27.0
+  ],
+  "direction_map": [
+    true,
+    true,
+    false,
+    false,
+    false,
+    false
+  ],
+  "speeds": [
+    250,
+    250,
+    150,
+    250,
+    250,
+    135
+  ],
+  "accelerations": [
+    500,
+    500,
+    500,
+    500,
+    500,
+    500
+  ]
+}

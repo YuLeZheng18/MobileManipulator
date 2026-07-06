@@ -7,6 +7,7 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/arm_control']),
         ('share/arm_control', ['package.xml']),
+        ('share/arm_control/config', ['config/robot_arm_config.json']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
