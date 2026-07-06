@@ -7,7 +7,7 @@ from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description():
     package_dir = get_package_share_directory('mm_description')
-    default_model_path = os.path.join(package_dir, 'urdf', 'omni_base.urdf.xacro')
+    default_model_path = os.path.join(package_dir, 'urdf', 'mm_robot.urdf')
     default_rviz_config_path = os.path.join(package_dir, 'config', 'rviz', 'display_model.rviz')
 
     model_arg = launch.actions.DeclareLaunchArgument(

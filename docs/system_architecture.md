@@ -207,3 +207,91 @@ mm_task: 触发感知 → /perception/object_pose
 mm_task: setPoseTarget → MoveIt 规划执行 → 气泵吸 → 放 tray
 mm_task: goToPose(目标货架) → 放下 → 循环
 ```
+
+---
+
+## 7. 真机全链路启动顺序与状态机(施工图)
+
+> 与第 6 节仿真侧对应。核心纪律:**严格自底向上启动,上层依赖下层的话题/TF/action 已就绪,状态机永远最后起。**
+
+### 7.1 启动顺序(六阶段)
+
+**阶段 A — 硬件层桥接(最先,其它都依赖它)**
+```
+1. micro_ros_agent (Jetson 上)   ← 起了它,ESP32 的 micro-ROS client 才连入 ROS 图
+     ESP32 节点这才可见:订阅 /cmd_vel、气泵 I/O;发布 /wheel_odom、/imu、/battery
+     注:ESP32 固件上电即跑,但不 agent 先行则话题不可见,不需要单独 run 固件
+2. CAN 驱动桥 (arm_control/can_bridge)   连机械臂 CAN 总线 → 暴露 ros2_control 硬件接口
+```
+
+**阶段 B — 传感器驱动**
+```
+3. rplidar_ros        → /scan
+4. RGB 相机驱动        → /camera/color/image_raw + /camera/color/camera_info
+5. 深度相机驱动        → /camera/depth/...(点云,eye-in-hand 抓取用)
+   (车体 ArUco 相机 Link_13 若独立,在此一并启动)
+```
+
+**阶段 C — 状态估计 + 机器人描述**
+```
+6. robot_state_publisher   读 mm_robot.urdf → 发 /robot_description + 各 link 固定 TF
+7. ekf_node (robot_localization)
+     订阅 /wheel_odom + /imu → 融合 → 发 /odom + odom→base_footprint TF(独占此段 TF)
+```
+
+**阶段 D — 定位与导航**
+```
+8. (前置离线一次) slam_toolbox 订阅 /scan /odom → 建图 → 存 .pgm/.yaml。任务时不跑 SLAM
+9. map_server         加载已存地图 → 发 /map
+10. AMCL              订阅 /scan /map /tf + /initialpose → 发 map→odom TF
+11. Nav2 栈           planner_server / controller_server(MPPI) / behavior_server / bt_navigator
+12. lane_navigator    车道导航节点(调 spin + follow_path action)
+```
+
+**阶段 E — 机械臂规划执行**
+```
+13. controller_manager + JTC   ros2_control,经 CAN 桥驱动真实关节
+14. move_group (MoveIt)         订阅 /joint_states + 规划场景 → 提供 FollowJointTrajectory
+    (真机无头运行,RViz 不启动)
+```
+
+**阶段 F — 感知 + 任务**
+```
+15. mm_perception:
+      object_detector    → /perception/object_pose(盒子顶面中心 xyz+yaw)
+      aruco_localizer    → 广播 aruco_<id> TF
+      grasp_node(抓取位姿转换,本人侧)
+16. mm_task 状态机         最后启动,调度以上全部
+```
+
+### 7.2 状态机运行流程
+
+```
+[S0 初始化定位]
+  aruco_localizer 识别车体相机看到的 ArUco
+  → 沿 TF 树 aruco→base_footprint + 预写死 map→aruco → 反推 map→base_footprint
+  → 发 /initialpose 给 AMCL → 收敛,此后 map→odom 由 AMCL 持续维护
+
+[S1 导航到货架]
+  mm_task 调 lane_navigator → Dijkstra 出路网路径 → 拆成 spin + follow_path 逐段执行
+  → MPPI 读 /odom + /scan 发 /cmd_vel → ESP32 → 底盘运动,中途 MPPI 实时避障(vy 横移)
+
+[S2 到点精对位]
+  车体 ArUco 相机看货架标记 → 算相对位姿 → 底盘伺服微调 /cmd_vel 对准(替代开环,防漂移)
+
+[S3 识别货物]
+  mm_task 按预设搬运顺序触发 object_detector → 发 /perception/object_pose(base_link 系)
+
+[S4 抓取]
+  grasp_node 把盒子位姿转成末端目标(top-down + 吸盘偏置)
+  → setPoseTarget → MoveIt 规划 → JTC 经 CAN 执行 → 臂到位
+  → 气泵 I/O 吸取 → 规划到 tray(Link_11)上方 → 释放 → 放下
+
+[S5 循环]
+  回 S1 导航到下一货架 → 直到搬运序列完成
+```
+
+### 7.3 分层:任务列表 vs 调度系统
+- **第一版**:状态机吃一个**写死的任务列表**(货架序列),把 S1~S5 跑通。
+- **后续**:上面再加一层**调度系统**,负责按货物流动动态生成任务列表喂给状态机;状态机本身不改。
+- 两层解耦:先做确定性的执行层,再叠智能的决策层。
