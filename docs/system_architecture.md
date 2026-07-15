@@ -78,6 +78,7 @@ costmap       订阅 /scan → 维护 global/local 代价地图
 move_group    订阅 /joint_states + 规划场景 → 输出规划轨迹
 [动作接口]    /move_action,  FollowJointTrajectory  ← 你的抓取代码调
 [服务]        /compute_ik, /plan_kinematic_path 等
+moveit_servo  实时 Cartesian jog(收 TwistStamped/JointJog)← 抓取精修阶段闭环伺服用(S4 ②)
 ```
 
 ### 感知(队友,见 interface_contract.md)
@@ -203,8 +204,8 @@ robot_localization ekf_node:
 ```
 mm_task: ArUco初始化 → /initialpose 给 AMCL
 mm_task: goToPose(货架) → Nav2 → /cmd_vel → 底盘 → 到位
-mm_task: 触发感知 → /perception/object_pose
-mm_task: setPoseTarget → MoveIt 规划执行 → 气泵吸 → 放 tray
+mm_task: 触发感知 → /perception/object_pose(抓取期间连续发布)
+mm_task: 抓取三段(粗定位闭环→精修伺服→末段相对直插,见 §7.2 S4)→ 气泵吸 → 放 tray
 mm_task: goToPose(目标货架) → 放下 → 循环
 ```
 
@@ -282,10 +283,12 @@ mm_task: goToPose(目标货架) → 放下 → 循环
 [S3 识别货物]
   mm_task 按预设搬运顺序触发 object_detector → 发 /perception/object_pose(base_link 系)
 
-[S4 抓取]
-  grasp_node 把盒子位姿转成末端目标(top-down + 吸盘偏置)
-  → setPoseTarget → MoveIt 规划 → JTC 经 CAN 执行 → 臂到位
+[S4 抓取] —— 三段混合,对机械臂零位偏差脱敏(详见 interface_contract.md §5)
+  ① 粗定位(闭环,MoveIt 规划):grasp_node 取 object_pose → TCP 规划到盒子上方预抓取位(约 10–15cm)
+  ② 精修(闭环,moveit_servo 视觉伺服):持续读新鲜 object_pose → Cartesian jog 对准顶面中心 xy+yaw → 逼近到约 5–8cm
+  ③ 末段(开环,相对当前姿态短距离直插):沿吸盘接近轴(suction_tip, Link_29 -Z)相对下插固定行程
   → 气泵 I/O 吸取 → 规划到 tray(Link_11)上方 → 释放 → 放下
+  ⚠️ 纪律:末段严禁用 FK 重算盒子 base_link 绝对坐标再 setPoseTarget,否则零位偏差加回末端
 
 [S5 循环]
   回 S1 导航到下一货架 → 直到搬运序列完成

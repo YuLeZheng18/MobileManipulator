@@ -422,4 +422,36 @@
     <origin xyz="0.05537897 0.00725 -0.01913" rpy="0 1.57079633 -1.57079633"/>
     <axis xyz="0 0 1"/>
   </joint>
+  <!-- 吸盘工具: 沿 Link_29 -Z 伸出 3cm 圆柱(Ø1.5cm), ready 位即朝下. 气路靠 IO 控制(固件), 不建模关节 -->
+  <link name="suction_link">
+    <inertial>
+      <mass value="0.02"/>
+      <origin xyz="0 0 -0.08" rpy="0 0 0"/>
+      <inertia ixx="1.78e-6" ixy="0" ixz="0" iyy="1.78e-6" iyz="0" izz="5.6e-7"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 -0.08" rpy="0 0 0"/>
+      <geometry>
+        <cylinder length="0.03" radius="0.0075"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.08" rpy="0 0 0"/>
+      <geometry>
+        <cylinder length="0.03" radius="0.0075"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Joint_suction" type="fixed">
+    <parent link="Link_29"/>
+    <child link="suction_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  <!-- suction_tip: 吸盘接触面(TCP), 圆柱末端面, Link_29 -Z 方向 9.5cm 处(腕部本体末端 6.5cm + 吸盘 3cm) -->
+  <link name="suction_tip"/>
+  <joint name="Joint_suction_tip" type="fixed">
+    <parent link="suction_link"/>
+    <child link="suction_tip"/>
+    <origin xyz="0 0 -0.095" rpy="0 0 0"/>
+  </joint>
 </robot>
