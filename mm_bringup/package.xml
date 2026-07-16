@@ -14,6 +14,12 @@
   <exec_depend>mm_perception</exec_depend>
   <exec_depend>mm_task</exec_depend>
 
+  <!-- mock 感知节点依赖 -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>gazebo_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 

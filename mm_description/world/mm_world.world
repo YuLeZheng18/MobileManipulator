@@ -1293,5 +1293,31 @@
           <publish_odom_tf>1</publish_odom_tf>
         </plugin>
       </model>
+    <!-- 抓取测试盒子(药盒): 货物统一放机器人右方. 车 yaw=pi 朝 world -x, 机器人右侧=world +y,
+         故放 world (0, +0.6)(对应 base_link y=-0.6). 90x55x25mm 扁平药盒, 平放静置于地(z=半高 0.0125),
+         顶面 90x55 供 Ø15 吸盘居中吸取. mock_object_detector 从 gazebo_ros_state 的 link_states 取真值当"识别结果". -->
+    <model name='grasp_box'>
+      <static>1</static>
+      <pose>0 0.6 0.0125 0 0 0</pose>
+      <link name='box_link'>
+        <collision name='collision'>
+          <geometry><box><size>0.09 0.055 0.025</size></box></geometry>
+        </collision>
+        <visual name='visual'>
+          <geometry><box><size>0.09 0.055 0.025</size></box></geometry>
+          <material>
+            <ambient>0.90 0.55 0.10 1</ambient>
+            <diffuse>0.90 0.55 0.10 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+    <!-- 世界级状态插件: 发 /gazebo/model_states 与 /gazebo/link_states(gazebo_msgs), 供 mock 感知取上帝真值 -->
+    <plugin name='gazebo_ros_state' filename='libgazebo_ros_state.so'>
+      <ros>
+        <namespace>/gazebo</namespace>
+      </ros>
+      <update_rate>30.0</update_rate>
+    </plugin>
   </world>
 </sdf>
