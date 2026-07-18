@@ -1,0 +1,22 @@
+# ===== mm_task 任务列表 + 参数 (占位, 用户按实调) =====
+# mission_manager 读此文件, 按 tasks 顺序跑 S0→S5 (架构 §7.2).
+#
+# initial_pose : S0 发给 AMCL 的已知初值 (map 系). 必须与 Gazebo spawn 位姿一致, 否则定位偏.
+# timeouts     : 各阶段超时(秒). localize=S0 等 AMCL 收敛(map->base_link 出现);
+#                nav=S1 导航; detect=S3 识别; grasp=S4 抓取/卸货整轮.
+# tasks        : 逐条 {nav_target, action}.
+#   nav_target : lane_graph.yaml 里的 node 名 (p1..p4)
+#   action     : grasp  = 去货架 → 识别 → 三段抓取到自己托盘(Link_11)   [调 /grasp/execute]
+#                unload = 从托盘取盒 → 放到目的地(grasp_node place_* 参数) [调 /grasp/unload]
+#                none   = 仅导航, 不抓取
+#
+# ⚠️ 全流程绿跑需把 grasp_box 摆到 nav_target 够得着处 (set_entity_state 或世界编辑),
+#    否则 S4 IK 不成立. 这属场景摆放, 非状态机问题 (架构 §8.4 允许单独调抓取).
+
+initial_pose: { x: 0.0, y: 0.0, yaw: 3.14159 }   # 必须与 Gazebo spawn 一致 (-x 0 -y 0 -Y pi)
+
+timeouts: { localize: 20.0, nav: 120.0, detect: 10.0, grasp: 150.0 }
+
+tasks:
+  - { nav_target: p2, action: grasp }    # 去 p2 货架 → 识别 → 三段抓取到托盘
+  - { nav_target: p4, action: unload }   # 搬运到 p4 → 从托盘卸货到目的地
