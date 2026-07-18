@@ -1,0 +1,12 @@
+# Python 字节码
+__pycache__/
+*.py[cod]
+
+# 备份/临时文件
+*.bak
+*~
+
+# colcon 构建产物 (若在 ws 根 src 内误跑)
+build/
+install/
+log/
