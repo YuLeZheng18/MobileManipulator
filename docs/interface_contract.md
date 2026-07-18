@@ -19,7 +19,7 @@ URDF 沿用 CAD 原始命名(`Link_xx`),与角色对照如下:
 | `Link_29` | 机械臂腕部 | MoveIt 规划链 tip;深度相机固连于此 |
 | `Link_30` | **深度相机**(eye-in-hand) | §3 手眼标定对象,经 Joint_17 固连 Link_29 |
 
-> 注:吸盘工具目前 URDF **未建模**,计划作圆柱沿 `Link_29` 的 -Z 固连(ready 位即朝下),接触点单独给一个 `suction_tip` link 作抓取 TCP。本人 TODO,**不影响队友输出**。
+> 注:吸盘工具**已建模**——圆柱沿 `Link_29` 的 -Z 固连(`suction_link`,ready 位即朝下),接触点 TCP 为 `suction_tip`(`Link_29` -Z 方向 9.5cm)。**不影响队友输出**。
 
 ---
 
@@ -34,7 +34,7 @@ URDF 沿用 CAD 原始命名(`Link_xx`),与角色对照如下:
 
 手眼标定(§3)交付的是 URDF 数值(改 `Joint_17` origin),不在此包,直接给本人回填。
 
-> 本人侧:订阅 `/perception/object_pose` 做抓取转换+执行的代码在 `mm_task/mm_task/grasp_node.py`(独立 action 节点),与队友无耦合。
+> 本人侧:订阅 `/perception/object_pose` 做抓取转换+执行的代码在 `mm_grasp` 包(C++ `grasp_node`,`std_srvs/Trigger` 服务 `/grasp/execute` 触发三段抓取,被 `mm_task` 状态机调用),与队友无耦合。
 
 ---
 
@@ -71,17 +71,17 @@ URDF 沿用 CAD 原始命名(`Link_xx`),与角色对照如下:
 | 项 | 约定 |
 |---|---|
 | 输出形式 | 向 `/tf` 广播 `TransformStamped` |
-| 父坐标系 | **`Link_13_optical`**(光学系,本人在 URDF 提供;见下方约定) |
+| 父坐标系 | **`base_link`**(队友在节点内完成 TF 转换,直接给底盘系;与 §1 一致) |
 | 子坐标系 | `aruco_<id>`(按标记 id 命名) |
 | 标记物理尺寸 | 按实际打印尺寸(默认 0.10m),作为节点参数可配 |
 | 相机内参来源 | 订阅 `Link_13` 相机的 `camera_info` 话题 |
 | 标记 id 分配 | 按现场货架/工位约定,队友在节点参数里登记 |
 
-### 相机光学系约定(重要,不处理会整体差 90°)
-- `Link_13` 是相机**机械安装系**(x 朝前);OpenCV/ArUco 解出的位姿在**光学系**(z 朝前、x 朝右、y 朝下,REP-104),两者朝向不同。
-- **本人在 URDF 里提供 `Link_13_optical` 光学系 frame**(`Link_13` 下挂一个固定旋转)。
-- 队友做法:**直接把 OpenCV 解出的位姿当 `Link_13_optical → aruco_<id>` 广播即可**,不用自己补旋转。
-- 若本人的 `Link_13_optical` 还没就绪,临时方案:父系用 `Link_13`,在节点内自行乘上"光学系→`Link_13`"的固定旋转。
+### 队友节点内 TF 换算(重要,不处理会整体差 90°)
+- OpenCV/ArUco 解出的位姿在相机**光学系**(z 朝前、x 朝右、y 朝下,REP-104);`Link_13` 是相机**机械安装系**(x 朝前),两者差一个固定旋转。
+- 队友在节点内把观测链到 `base_link` 再广播(与 §1 输出 base_link 一致):
+  `base_link → aruco_<id>` = `base_link → Link_13`(查 TF 树,`robot_state_publisher` 已发) ∘ `Link_13 → 光学系`(固定旋转,REP-104) ∘ `光学系 → aruco_<id>`(OpenCV 解算)。
+- 即:先补"光学系→`Link_13`"固定旋转,再用 TF 查询把位姿转到 `base_link`,最后广播 `base_link → aruco_<id>`。
 
 下游用法(本人实现,队友无需关心):
 - 初始位姿:已知 `map→aruco`(预先标定写死)+ TF 树 `aruco→base_footprint` → 反推 `map→base_footprint` → 发 `/initialpose` 给 AMCL。
@@ -125,7 +125,7 @@ eye-in-hand:深度相机已建模为 `Link_30`,经 `Joint_17`(fixed)固连机械
 
 **残余兜底**:姿态微偏 × 行程会产生横向漂移,故 (a) 精修尽量逼近再插以缩短行程,(b) 靠吸盘/夹爪机械容差(倒角/柔性)吃 mm 级残差。
 
-**对队友无影响**:三段全在 `grasp_node`/MoveIt 本人侧;对队友唯一新增 = §1 的连续发布要求。`moveit_servo` 集成为本人 TODO,细节待验证。
+**对队友无影响**:三段全在 `mm_grasp`/MoveIt 本人侧;对队友唯一新增 = §1 的连续发布要求。`moveit_servo` 已集成(精修段视觉伺服),细节见 `mm_grasp/config/servo.yaml`。
 
 ---
 
@@ -134,8 +134,8 @@ eye-in-hand:深度相机已建模为 `Link_30`,经 `Joint_17`(fixed)固连机械
 - [x] 深度相机 camera_link 名(§3)→ `Link_30`(固连 `Link_29`)
 - [x] 抓取模型 & 位姿语义(§1)→ 4-DOF top-down,队友发盒子顶面中心 `xyz+yaw`,末端换算归本人
 - [x] 话题名(§1)→ `/perception/object_pose`(原 `grasp_pose` 改名,语义=盒子位姿非末端姿态)
-- [ ] 吸盘工具 link / `suction_tip` TCP(§1)— **本人 TODO**,URDF 补吸盘(沿 Link_29 -Z)后确定
-- [ ] `Link_13_optical` 光学系 frame(§2)— **本人 TODO**,URDF 在 `Link_13` 下挂固定旋转
+- [x] 吸盘工具 link / `suction_tip` TCP(§1)→ URDF 已建 `suction_link`(Link_29 -Z 圆柱)+ `suction_tip` TCP(Link_29 -Z 9.5cm)
+- [x] ArUco 输出坐标系(§2)→ 统一 `base_link`,队友节点内做 TF 换算(与 §1 一致),无需 URDF 建 `Link_13_optical`
 - [ ] ArUco 各标记 id 分配(§2)— 队友按现场登记到节点参数
 - [ ] 气泵 I/O 接口(§4)— 实机阶段定
 - [x] 抓取执行策略(§5)→ 闭环粗定位 + 闭环精修 + 开环相对直插,对零位偏差脱敏
