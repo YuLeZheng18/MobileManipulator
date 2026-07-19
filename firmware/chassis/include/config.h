@@ -37,6 +37,7 @@
 // ===== IMU HWT906P (硬件串口 UART1; ESP32 TX=18->IMU RX, ESP32 RX=21->IMU TX) =====
 #define IMU_TX 18
 #define IMU_RX 21
+#define IMU_BAUD 115200   // 已用 IMU_PROVISION 一次性配为 115200+100Hz 并 SAVE (2026-07-19)
 
 // ===== 其他 PWM 输出 (LEDC) =====
 #define PUMP1_PWM 7   // 气泵    (物理接 GPIO7)
