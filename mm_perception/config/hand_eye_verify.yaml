@@ -1,0 +1,36 @@
+# 手眼标定结果验证参数 (在线实测一致性, 不重新标定).
+# 采一批姿态的 (gripper2base, target2camera), 用两套外参各算 base<-marker 散布对比.
+# 节点名 hand_eye_verify. 相机/标记设置与 hand_eye_calib.yaml 保持一致(红外流).
+hand_eye_verify:
+  ros__parameters:
+    # ---- 深度相机 D435i 左红外(infra1)流 (彩色标定损坏, 走红外) ----
+    image_topic: /camera/camera/infra1/image_rect_raw
+    camera_info_topic: /camera/camera/infra1/camera_info
+    image_is_best_effort: true
+
+    # ---- 固定 ArUco 标记 ----
+    aruco_dictionary: DICT_4X4_50
+    marker_size: 0.135
+    marker_id: 0
+    equalize_clahe: true          # 红外必开, 与标定一致
+    clahe_clip_limit: 3.0
+    clahe_tile: 8
+
+    # ---- TF 链 ----
+    base_frame: Link_20
+    ee_frame: Link_29
+
+    # ---- 采样: manual 手动摆位(安全, 不自动摆臂); 回车采样, s 出报告 ----
+    sampling_mode: manual
+    arm_action: /arm_controller/follow_joint_trajectory
+    joint_names: [Joint_11, Joint_12, Joint_13, Joint_14, Joint_15, Joint_16]
+    move_time: 4.0
+    settle_time: 1.5
+
+    # ---- 待验证的两套外参 (即"代码里的数据") ----
+    # 标定结果 (hand_eye_result.yaml, 红外光学系)
+    calib_xyz: [0.008204, -0.042158, -0.047865]
+    calib_rpy: [-3.111097, 0.292215, -1.564613]
+    # URDF 名义值 (mm_robot.urdf Joint_17 origin, 机械系; 节点内补光学->机械旋转)
+    nominal_xyz: [0.05537897, 0.00725, -0.01913]
+    nominal_rpy: [0.0, 1.57079633, -1.57079633]

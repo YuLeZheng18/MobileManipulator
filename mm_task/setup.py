@@ -10,7 +10,8 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', []),
+        ('share/' + package_name + '/launch', ['launch/grasp.launch.py']),
+        ('share/' + package_name + '/config', ['config/grasp.yaml']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -21,7 +22,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            # 示例(待实现):
+            'grasp_node = mm_task.grasp_node:main',
             # 'mission_manager = mm_task.mission_manager:main',
         ],
     },

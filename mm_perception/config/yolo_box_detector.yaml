@@ -1,0 +1,60 @@
+# YOLO 盒子识别 + 抓取位姿节点参数 (契约 §1 抓取版).
+# 用法: ros2 run mm_perception yolo_box_detector --ros-args --params-file <此文件>
+#   或由 launch 加载.
+yolo_box_detector:
+  ros__parameters:
+    # ---- 模型 ----
+    # 自训练盒子模型 (类别 1/2/3/4). 留文件名, launch 解析为包内 share/models/ 下.
+    #   best_ncnn_model = NCNN 导出目录 (ARM CPU 加速 ~4.8x, 见下). 用 best.pt 走原生权重.
+    # 绝对路径后覆盖此值; 直接 ros2 run 时需自行传绝对路径.
+    model_path: best_ncnn_model
+    # NCNN/ONNX 导出格式无法自动识别 task, 必须显式指定, 否则 res.obb 变 None.
+    #   用 .pt 原生权重时留空 '' (自带 task).
+    model_task: obb
+    conf: 0.75                      # YOLO 置信度阈值: 只识别 >0.75 的盒子. 远处漏检就降, 误检多就升
+    imgsz: 640                      # 推理输入尺寸. 必须与 NCNN 导出固化尺寸一致(现 best_ncnn_model 是 640
+                                    #   导出的; 不一致会框错位/不准!). 换 imgsz 须重导 NCNN 用同尺寸.
+                                    #   pytorch CPU 实测: 640≈0.9 480≈1.4 416≈1.9 320≈3.2FPS (慢, 故默认走 NCNN)
+                                    #   NCNN 实测:        640≈4.1 480≈5.0 416≈5.3 320≈5.6FPS (加速 1.8~4.8x)
+    device: 'vulkan:0'              # NCNN 走 Vulkan GPU (Jetson Orin nvgpu). 实测 640: 14.7FPS vs CPU 4.8 (3x).
+                                    #   绕开 torch CUDA 驱动版本问题(torch cuda 仍不可用). 仅 NCNN 支持 vulkan.
+                                    #   若用 .pt 原生权重: 改回 'cpu' (torch 无法用 vulkan, 且 cuda 不可用).
+    class_names: ['1', '2', '3', '4']   # 只保留这四类盒子, 滤掉其它误检
+
+    # ---- 话题 (RealSense 默认命名空间 camera/camera) ----
+    color_topic: /camera/camera/color/image_raw
+    # 本机彩色标定坏(K/外参 NaN), aligned_depth 全废 -> 走原始深度流.
+    use_raw_depth: true             # true=原始深度流(本机必需); false=aligned_depth
+    depth_topic: /camera/camera/depth/image_rect_raw       # 原始深度(848x480)
+    camera_info_topic: /camera/camera/color/camera_info    # 彩色内参(NaN->fallback)
+    depth_info_topic: /camera/camera/depth/camera_info     # 深度内参(有效, 反投影用)
+    depth_is_best_effort: true      # RealSense 图像走 BEST_EFFORT
+
+    # ---- 坐标系 ----
+    camera_frame: Link_30           # 深度相机 URDF link
+    base_frame: base_link           # 目标系 (契约 §1)
+    apply_optical_rotation: true    # 反投影(光学系)->Link_30 机械系
+
+    # ---- ROI 内深度分割 ----
+    min_depth: 0.15                 # 有效深度下限(米)
+    max_depth: 3.0                  # 有效深度上限(米)
+    min_box_height: 0.02            # 高出台面多少算盒子(米)
+    max_box_height: 0.5             # 高出台面超此值视为噪声(米)
+    center_patch: 9                 # 中心深度邻域, 调大取中值更稳
+    roi_shrink: 0.08                # ROI 四周向内收缩比例, 避开框边噪声
+    min_mask_px: 300                # ROI 内盒子掩码最小像素, 少于此退化为整 ROI
+
+    # ---- 内参兜底 (本机彩色 camera_info K 若为 NaN) ----
+    use_fallback_on_nan: true       # 仿真 K 完好则用不到; 实机 K 坏时先跑通(有系统误差)
+    fallback_fx: 900.0              # 1280x720 粗估
+    fallback_fy: 900.0
+
+    # ---- 输出 (契约 §1) ----
+    publish_pose: true              # 发 /perception/object_pose (PoseStamped) + object_poses (PoseArray)
+    pose_topic: /perception/object_pose      # 单目标: 恒发面积最大框 (抓取一次一个)
+    poses_topic: /perception/object_poses    # 多目标: 所有盒子位姿数组 (PoseArray, 面积降序)
+    only_largest: false             # false=检测/画/打印所有盒子; 位姿话题仍只发最大框(抓取一次一个).
+                                    #   true=检测阶段就只留最大框(窗口也只显示一个).
+
+    # ---- 可视化 ----
+    show_window: true               # 无显示器/远程置 false

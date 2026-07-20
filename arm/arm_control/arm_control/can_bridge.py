@@ -49,7 +49,9 @@ class MotorConfig:
     """与 joint_gui.py 共用 ~/.robot_arm_config.json, 保证仿真调好的参数与实车一致."""
     def __init__(self):
         self.REDUCTION_RATIOS = [50.0, 50.0, 30.0, 82.67, 62.5, 27.0]
-        self.DIRECTION_MAP = [False, False, False, False, False, False]
+        # 电机1、2(Joint_11/12)实车转向与模型相反, 默认取反; 指令与反馈都用此标志, 翻转后闭环自洽.
+        # 与 joint_gui.py 保持一致; ~/.robot_arm_config.json 存在时会覆盖这里.
+        self.DIRECTION_MAP = [True, True, False, False, False, False]
         self.SPEEDS = [250, 250, 150, 250, 250, 135]
         self.ACCELERATIONS = [500, 500, 500, 500, 500, 500]
         self.load()

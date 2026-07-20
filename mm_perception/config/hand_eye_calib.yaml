@@ -1,0 +1,84 @@
+# 手眼标定 (eye-in-hand) 参数.
+# 求 Link_29(腕部) -> Link_30(深度相机) 外参, 用于修正 URDF Joint_17 origin.
+# 由 hand_eye_calib.launch.py 加载, 或 --params-file 传入.
+hand_eye_calibrator:
+  ros__parameters:
+    # ---- 深度相机(RealSense D435i)话题 ----
+    # 用【左红外(infra1)】而非彩色: 本机彩色标定表损坏(camera_info K 全为 NaN),
+    # 而左红外内参完好(fx=fy≈428.4). 左红外 imager 即 depth 的参考原点, 契约 §3 的
+    # Link_30(深度相机 camera_link) 正对应此系, 故标定结果无需再叠加 depth->color 补偿.
+    # 前提: 驱动带 enable_infra1:=true depth_module.emitter_enabled:=0 启动
+    #       (关投射器, 否则红外散斑点会干扰 ArUco 角点检测).
+    # 注: 结果在红外【光学系】(z 朝前); 回填 Joint_17 时按 Link_30 的朝向约定处理.
+    image_topic: /camera/camera/infra1/image_rect_raw
+    camera_info_topic: /camera/camera/infra1/camera_info
+    image_is_best_effort: true      # RealSense 图像走 BEST_EFFORT
+
+    # ---- 固定 ArUco 标记 (与车体相机同参数) ----
+    aruco_dictionary: DICT_4X4_50
+    marker_size: 0.135              # 黑边实际边长(米), 实测打印件外沿 135mm
+    marker_id: 0                    # 标定用的那个固定标记 id
+
+    # ---- TF: gripper2base 链 ----
+    base_frame: Link_20             # 机械臂基座 (规划链 base)
+    ee_frame: Link_29               # 腕部 (规划链 tip; Joint_17 的 parent)
+
+    # ---- 机械臂控制 (自动摆臂) ----
+    arm_action: /arm_controller/follow_joint_trajectory
+    joint_names: [Joint_11, Joint_12, Joint_13, Joint_14, Joint_15, Joint_16]
+    move_time: 4.0                  # 每次运动到位的时长(秒)
+    settle_time: 1.5                # 到位后稳定再采样的等待(秒)
+
+    # 采样模式: auto=按 calib_poses 自动摆臂; manual=手动摆位,终端按回车逐组采样.
+    # manual 下不发轨迹、不用 calib_poses, 摆臂方式(手扳/joint_gui/示教)不限.
+    sampling_mode: manual
+
+    min_samples: 6                  # 有效样本下限, 低于此不出结果
+
+    # ---- 预存标定姿态 (关节角, 弧度) ----
+    # !! 展平的一维数组, 每 6 个连续值 = 一组 Joint_11~16 (ROS2 参数不支持嵌套数组) !!
+    # 关节限位: J11 0~4.712, J12 0~2.740, J13 0~2.304, J14 0~3.142, J15/J16 ±1.571.
+    # 下面这组由 test/precheck_poses.py 用 URDF 正运动学离线筛出: J15(水平tilt)×J16(竖直tilt)
+    # 二维网格, 15 组全部标记可见且 calibrateHandEye 可解(误差 1e-16). 仿真用.
+    # 真机: 标记固定在环境中, 姿态可更自由/幅度更大, 按现场标记可见性调整即可.
+    calib_poses: [
+      1.50, 1.00, 1.00, 1.50, -0.22, -0.18,
+      1.50, 1.00, 1.00, 1.50, -0.22,  0.00,
+      1.50, 1.00, 1.00, 1.50, -0.22,  0.18,
+      1.50, 1.00, 1.00, 1.50, -0.11, -0.18,
+      1.50, 1.00, 1.00, 1.50, -0.11,  0.00,
+      1.50, 1.00, 1.00, 1.50, -0.11,  0.18,
+      1.50, 1.00, 1.00, 1.50,  0.00, -0.18,
+      1.50, 1.00, 1.00, 1.50,  0.00,  0.00,
+      1.50, 1.00, 1.00, 1.50,  0.00,  0.18,
+      1.50, 1.00, 1.00, 1.50,  0.11, -0.18,
+      1.50, 1.00, 1.00, 1.50,  0.11,  0.00,
+      1.50, 1.00, 1.00, 1.50,  0.11,  0.18,
+      1.50, 1.00, 1.00, 1.50,  0.22, -0.18,
+      1.50, 1.00, 1.00, 1.50,  0.22,  0.00,
+      1.50, 1.00, 1.00, 1.50,  0.22,  0.18,
+    ]
+
+    # ---- 输出 ----
+    output_path: hand_eye_result.yaml   # 结果写到运行目录; 6个数用于填 Joint_17 origin
+
+# 相机侧可行性验证节点 (不用机械臂): 与上面共用相机/标记设置.
+# 由 hand_eye_camera_check.launch.py 加载. 只读验证深度相机能否稳定检出固定 ArUco.
+hand_eye_camera_check:
+  ros__parameters:
+    # 同标定节点: 用左红外(彩色标定损坏), 内参完好无需 override 兜底.
+    image_topic: /camera/camera/infra1/image_rect_raw
+    camera_info_topic: /camera/camera/infra1/camera_info
+    image_is_best_effort: true
+    aruco_dictionary: DICT_4X4_50
+    marker_size: 0.135
+    marker_id: 0
+    report_period: 1.0      # 终端刷新周期(秒)
+    jitter_window: 30       # 抖动统计窗口帧数 (相机静止时才有意义)
+    # ---- 内参兜底 (本机 D435i 彩色标定损坏, camera_info 的 K 为 NaN) ----
+    # 当 camera_info 无效时改用下面的注入内参. D435 彩色 640x480 标称 fx=fy≈617.
+    # cx/cy<=0 时用图像中心(w/2,h/2)兜底. 仅供链路验证, 交付级标定需棋盘格标定后回填精确值.
+    override_fx: 617.0
+    override_fy: 617.0
+    override_cx: 0.0        # <=0: 用图像中心
+    override_cy: 0.0
