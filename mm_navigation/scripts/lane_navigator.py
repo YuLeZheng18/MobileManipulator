@@ -128,6 +128,9 @@ class LaneNavigator(Node):
             reliability=QoSReliabilityPolicy.RELIABLE,
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.plan_pub = self.create_publisher(Path, 'lane_plan', latched)
+        # 路由终态回报(供 mm_task 状态机知悉 S1 完成/失败): "<target>:SUCCEEDED" / "<target>:FAILED".
+        # latched: 晚订阅者也能拿到最后一条终态.
+        self.status_pub = self.create_publisher(String, 'lane_navigator/status', latched)
         # 终点闭环 spin 直接发 /cmd_vel(与 Nav2 Spin 行为同一话题), 经 cmd_vel_smoother 到底盘
         self.cmd_pub = self.create_publisher(Twist, 'cmd_vel', 10)
         self.go_sub = self.create_subscription(String, 'go_to', self.on_go_to, 10)
@@ -352,17 +355,20 @@ class LaneNavigator(Node):
         target = msg.data.strip()
         if target not in self.nodes:
             self.get_logger().error(f'Unknown node "{target}". Known: {list(self.nodes)}')
+            self.status_pub.publish(String(data=f'{target}:FAILED'))
             return
         pose = self.get_robot_pose()
         if pose is None:
+            self.status_pub.publish(String(data=f'{target}:FAILED'))
             return
         px, py, _ = pose
 
-        # 已在目标点附近 -> 忽略
+        # 已在目标点附近 -> 直接回报到位(状态机据此放行, 不再干等)
         tx, ty, _ = self.nodes[target]
         d_goal = math.hypot(px - tx, py - ty)
         if d_goal <= self.arrival_tol:
             self.get_logger().info(f'Already at "{target}" (dist={d_goal:.2f}m), ignoring')
+            self.status_pub.publish(String(data=f'{target}:SUCCEEDED'))
             return
 
         # 相同目标且仍在执行 -> 忽略重复触发(防 ros2 topic pub -r 连发抖动)
@@ -375,6 +381,7 @@ class LaneNavigator(Node):
         ne = self.nearest_edge(px, py)
         if ne is None:
             self.get_logger().error('No edges in lane graph')
+            self.status_pub.publish(String(data=f'{target}:FAILED'))
             return
         d_lat, qx, qy, a, b = ne
         ra, da = self.dijkstra(a, target)
@@ -387,6 +394,7 @@ class LaneNavigator(Node):
             route = rb
         else:
             self.get_logger().error(f'No route to {target}')
+            self.status_pub.publish(String(data=f'{target}:FAILED'))
             return
 
         route_pts = [(self.nodes[n][0], self.nodes[n][1]) for n in route]
@@ -464,6 +472,7 @@ class LaneNavigator(Node):
             return
         if self._step_idx >= len(self._steps):
             self.get_logger().info(f'Route to "{self._active_target}" complete')
+            self.status_pub.publish(String(data=f'{self._active_target}:SUCCEEDED'))
             self._active_target = None
             self._goal_handle = None
             self._steps = []
@@ -677,6 +686,7 @@ class LaneNavigator(Node):
         if ep != self._epoch:
             return
         self.get_logger().warn(f'Route to "{self._active_target}" failed: {why}')
+        self.status_pub.publish(String(data=f'{self._active_target}:FAILED'))
         self._cancel_retry_timer()
         self._cancel_cspin_timer()
         self.cmd_pub.publish(Twist())

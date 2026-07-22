@@ -3,9 +3,9 @@
 /install/
 /log/
 
-# Python 缓存
+# Python 字节码/缓存
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 
 # 编辑器/系统
@@ -18,6 +18,6 @@ __pycache__/
 # Claude Code 会话/记忆 (不进公开仓库)
 .claude/
 
-# 备份归档 (如 install.bak.<hash>.tar.gz)
+# 备份/临时文件
 *.bak
 install.bak.*.tar.gz

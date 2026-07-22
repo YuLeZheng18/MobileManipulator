@@ -127,8 +127,10 @@ static bool create_entities() {
   if (rclc_node_init_default(&node, "chassis_driver", "", &support) != RCL_RET_OK) return false;
 
   // 发布者 (best_effort, 高频传感器数据)
+  // 话题名 /wheel_odom (非 /odom): /odom 由上位机 robot_localization EKF 输出独占,
+  // 固件这路只是轮式里程计原始量, 作为 EKF 输入 (架构 §5.2)。frame_id 仍为 "odom"。
   if (rclc_publisher_init_best_effort(&pub_odom, &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry), "/odom") != RCL_RET_OK) return false;
+        ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry), "/wheel_odom") != RCL_RET_OK) return false;
   if (rclc_publisher_init_best_effort(&pub_imu, &node,
         ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu), "/imu") != RCL_RET_OK) return false;
   if (rclc_publisher_init_best_effort(&pub_bat, &node,

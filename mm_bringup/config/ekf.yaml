@@ -1,0 +1,43 @@
+# robot_localization EKF — 实机状态估计 (架构 §5.2 / §7.1-C)
+#
+# 融合下位机 /wheel_odom (ESP32-S3 编码器正解) + /imu (HWT906P) → 发 /odom 话题
+# 与 odom->base_link TF。⚠️ 纪律 (架构 §5.2): odom->base_link 这段 TF 只有 EKF 能发,
+# ESP32 固件绝不发 TF, 否则两边抢发 TF 树会跳变。
+#
+# base_link_frame 用 base_link (不用 base_footprint): 当前整车 URDF 根即 base_link,
+# 无 base_footprint 层, 与仿真 planar_move 发的 odom->base_link 一致 (本轮拍板 #2)。
+# 若日后 URDF 补 base_footprint, 改此处 base_link_frame 即可, 不动其它。
+ekf_filter_node:
+  ros__parameters:
+    frequency: 30.0
+    sensor_timeout: 0.2
+    two_d_mode: true            # 平面移动机器人: 锁 z/roll/pitch, 只估 x y yaw
+    publish_tf: true
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom           # 发 odom->base_link (map->odom 由 AMCL 独占, 见架构 §1)
+
+    # 轮式里程计: 全向底盘给 vx vy 与 vyaw (取速度, 位姿靠积分, 防绝对漂移累计)
+    # 15 位序: [x y z  roll pitch yaw  vx vy vz  vroll vpitch vyaw  ax ay az]
+    odom0: /wheel_odom
+    odom0_config: [false, false, false,
+                   false, false, false,
+                   true,  true,  false,
+                   false, false, true,
+                   false, false, false]
+    odom0_differential: false
+    odom0_relative: false
+    odom0_queue_size: 10
+
+    # IMU: 取 yaw 姿态 + vyaw 角速度 + 平面线加速度 (HWT906P 已融合姿态)
+    imu0: /imu
+    imu0_config: [false, false, false,
+                  false, false, true,
+                  false, false, false,
+                  false, false, true,
+                  true,  true,  false]
+    imu0_differential: false
+    imu0_relative: false
+    imu0_queue_size: 10
+    imu0_remove_gravitational_acceleration: true

@@ -172,6 +172,77 @@ void loop() {
     }
   }
 }
+#elif defined(IMU_SCAN)
+// IMU 波特探测: 逐个候选波特打开 Serial1, 统计原始字节数与 WIT 帧头(0x55 0x5x)出现次数
+// raw=0 全表 -> 接线/供电问题(RX 未连或 IMU 无输出); 某波特 witFrame>0 -> 即为 IMU 当前波特
+void setup() {
+  DBG.begin(115200);
+  DBG.println("\n[chassis] IMU_SCAN: 探测 IMU 当前波特 (IMU_RX=21<-IMU TX, IMU_TX=18->IMU RX)");
+}
+
+// 采样某脚空闲电平: 返回高电平占比(0-100). 真 UART TX 空闲>95%高; 浮空脚≈随机
+static int idleHighPct(int pin) {
+  pinMode(pin, INPUT);
+  int hi = 0; const int N = 20000;
+  for (int i = 0; i < N; i++) { if (digitalRead(pin)) hi++; delayMicroseconds(5); }
+  return hi * 100 / N;
+}
+
+void loop() {
+  // 1) 电平探测: 判断哪根脚真接了通电的 IMU TX
+  DBG.printf("idle-level  GPIO21=%d%%  GPIO18=%d%%   (真TX空闲应>95%%高, 浮空≈随机)\n",
+             idleHighPct(IMU_RX), idleHighPct(IMU_TX));
+
+  // 2) 纯被动 hex-dump 高波特段(IMU 自己在吐数据, 不发TX避免flood): 找 0x55 帧头
+  const long bauds[] = {115200, 230400, 460800, 921600};
+  for (unsigned i = 0; i < sizeof(bauds) / sizeof(bauds[0]); i++) {
+    Serial1.begin(bauds[i], SERIAL_8N1, IMU_RX, IMU_TX);
+    delay(60);
+    while (Serial1.available()) Serial1.read();
+    uint32_t t0 = millis(); int raw = 0, hdr = 0, prev = -1; uint8_t hex[28]; int hn = 0;
+    while (millis() - t0 < 1000) {
+      while (Serial1.available()) {
+        int c = Serial1.read(); raw++;
+        if (prev == 0x55 && (c >= 0x50 && c <= 0x5A)) { hdr++; if (hn < (int)sizeof(hex)) hex[hn++] = 0x55; }
+        // 优先抓帧头附近字节; 否则也留前若干原始字节
+        if (hn < (int)sizeof(hex)) hex[hn++] = (uint8_t)c;
+        prev = c;
+      }
+    }
+    Serial1.end();
+    DBG.printf("baud=%-6ld raw=%-5d witHdr=%-3d hex:", bauds[i], raw, hdr);
+    for (int k = 0; k < hn; k++) DBG.printf(" %02X", hex[k]);
+    DBG.println();
+  }
+  DBG.println("---- scan done, 5s 后重扫 ----");
+  delay(5000);
+}
+#elif defined(IMU_PROVISION)
+// 一次性 IMU 配置模式: 返修件当前实测为 921600 波特(IMU_SCAN 确认)
+// 将其永久设为 115200 波特 + 100Hz 输出并 SAVE, 随后循环打印验证帧率
+// 用法: platformio.ini build_flags 临时加 -DIMU_PROVISION 烧一次, 串口看到约100Hz正常数据后
+//       去掉该 flag 重新烧常规固件 (正常固件已按 IMU_BAUD=115200 打开串口)
+void setup() {
+  DBG.begin(115200);
+  DBG.println("\n[chassis] IMU_PROVISION: 921600 -> 115200 + 100Hz + SAVE");
+  Serial1.begin(921600, SERIAL_8N1, IMU_RX, IMU_TX);  // 对上 IMU 当前实测波特
+  imu.begin(Serial1);
+  imu.provision100Hz115200();                         // 内部把 Serial1 切到 115200
+  DBG.println("[chassis] 配置完成, 开始验证 (帧率应约100Hz)");
+}
+
+void loop() {
+  static uint32_t last = 0, t0 = millis();
+  imu.poll();
+  uint32_t now = millis();
+  if (now - t0 >= 1000) {
+    uint32_t f = imu.frames();
+    ImuData d = imu.get();
+    DBG.printf("rate=%luHz  angle(rad) r=%.3f p=%.3f y=%.3f\n",
+               (unsigned long)(f - last), d.angle[0], d.angle[1], d.angle[2]);
+    last = f; t0 = now;
+  }
+}
 #else
 
 void setup() {
@@ -204,8 +275,8 @@ void setup() {
   servo_begin(PUMP2_PWM, PUMP2_CH);
   apply_pump(PUMP_STOP);
 
-  // IMU (UART1) + INA226
-  Serial1.begin(9600, SERIAL_8N1, IMU_RX, IMU_TX);
+  // IMU (UART1) + INA226  (已由 IMU_PROVISION 一次性配为 115200+100Hz 并 SAVE)
+  Serial1.begin(IMU_BAUD, SERIAL_8N1, IMU_RX, IMU_TX);
   imu.begin(Serial1);
   power.begin(I2C_SDA, I2C_SCL, INA226_ADDR, INA226_R_SHUNT, INA226_MAX_CURR);
 

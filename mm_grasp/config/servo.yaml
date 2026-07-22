@@ -1,0 +1,58 @@
+###############################################
+# moveit_servo 参数 (mm_grasp 精修段视觉伺服用)
+# 适配本车机械臂: group=arm, base=Link_20, tip=Link_29, TCP=suction_tip
+# 注: planning_frame 需与 move_group 实际 getPlanningFrame() 一致, 起 servo 前用节点日志核对
+###############################################
+use_gazebo: true
+
+## 进来的命令: speed_units = twist 直接是 m/s 与 rad/s (P 控制器输出实际速度, 免 scale 换算)
+command_in_type: "speed_units"
+scale:
+  linear:  0.10   # speed_units 下不用作缩放, 保留作参考上限
+  rotational:  0.30
+  joint: 0.30
+
+## 出去的命令
+publish_period: 0.034            # ~30Hz
+low_latency_mode: false
+command_out_type: trajectory_msgs/JointTrajectory
+publish_joint_positions: true
+publish_joint_velocities: false
+publish_joint_accelerations: false
+
+smoothing_filter_plugin_name: "online_signal_smoothing::ButterworthFilterPlugin"
+
+# move_group 是主 planning scene, servo 不当主
+is_primary_planning_scene_monitor: false
+
+## MoveIt 属性
+move_group_name:  arm
+planning_frame:  base_link        # 待核对: 若 getPlanningFrame() 报 world 则改这里
+ee_frame_name:  suction_tip
+robot_link_command_frame:  base_link   # 伺服 twist 给在 base_link 系 (与 object_pose 一致)
+
+## 停止行为
+incoming_command_timeout:  0.2
+num_outgoing_halt_msgs_to_publish: 4
+
+## 奇异点/关节限位处理
+# top-down 吸取姿态在本臂天然接近腕奇异(J15 偏小), 精修降最后 1cm 时雅可比条件数
+# 逼近原 17/30 阈值 -> servo 减速到近乎停死 -> 20s 超时. 抬高两阈值给伺服降到位的空间;
+# 精修末端限速 max_lin_vel=0.05 很低, 靠近奇异即便放大关节速度, 有 joint_limit_margin 兜底不失控.
+lower_singularity_threshold:  30.0
+hard_stop_singularity_threshold: 50.0
+joint_limit_margin: 0.15
+leaving_singularity_threshold_multiplier: 2.0
+
+## 话题名
+cartesian_command_in_topic: ~/delta_twist_cmds
+joint_command_in_topic: ~/delta_joint_cmds
+joint_topic: /joint_states
+status_topic: ~/status
+command_out_topic: /arm_controller/joint_trajectory
+
+## 全身碰撞检查
+check_collisions: true
+collision_check_rate: 10.0
+self_collision_proximity_threshold: 0.01
+scene_collision_proximity_threshold: 0.02

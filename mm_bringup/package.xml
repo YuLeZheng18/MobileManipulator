@@ -14,11 +14,30 @@
   <exec_depend>mm_perception</exec_depend>
   <exec_depend>mm_task</exec_depend>
 
-  <!-- mock 感知节点依赖 -->
+  <!-- mock 节点依赖 (感知 + 假吸附) -->
   <exec_depend>rclpy</exec_depend>
   <exec_depend>gazebo_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
+
+  <!-- 实机 bringup 依赖 -->
+  <exec_depend>arm_moveit_config</exec_depend>  <!-- 机械臂实机 real_bringup + move_group -->
+  <exec_depend>arm_control</exec_depend>        <!-- CAN 桥 (经 arm_moveit_config 间接起) -->
+  <exec_depend>mm_grasp</exec_depend>           <!-- grasp.launch (servo + grasp_node) -->
+  <exec_depend>robot_localization</exec_depend> <!-- EKF 状态估计 (/wheel_odom+/imu -> /odom+TF) -->
+  <exec_depend>rplidar_ros</exec_depend>        <!-- 思岚 A3 雷达驱动 (目标机安装) -->
+  <!-- micro_ros_agent: 独立 ws (~/microros_ws), 需先 source, 不走本包 rosdep -->
+  <!-- nav2_bringup: Nav2 无头栈 (由 mm_navigation 间接依赖) -->
+  <!-- 深度相机/车体相机驱动: 型号确定后补 (realsense2_camera / usb_cam 等) -->
+
+  <exec_depend>nav2_bringup</exec_depend>
+
+  <!-- 分布式调试本机端: RViz(moveit_rviz, arm_moveit_config 已依赖) + 相机监视 -->
+  <!-- 相机图走压缩传输, 两机都需装压缩插件 -->
+  <exec_depend>rqt_image_view</exec_depend>
+  <exec_depend>compressed_image_transport</exec_depend>
+  <exec_depend>compressed_depth_image_transport</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

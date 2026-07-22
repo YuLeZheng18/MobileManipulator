@@ -13,9 +13,11 @@ foreach(dir launch config)
   endif()
 endforeach()
 
-# 仿真专用 mock 感知节点 (sim-only, 不进队友 mm_perception)
+# 仿真专用 mock 节点 (sim-only, 不进队友 mm_perception)
 install(PROGRAMS
   scripts/mock_object_detector.py
+  scripts/mock_suction.py
+  scripts/place_box_helper.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
