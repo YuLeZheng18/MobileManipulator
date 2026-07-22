@@ -68,8 +68,8 @@ def generate_launch_description():
                               description='起 mm_perception 真感知 (队友节点调试中, 就绪后开)'),
         DeclareLaunchArgument('agent_serial_dev', default_value='/dev/ttyACM0',
                               description='micro-ROS 代理串口 (ESP32-S3 native USB)'),
-        DeclareLaunchArgument('lidar_serial_port', default_value='/dev/ttyUSB0',
-                              description='思岚雷达串口'),
+        DeclareLaunchArgument('lidar_serial_port', default_value='/dev/ttyTHS1',
+                              description='思岚雷达串口 (Jetson 硬件 UART; 走排针串口非 USB, 用前 stop nvgetty)'),
         DeclareLaunchArgument(
             'map', default_value=os.path.join(mm_nav_share, 'maps', 'room.yaml'),
             description='Nav2 地图 (默认复用仿真同图, 实机重建后替换)'),
