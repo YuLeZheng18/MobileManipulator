@@ -1,12 +1,23 @@
-# Python 字节码
+# colcon 构建产物
+/build/
+/install/
+/log/
+
+# Python 字节码/缓存
 __pycache__/
 *.py[cod]
+*.pyo
+
+# 编辑器/系统
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Claude Code 会话/记忆 (不进公开仓库)
+.claude/
 
 # 备份/临时文件
 *.bak
-*~
-
-# colcon 构建产物 (若在 ws 根 src 内误跑)
-build/
-install/
-log/
+install.bak.*.tar.gz

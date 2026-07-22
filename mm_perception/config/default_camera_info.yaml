@@ -1,0 +1,30 @@
+# 默认相机内参 (未标定兜底, 仅供跑通流程).
+# 粗略估计: 640x480 普通 USB 相机, fx≈fy≈图像宽度量级, 主点取图像中心, 无畸变.
+# !! 距离/角度会有系统误差 !! 要精确请用 camera_calibration 标定后替换本文件.
+# 由 usb_cam 通过 camera_info_url 加载 (格式为 camera_info_manager 标准 YAML).
+image_width: 640
+image_height: 480
+camera_name: default_usb_cam
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [600.0,   0.0, 320.0,
+           0.0, 600.0, 240.0,
+           0.0,   0.0,   1.0]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [0.0, 0.0, 0.0, 0.0, 0.0]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1.0, 0.0, 0.0,
+         0.0, 1.0, 0.0,
+         0.0, 0.0, 1.0]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [600.0,   0.0, 320.0, 0.0,
+           0.0, 600.0, 240.0, 0.0,
+           0.0,   0.0,   1.0, 0.0]

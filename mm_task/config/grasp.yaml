@@ -1,0 +1,20 @@
+# 抓取节点 (MVP) 参数. 节点名 grasp_node.
+grasp_node:
+  ros__parameters:
+    object_pose_topic: /perception/object_pose   # YOLO 发布的盒顶位姿 (base_link)
+    pump_topic: /pump_cmd                          # 气泵命令 (Int8: 0停/1吸/2放)
+    base_frame: Link_20                            # MoveIt 规划基座 (SRDF chain base)
+    tcp_link: Link_29                              # 规划目标 link (SRDF 链末端; suction_tip 会挂 Cartesian)
+    suction_offset: 0.095                          # Link_29 -> 吸盘尖 沿 -Z(米), z 目标加此值
+
+    pre_height: 0.12        # 预抓取: 盒顶上方高度(米)
+    contact_gap: 0.0        # 末段: 吸盘距盒顶最终间隙(米, 0=贴面)
+    pose_timeout: 2.0       # 位姿新鲜度阈值(秒)
+    suck_settle: 1.0        # 吸取稳定等待(秒)
+
+    max_velocity: 0.3       # 真机保守限速 (占最大速度比例)
+    max_acceleration: 0.3
+
+    auto_grasp: false       # true=启动即抓一次; false=等 /grasp 服务触发
+    dry_run: false          # true=只规划不执行 (无真机验证用)
+    move_only: false        # true=只移到预抓取位就停(不下插/不吸/不抬), 真机运动验证

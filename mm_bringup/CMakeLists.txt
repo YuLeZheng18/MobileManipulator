@@ -3,9 +3,15 @@ project(mm_bringup)
 
 find_package(ament_cmake REQUIRED)
 
-install(DIRECTORY launch config
-  DESTINATION share/${PROJECT_NAME}
-)
+# Only install directories that actually exist so the skeleton package
+# builds before launch/config content is added.
+foreach(dir launch config)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${dir}")
+    install(DIRECTORY ${dir}
+      DESTINATION share/${PROJECT_NAME}
+    )
+  endif()
+endforeach()
 
 # 仿真专用 mock 节点 (sim-only, 不进队友 mm_perception)
 install(PROGRAMS

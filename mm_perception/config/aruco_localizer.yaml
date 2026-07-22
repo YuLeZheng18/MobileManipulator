@@ -1,0 +1,38 @@
+# ArUco 定位节点参数.
+# 用法: 由 aruco_localizer.launch.py 加载, 或
+#   ros2 run mm_perception aruco_localizer --ros-args --params-file <此文件>
+#
+# 节点名为 aruco_localizer, 故顶层键用节点名 + ros__parameters.
+aruco_localizer:
+  ros__parameters:
+    # ---- 话题 (按实际相机驱动改) ----
+    image_topic: /camera/image_raw
+    camera_info_topic: /camera/camera_info
+
+    # ---- 坐标系 ----
+    # 临时方案 (契约 §2): Link_13_optical 尚未在 URDF 建立, 先用机械系 Link_13 代替.
+    # Link_13 是相机机械安装系 (URDF Joint_7: x 朝前), 非光学系; OpenCV 解出的位姿在
+    # 光学系 (z 朝前, REP-104). 故父系用 Link_13, 并在节点内补光学->机械旋转
+    # (见下方 apply_optical_rotation: true). Link_13_optical 就绪后, 改回
+    # parent_frame: Link_13_optical + apply_optical_rotation: false 即可.
+    parent_frame: Link_13
+    child_frame_prefix: aruco_
+
+    # ---- 标记 ----
+    marker_size: 0.10            # 标记黑边实际边长(米), 按打印尺寸改
+    aruco_dictionary: DICT_4X4_50
+    # 白名单: 空=接受所有 id; 现场按货架/工位登记, 例如 [0, 1, 5]
+    marker_ids: []
+
+    # ---- 光学系兜底 ----
+    # true (临时方案): 父系是机械系 Link_13, 节点内左乘固定旋转 (rpy=-pi/2,0,-pi/2)
+    #   把光学系位姿变换回 Link_13 机械系再广播. Link_13_optical 未建时用此项.
+    # false: 父系已是光学系 (Link_13_optical), 直接广播不补旋转. URDF 补好 optical frame 后改回.
+    apply_optical_rotation: true
+
+    # ---- 调试 ----
+    publish_debug_image: false
+    debug_image_topic: ~/debug_image
+
+    # 图像 QoS: true=BEST_EFFORT(多数相机驱动), false=RELIABLE
+    use_image_transport_best_effort: true

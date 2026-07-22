@@ -1,0 +1,15 @@
+# usb_cam 驱动参数 (真机 USB 相机).
+# 用法: 由 aruco_real.launch.py 加载 (video_device 与 camera_info_url 由 launch 注入).
+# 注: 未标定, 用 config/default_camera_info.yaml 的粗略内参(fx=fy=600) -> 距离/角度有系统
+#     误差, 仅供跑通流程. 精确请用 camera_calibration 标定后替换 default_camera_info.yaml.
+/**:
+  ros__parameters:
+    framerate: 30.0
+    io_method: "mmap"
+    frame_id: "Link_13"          # 图像/内参的 frame, 须为相机所在 URDF link
+    pixel_format: "mjpeg2rgb"    # 多数 UVC 相机支持 mjpeg; 若报错改 "yuyv2rgb"
+    image_width: 640
+    image_height: 480
+    camera_name: "default_usb_cam"   # 须与 default_camera_info.yaml 里 camera_name 一致
+    autoexposure: true
+    autofocus: false

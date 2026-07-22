@@ -22,37 +22,53 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from sensor_msgs.msg import JointState
 
+from ament_index_python.packages import get_package_share_directory, PackageNotFoundError
+
 from .can_interface import CANInterface
 from .PCANBasic import PCAN_USBBUS1, PCAN_BAUD_500K
 
 
-CONFIG_PATH = os.path.expanduser('~/.robot_arm_config.json')
+# 优先读仓库配置(与 can_bridge.py 一致); HOME 仅作兜底/保存目标.
+HOME_CONFIG_PATH = os.path.expanduser('~/.robot_arm_config.json')
+
+
+def _repo_config_path():
+    try:
+        return os.path.join(
+            get_package_share_directory('arm_control'), 'config', 'robot_arm_config.json')
+    except PackageNotFoundError:
+        return None
 
 
 class MotorConfig:
     def __init__(self):
         self.REDUCTION_RATIOS = [50.0, 50.0, 30.0, 82.67, 62.5, 27.0]
-        self.DIRECTION_MAP = [False, False, False, False, False, False]
+        # 电机1、2(Joint_11/12)实车转向与模型相反, 默认取反; 与 can_bridge.py 保持一致.
+        # ~/.robot_arm_config.json 存在时会覆盖这里.
+        self.DIRECTION_MAP = [True, True, False, False, False, False]
         self.SPEEDS = [250, 250, 150, 250, 250, 135]
         self.ACCELERATIONS = [500, 500, 500, 500, 500, 500]
         self.load()
 
     def load(self):
-        if not os.path.exists(CONFIG_PATH):
-            return
-        try:
-            with open(CONFIG_PATH, 'r') as f:
-                data = json.load(f)
-            if 'reduction_ratios' in data:
-                self.REDUCTION_RATIOS = data['reduction_ratios']
-            if 'direction_map' in data:
-                self.DIRECTION_MAP = data['direction_map']
-            if 'speeds' in data:
-                self.SPEEDS = data['speeds']
-            if 'accelerations' in data:
-                self.ACCELERATIONS = data['accelerations']
-        except Exception:
-            pass
+        # 优先级: 仓库 config > home 兜底 > 硬编码默认. 读到任一份即停(与 can_bridge.py 一致).
+        for path in (_repo_config_path(), HOME_CONFIG_PATH):
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                if 'reduction_ratios' in data:
+                    self.REDUCTION_RATIOS = data['reduction_ratios']
+                if 'direction_map' in data:
+                    self.DIRECTION_MAP = data['direction_map']
+                if 'speeds' in data:
+                    self.SPEEDS = data['speeds']
+                if 'accelerations' in data:
+                    self.ACCELERATIONS = data['accelerations']
+                return
+            except Exception:
+                continue
 
     def save(self):
         data = {
@@ -61,11 +77,18 @@ class MotorConfig:
             'speeds': self.SPEEDS,
             'accelerations': self.ACCELERATIONS
         }
-        try:
-            with open(CONFIG_PATH, 'w') as f:
-                json.dump(data, f, indent=2)
-        except Exception:
-            pass
+        # 写回 load 首选的同一路径(仓库 config), 保证 GUI 改完后两个节点下次读到的就是新值;
+        # 该路径不可写(无仓库/只读)时退回 HOME 兜底.
+        for path in (_repo_config_path(), HOME_CONFIG_PATH):
+            if not path:
+                continue
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, 'w') as f:
+                    json.dump(data, f, indent=2)
+                return
+            except Exception:
+                continue
 
 
 class ArmNode(Node):
