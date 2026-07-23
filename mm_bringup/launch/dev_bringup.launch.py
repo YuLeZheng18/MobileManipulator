@@ -2,14 +2,15 @@
 
 只跑给人看的可视化 + 粗粒度调度, 不碰任何硬件、不产任何 TF:
   - RViz (MoveIt 视图: 机器人模型 + 规划场景 + TF; 可手动加 Nav2 的 map/costmap/path 显示)。
-  - rqt_image_view x2 (view_cameras:=true): 监视车体相机 + 手眼深度相机画面。
+  - 相机监视 x3 (view_cameras:=true): cam_a(ArUco 转正)、cam_b(监视转正)、D435i 彩色。
   - mm_task 状态机 (默认关): 发 /go_to /initialpose、调 /grasp/* 服务, 都是小消息粗指令。
 
-⚠️ 相机画面必须走压缩传输, 别直传原始大图/点云把 WiFi 打满:
-  两机都需装 `compressed_image_transport` + `compressed_depth_image_transport`(apt);
-  Nano 相机驱动随 image_transport 自动发 <topic>/compressed 与 <topic>/compressedDepth,
-  本机 rqt 打开后在 Transport 下拉里选 compressed / compressedDepth(默认 raw 会打满带宽)。
-  深度点云更重, 调试看深度"图"(compressedDepth)即可, 别把点云拉过网。
+⚠️ 相机画面走"本机解码"而非 rqt 直吃 compressed:
+  Nano 把每路转正流/彩色流用 image_transport 发 <topic>/compressed 过网 (~0.5MB/s);
+  本机 republish 把 compressed 解回本地 raw (<name>/view, 走 loopback 不占 WiFi),
+  rqt 直接看本地 raw — 无需在 Transport 下拉手动切 compressed (那下拉易空/易错)。
+  两机都需装 compressed_image_transport (apt)。别直传原始大图/点云把 WiFi 打满。
+  深度图暂不看: compressedDepth 的 republish 有 bug, 且 depth raw ~15MB/s 过网太重。
 
 机器人端全栈 (硬件/控制/Nav2/MoveIt/感知) 在 Nano 上由 nano_bringup.launch.py 起。
 两机同一 ROS_DOMAIN_ID + 同 LAN, DDS 自动发现, 话题/TF/服务/action 跨机透明。
@@ -40,21 +41,14 @@ from launch_ros.actions import Node
 def generate_launch_description():
     run_mission = LaunchConfiguration('run_mission')
     view_cameras = LaunchConfiguration('view_cameras')
-    color_image_topic = LaunchConfiguration('color_image_topic')
-    depth_image_topic = LaunchConfiguration('depth_image_topic')
 
     args = [
         DeclareLaunchArgument('run_mission', default_value='false',
                               description='true=起 mm_task 自动跑 S0->S5; '
                                           'false=只起 RViz, 手动派命令调试 (推荐)'),
         DeclareLaunchArgument('view_cameras', default_value='false',
-                              description='起 rqt_image_view 监视相机 (需 Nano use_cameras:=true '
-                                          '且真机相机驱动就绪; 相机型号定后开)'),
-        # 话题名沿用架构 §7.1 阶段B 约定, 需与真机相机驱动实际发布名对齐
-        DeclareLaunchArgument('color_image_topic', default_value='/camera/color/image_raw',
-                              description='车体相机彩色图 (rqt 里 Transport 选 compressed)'),
-        DeclareLaunchArgument('depth_image_topic', default_value='/camera/depth/image_rect_raw',
-                              description='手眼深度相机深度图 (rqt 里 Transport 选 compressedDepth)'),
+                              description='本机监视三路相机 (需 Nano use_cameras:=true + '
+                                          'D435i 就绪); 每路 republish 解码 compressed 再 rqt'),
     ]
 
     # RViz: MoveIt 视图 (use_sim_time=false 实机时钟)。robot_state_publisher 在 Nano,
@@ -66,16 +60,26 @@ def generate_launch_description():
         launch_arguments={'use_sim_time': 'false'}.items(),
     )
 
-    # 相机监视: 各开一个 rqt_image_view (view_cameras:=true)。透传的是压缩流,
-    # 打开后在 Transport 下拉选 compressed(彩色)/ compressedDepth(深度), 勿用 raw。
-    view_color = Node(
-        package='rqt_image_view', executable='rqt_image_view', name='view_color',
-        arguments=[color_image_topic], output='screen',
-        condition=IfCondition(view_cameras))
-    view_depth = Node(
-        package='rqt_image_view', executable='rqt_image_view', name='view_depth',
-        arguments=[depth_image_topic], output='screen',
-        condition=IfCondition(view_cameras))
+    # 相机监视 (view_cameras:=true): 每路 = republish(compressed->本地raw) + rqt 看本地raw。
+    # compressed 过网 (~0.5MB/s), 本机解回 <name>/view (loopback), rqt 无需切 Transport。
+    def _view(name, compressed_in):
+        rep = Node(
+            package='image_transport', executable='republish',
+            name=f'decode_{name}', output='screen',
+            arguments=['compressed', 'raw'],
+            remappings=[('in/compressed', compressed_in), ('out', f'/{name}/view')],
+            condition=IfCondition(view_cameras))
+        view = Node(
+            package='rqt_image_view', executable='rqt_image_view', name=f'view_{name}',
+            arguments=[f'/{name}/view'], output='screen',
+            condition=IfCondition(view_cameras))
+        return [rep, view]
+
+    # cam_a/cam_b: 转正流的 compressed (mm_perception/cameras.launch.py 里的 republish 发的);
+    # D435i 彩色: realsense 双层命名空间 /camera/camera/...; 深度不看 (见文件头说明)。
+    cams = (_view('cam_a', '/cam_a/image_rot/compressed')
+            + _view('cam_b', '/cam_b/image_rot/compressed')
+            + _view('color', '/camera/camera/color/image_raw/compressed'))
 
     # mm_task: 顶层调度 (默认关, 调试时手动派命令; run_mission:=true 才自动整轮跑)
     mission = IncludeLaunchDescription(
@@ -86,4 +90,4 @@ def generate_launch_description():
         condition=IfCondition(run_mission),
     )
 
-    return LaunchDescription(args + [rviz, view_color, view_depth, mission])
+    return LaunchDescription(args + [rviz] + cams + [mission])
