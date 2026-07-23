@@ -47,9 +47,21 @@ def _setup(context, *args, **kwargs):
         parameters=[usb_cam_cfg, {'video_device': video_device,
                                   'camera_info_url': cam_info_url}],
         remappings=[
-            ('/image_raw', '/camera/image_raw'),
-            ('/camera_info', '/camera/camera_info'),
+            ('/image_raw', '/cam_a/image_raw'),
+            ('/camera_info', '/cam_a/camera_info'),
         ],
+    )
+
+    # cam_a 装反(180°): image_rotator 转正 -> /cam_a/image_rot(+camera_info_rot),
+    # 与 aruco_localizer.yaml 订阅话题对齐 (ArUco 吃转正流, 非原始歪图).
+    rotation = int(LaunchConfiguration('rotation').perform(context))
+    rotator = Node(
+        package='mm_perception', executable='image_rotator', name='image_rotator',
+        output='screen', parameters=[{'rotation': rotation}],
+        remappings=[('image_in', '/cam_a/image_raw'),
+                    ('info_in', '/cam_a/camera_info'),
+                    ('image_out', '/cam_a/image_rot'),
+                    ('info_out', '/cam_a/camera_info_rot')],
     )
 
     # with_viewer 时强制打开调试图发布 (在 yaml 之上追加覆盖)
@@ -62,7 +74,7 @@ def _setup(context, *args, **kwargs):
         parameters=aruco_params,
     )
 
-    nodes = [usb_cam, aruco]
+    nodes = [usb_cam, rotator, aruco]
 
     # 可视化窗口: rqt_image_view 直接订阅调试图 (画了检测边框+id 的相机画面).
     # 调试图话题 = 节点名 + 相对话题 ~/debug_image -> /aruco_localizer/debug_image
@@ -99,5 +111,8 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'with_viewer', default_value='true',
             description='true=弹出 rqt_image_view 显示检测画面(带边框+id); false=无窗口'),
+        DeclareLaunchArgument(
+            'rotation', default_value='180',
+            description='cam_a 装反校正角 0/90/180/270 (image_rotator)'),
         OpaqueFunction(function=_setup),
     ])

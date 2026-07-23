@@ -113,13 +113,14 @@ def generate_launch_description():
         condition=IfCondition(use_lidar),
     )
 
-    # TODO 相机驱动 (use_cameras:=true 时起, 驱动型号/话题确定后接线):
-    #   - 手眼深度相机 (Link_30, Joint_17 固连 Link_29 腕部): 供 mm_perception 抓取识别。
-    #   - 车体 ArUco 相机 (Link_13): 供 aruco_localizer 精对位。
-    #   frame_id 必须对齐 URDF 的 Link_30 / Link_13 (interface_contract 链接角色表)。
-    #   例: realsense2_camera / usb_cam Node, 此处按实物补。
+    # 车体两路 USB 相机 + 装反校正 (use_cameras:=true 时起):
+    #   cam_a (Link_13, ArUco): usb口2.2.2, 180°校正 -> /cam_a/image_rot
+    #   cam_b (Link_14, 监视):  usb口2.2.3, 180°校正 -> /cam_b/image_rot
+    # 手眼深度相机 (Link_30, D435i) 待臂复装后在 D5 补 realsense2_camera。
+    cameras = _include('mm_perception', 'cameras.launch.py',
+                       condition=IfCondition(use_cameras))
 
-    stage1 = [micro_ros_agent, arm_real, lidar]
+    stage1 = [micro_ros_agent, arm_real, lidar, cameras]
 
     # ===== 阶段2 (t=5): EKF 状态估计 =====
     # robot_localization 融合 /wheel_odom + /imu -> /odom + odom->base_link TF。
@@ -192,7 +193,12 @@ def generate_launch_description():
         condition=IfCondition(use_perception))
     aruco_localizer = Node(
         package='mm_perception', executable='aruco_localizer', name='aruco_localizer',
-        output='screen', parameters=[{'use_sim_time': use_sim_time}],
+        output='screen',
+        parameters=[
+            os.path.join(get_package_share_directory('mm_perception'),
+                         'config', 'aruco_localizer.yaml'),
+            {'use_sim_time': use_sim_time},
+        ],
         condition=IfCondition(use_perception))
     stage6 = TimerAction(period=20.0, actions=[object_detector, aruco_localizer])
 

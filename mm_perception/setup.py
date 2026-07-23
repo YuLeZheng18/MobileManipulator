@@ -33,6 +33,7 @@ setup(
     entry_points={
         'console_scripts': [
             'aruco_localizer = mm_perception.aruco_localizer:main',
+            'image_rotator = mm_perception.image_rotator:main',
             'hand_eye_calibrator = mm_perception.hand_eye_calibrator:main',
             'hand_eye_camera_check = mm_perception.hand_eye_camera_check:main',
             'hand_eye_verify = mm_perception.hand_eye_verify:main',

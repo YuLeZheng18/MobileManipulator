@@ -6,8 +6,10 @@
 aruco_localizer:
   ros__parameters:
     # ---- 话题 (按实际相机驱动改) ----
-    image_topic: /camera/image_raw
-    camera_info_topic: /camera/camera_info
+    # cam_a 装反(上下颠倒), 故吃 image_rotator 转正后的流 (cameras.launch.py 产出),
+    # 而非 usb_cam 原始 /cam_a/image_raw; camera_info 同理用转正自洽的 _rot 版.
+    image_topic: /cam_a/image_rot
+    camera_info_topic: /cam_a/camera_info_rot
 
     # ---- 坐标系 ----
     # 临时方案 (契约 §2): Link_13_optical 尚未在 URDF 建立, 先用机械系 Link_13 代替.
