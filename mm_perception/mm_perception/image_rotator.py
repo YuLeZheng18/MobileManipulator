@@ -43,15 +43,21 @@ class ImageRotator(Node):
         self.bridge = CvBridge()
         self._info_out = None  # 缓存变换后的 camera_info(尺寸不变时只算一次)
 
-        qos = QoSProfile(depth=10, history=HistoryPolicy.KEEP_LAST)
-        qos.reliability = (ReliabilityPolicy.BEST_EFFORT
-                           if self.get_parameter('use_best_effort').value
-                           else ReliabilityPolicy.RELIABLE)
+        # 输入 QoS 跟相机驱动 (多数发 BEST_EFFORT); 输出恒 RELIABLE.
+        # DDS 兼容规则: RELIABLE 发布者对 RELIABLE 和 BEST_EFFORT 订阅者都兼容, 反之不行.
+        # image_rot 只在 Nano 本地被消费 (ArUco best_effort + image_transport republish
+        # reliable -> compressed 过网监视), reliable 无 WiFi 成本却能同时喂饱两者.
+        sub_qos = QoSProfile(depth=10, history=HistoryPolicy.KEEP_LAST)
+        sub_qos.reliability = (ReliabilityPolicy.BEST_EFFORT
+                               if self.get_parameter('use_best_effort').value
+                               else ReliabilityPolicy.RELIABLE)
+        pub_qos = QoSProfile(depth=10, history=HistoryPolicy.KEEP_LAST)
+        pub_qos.reliability = ReliabilityPolicy.RELIABLE
 
-        self.pub_img = self.create_publisher(Image, 'image_out', qos)
-        self.pub_info = self.create_publisher(CameraInfo, 'info_out', qos)
-        self.create_subscription(Image, 'image_in', self._on_image, qos)
-        self.create_subscription(CameraInfo, 'info_in', self._on_info, qos)
+        self.pub_img = self.create_publisher(Image, 'image_out', pub_qos)
+        self.pub_info = self.create_publisher(CameraInfo, 'info_out', pub_qos)
+        self.create_subscription(Image, 'image_in', self._on_image, sub_qos)
+        self.create_subscription(CameraInfo, 'info_in', self._on_info, sub_qos)
         self.get_logger().info(f'image_rotator 启动: rotation={self.rot}°')
 
     def _on_image(self, msg: Image):

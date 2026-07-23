@@ -46,7 +46,17 @@ def _one_cam(percep_share, name, device, frame_id, rotation, cam_info_url=''):
                     ('image_out', f'/{name}/image_rot'),
                     ('info_out', f'/{name}/camera_info_rot')],
     )
-    return [cam, rot]
+    # 转正流 raw->compressed republish: 本机(笔记本)跨 WiFi 只订阅 compressed 看实时,
+    # 别直传 raw 转正流(640x480@30 ~220Mbps 打满 WiFi). usb_cam 原始图有 compressed,
+    # 但那是歪的; 转正流是 image_rotator 现发的, 得自己补一路 compressed.
+    republish = Node(
+        package='image_transport', executable='republish',
+        name='republish', namespace=name, output='screen',
+        arguments=['raw', 'compressed'],
+        remappings=[('in', f'/{name}/image_rot'),
+                    ('out/compressed', f'/{name}/image_rot/compressed')],
+    )
+    return [cam, rot, republish]
 
 
 def _setup(context, *args, **kwargs):
