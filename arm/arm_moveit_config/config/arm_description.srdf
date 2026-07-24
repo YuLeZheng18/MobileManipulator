@@ -23,7 +23,7 @@
         <joint name="Joint_13" value="0.5759587"/>
         <joint name="Joint_14" value="1.5707963"/>
         <joint name="Joint_15" value="0"/>
-        <joint name="Joint_16" value="2.93215314"/>
+        <joint name="Joint_16" value="2.96705973"/>
     </group_state>
     <!--VIRTUAL JOINT-->
     <virtual_joint name="virtual_joint" type="fixed" parent_frame="world" child_link="base_link"/>
