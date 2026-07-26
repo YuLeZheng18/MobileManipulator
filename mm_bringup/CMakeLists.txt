@@ -5,7 +5,7 @@ find_package(ament_cmake REQUIRED)
 
 # Only install directories that actually exist so the skeleton package
 # builds before launch/config content is added.
-foreach(dir launch config)
+foreach(dir launch config udev)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${dir}")
     install(DIRECTORY ${dir}
       DESTINATION share/${PROJECT_NAME}

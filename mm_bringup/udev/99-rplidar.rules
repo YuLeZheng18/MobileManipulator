@@ -1,0 +1,11 @@
+# 思岚 RPLIDAR A3 经 CP2102 USB-TTL 接入 -> 固定软链 /dev/rplidar
+#
+# 背景: Jetson (Orin NX/Nano) 内核无 CH340(ch341) 驱动, 且 40 针排针 UART(ttyTHS1)
+#       在 256000 波特下信号完整性不足(实测残缺乱码); 故雷达改走 CP2102 USB-TTL
+#       (内核自带 cp210x 驱动, 即插即用)。A3 波特 256000, frame_id=Link_12。
+#
+# CP2102 出厂序列号常为通用值(如 0001)不唯一, 用 VID/PID 匹配即可
+# (当前 Nano 上唯一的 CP210x 设备; 若将来再插第二个 CP2102 设备需按 serial 区分)。
+#
+# 部署: sudo cp 99-rplidar.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules && sudo udevadm trigger
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="rplidar", MODE="0666"

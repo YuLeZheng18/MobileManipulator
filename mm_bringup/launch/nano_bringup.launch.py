@@ -40,7 +40,7 @@ def generate_launch_description():
         DeclareLaunchArgument('use_perception', default_value='false',
                               description='mm_perception 真感知 (队友节点就绪后开)'),
         DeclareLaunchArgument('agent_serial_dev', default_value='/dev/ttyACM0'),
-        DeclareLaunchArgument('lidar_serial_port', default_value='/dev/ttyUSB0'),
+        DeclareLaunchArgument('lidar_serial_port', default_value='/dev/rplidar'),
     ]
 
     real = IncludeLaunchDescription(

@@ -1,0 +1,7 @@
+# ESP32-S3 底盘下位机 (micro-ROS, 原生 USB CDC) -> 固定软链 /dev/esp32_chassis
+#
+# micro-ROS 代理 --dev 用此软链, 免 ttyACM0/1 随插拔漂移。
+# ESP32-S3 native USB, VID/PID=303a:1001; serial 为板载 MAC, 唯一。
+#
+# 部署: sudo cp 99-esp32-chassis.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules && sudo udevadm trigger
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", ATTRS{serial}=="E0:72:A1:D3:66:24", SYMLINK+="esp32_chassis"
