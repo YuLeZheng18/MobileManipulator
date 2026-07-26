@@ -32,6 +32,10 @@ def generate_launch_description():
     servo_yaml = load_yaml("mm_grasp", "config/servo.yaml")
     servo_params = {"moveit_servo": servo_yaml}
 
+    # 双托盘放置 + 按类别堆叠 + 安全测试参数 (真机标定值在此 yaml).
+    place_params = os.path.join(
+        get_package_share_directory("mm_grasp"), "config", "place.yaml")
+
     servo_node = Node(
         package="moveit_servo",
         executable="servo_node_main",
@@ -55,6 +59,7 @@ def generate_launch_description():
             moveit_config.robot_description,
             moveit_config.robot_description_semantic,
             moveit_config.robot_description_kinematics,
+            place_params,
             {"use_sim_time": use_sim_time},
         ],
     )

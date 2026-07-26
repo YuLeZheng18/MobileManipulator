@@ -46,6 +46,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 import cv2
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped, Pose, PoseArray
+from std_msgs.msg import Int32, Float32
 import tf2_ros
 
 # 必须在 import ultralytics 前注入 torchvision 兜底 (Jetson 系统 GPU torch 无匹配
@@ -118,6 +119,11 @@ class YoloBoxDetector(Node):
         # 多目标: 所有盒子位姿数组 (PoseArray). 单目标 pose_topic 仍恒发最大框.
         self.declare_parameter('poses_topic', '/perception/object_poses')
         self.declare_parameter('only_largest', True)    # 单目标: 只发最大框
+        # B 路线(队友停工本人补): 与单目标 pose 同步发"当前目标类别 + 厚度(米)",
+        # grasp_node 订阅以按类别分托盘 + 视觉厚度堆叠. 类别取 class_names 里的数字名,
+        # 解析失败发 0; 厚度=台面深度-顶面深度. 话题名与 grasp place.yaml 对齐.
+        self.declare_parameter('class_topic', '/perception/object_class')
+        self.declare_parameter('thickness_topic', '/perception/object_thickness')
 
         # ---- 可视化 ----
         self.declare_parameter('show_window', True)
@@ -200,12 +206,19 @@ class YoloBoxDetector(Node):
         # ---- 位姿发布 (契约 §1) ----
         self._pose_pub = None
         self._poses_pub = None
+        self._class_pub = None
+        self._thickness_pub = None
         if self.publish_pose:
             self._pose_pub = self.create_publisher(
                 PoseStamped, gp('pose_topic').value, 10)
             # 多目标数组: 所有有 base_link 坐标的盒子
             self._poses_pub = self.create_publisher(
                 PoseArray, gp('poses_topic').value, 10)
+            # B 路线: 当前目标(=面积最大框)的类别与厚度, 与单目标 pose 同步发.
+            self._class_pub = self.create_publisher(
+                Int32, gp('class_topic').value, 10)
+            self._thickness_pub = self.create_publisher(
+                Float32, gp('thickness_topic').value, 10)
 
         self.get_logger().info(
             'yolo_box_detector(抓取版) 就绪: 深度模式=%s, camera_frame=%s -> %s, 发位姿=%s, 类过滤=%s'
@@ -445,7 +458,9 @@ class YoloBoxDetector(Node):
         p_cam = self._pixel_to_cam(cu, cv_, d)   # 相机系 3D 坐标, 不依赖 TF
         p_base = (R @ p_cam + t) if R is not None else None
         yaw = self._estimate_yaw(c, cu, cv_, d, R, axis)
-        return (cu, cv_, d, p_base, yaw, p_cam)
+        # 盒子厚度 = 台面深度 - 顶面中心深度 (凸起朝相机 -> 顶面更近, 差为正). 供堆叠放置用.
+        thickness = float(table - d)
+        return (cu, cv_, d, p_base, yaw, p_cam, thickness)
 
     def _center_depth(self, depth, u, v):
         """取 (u,v) 邻域内有效深度中值. 无有效值返回 0."""
@@ -533,7 +548,7 @@ class YoloBoxDetector(Node):
             return
         lines = ['检测到 %d 个盒子 (顶面中心):' % len(valid)]
         for i, (x1, y1, x2, y2, name, cf, pose, _corners) in enumerate(valid):
-            cu, cv_, d, p, yaw, p_cam = pose
+            cu, cv_, d, p, yaw, p_cam, _th = pose
             # 中心点坐标+深度恒有效 (相机系 Link_30, 纯几何不依赖 TF)
             base = ('   base_link=[%.3f, %.3f, %.3f]m yaw=%s'
                     % (p[0], p[1], p[2],
@@ -557,7 +572,7 @@ class YoloBoxDetector(Node):
             return
 
         def to_pose(r):
-            _cu, _cv, _d, p, yaw, _p_cam = r[6]
+            _cu, _cv, _d, p, yaw, _p_cam, _th = r[6]
             yaw = yaw if yaw is not None else 0.0
             ps = Pose()
             ps.position.x = float(p[0])
@@ -574,6 +589,18 @@ class YoloBoxDetector(Node):
         msg.header.frame_id = self.base_frame
         msg.pose = to_pose(target)
         self._pose_pub.publish(msg)
+
+        # B 路线: 与单目标 pose 同步发当前目标的类别 + 厚度. 类别名(class_names)是数字字符串,
+        # 解析成 int 发 Int32; 解析失败发 0 (grasp_node 兜底). 厚度(米)是 pose 元组第 7 位.
+        if self._class_pub is not None:
+            name = target[4]
+            try:
+                cat = int(str(name).strip())
+            except (ValueError, TypeError):
+                cat = 0
+            self._class_pub.publish(Int32(data=cat))
+        if self._thickness_pub is not None:
+            self._thickness_pub.publish(Float32(data=float(target[6][6])))
 
         # 多目标数组: 所有有 base_link 坐标的盒子 (面积降序)
         if self._poses_pub is not None:
@@ -595,7 +622,7 @@ class YoloBoxDetector(Node):
                 cv2.putText(bgr, '%s %.2f (no depth)' % (name, cf), (x1, y1 - 6),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 2, cv2.LINE_AA)
                 continue
-            cu, cv_, d, p, yaw, p_cam = pose
+            cu, cv_, d, p, yaw, p_cam, _th = pose
             # cu,cv_ 在深度图坐标系(raw 模式); 画到彩色图需转回彩色像素
             pcu, pcv = self._depth_px_to_color_px(cu, cv_) if self.use_raw_depth else (cu, cv_)
             # 物体坐标系 (X=红沿长轴, Y=绿, Z=蓝竖直向上): 有 base 位姿+yaw 才画

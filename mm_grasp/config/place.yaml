@@ -1,0 +1,45 @@
+grasp_node:
+  ros__parameters:
+    # ============================================================
+    #  双托盘放置 + 按类别堆叠 (真机标定值, base_link 系)
+    #  release z = 托盘"空载吸盘接触中心"标定 z + 累计下层厚度 + 本层厚度
+    #  厚度来源: 视觉识别值(B 路线话题带过来), 识别失败用 fallback_thickness 兜底.
+    # ============================================================
+
+    num_trays: 2                    # 托盘数. 数组参数长度须与此一致.
+
+    # 托盘"空载吸盘接触托盘中心"位姿 (真机 RViz/实测标定). 索引 0=右托盘, 1=左托盘.
+    #   xyz = suction_tip 空载贴托盘中心时的位置; quat = 工具朝下的标定朝向(非单位姿态).
+    #   放置时: 规划到此 xy+朝向的正上方 -> 笛卡尔垂直直下到 release z(见上式) -> 释放.
+    tray_x:  [-0.235, -0.235]
+    tray_y:  [ 0.047, -0.062]
+    tray_z:  [ 0.079,  0.081]
+    tray_qx: [ 0.009,  0.009]
+    tray_qy: [ 0.000,  0.000]
+    tray_qz: [ 1.000,  1.000]
+    tray_qw: [ 0.000,  0.000]
+
+    tray_capacity: [2, 2]           # 每托盘最多摞几个盒 (满了拒绝再放, 防撞).
+
+    # ---- 类别 -> 托盘映射 ----
+    # category_ids[i] 类别的盒子放到 category_tray[i] 号托盘 (0=右,1=左).
+    # 用户确认: 类别1,2 -> 左托盘(索引1); 类别3,4 -> 右托盘(索引0).
+    category_ids:   [1, 2, 3, 4]
+    category_tray:  [1, 1, 0, 0]
+
+    # 厚度识别兜底 (米), 按 category_ids 顺序. B 路线话题给到有效厚度时优先用识别值,
+    # 收不到/无效才回退到这里对应类别的值.
+    fallback_thickness: [0.025, 0.025, 0.025, 0.025]
+
+    # ---- 四步渐进安全测试开关 (Task #1) ----
+    # dry_run=true: 放置只 plan + 打印轨迹信息, 不 execute (第①②步看轨迹/RViz).
+    # place_velocity_scaling: 放置段整体降速 (第④步慢速真跑, 建议 0.1).
+    dry_run: false
+    place_velocity_scaling: 1.0
+
+    # ---- 类别+厚度话题 (B 路线, Task #4) ----
+    # 队友视觉侧额外发的轻量话题: 当前目标盒的 类别(int) + 厚度(米,float).
+    # 话题名/字段形式与队友对齐后改这里; 收不到则 execute 用 default_category 兜底.
+    class_topic: /perception/object_class        # std_msgs/Int32: 当前目标类别
+    thickness_topic: /perception/object_thickness # std_msgs/Float32: 当前目标厚度(米)
+    default_category: 1                            # 收不到类别时按此类别放 (兜底)

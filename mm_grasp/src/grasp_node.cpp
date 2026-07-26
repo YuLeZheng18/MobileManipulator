@@ -12,6 +12,7 @@
 //
 // M4: std_srvs/Trigger 服务 /grasp/execute 触发一整轮.
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <map>
@@ -29,7 +30,12 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <std_msgs/msg/int8.hpp>
+#include <std_msgs/msg/int32.hpp>
+#include <std_msgs/msg/float32.hpp>
 #include <std_srvs/srv/trigger.hpp>
+
+#include <mutex>
+#include <vector>
 
 using namespace std::chrono_literals;
 
@@ -76,18 +82,40 @@ public:
     // 放托盘"正上方"抬高量: 到此高度盒远离托盘边框, 规划器不绕圈, 再垂直直下入位.
     tray_clearance_ = node_->declare_parameter<double>("tray_clearance", 0.06);
 
-    // 放托盘目标位姿 (base_link 系): 直接用 RViz 规划到"盒底贴托盘中心"时实测的
-    // suction_tip 位姿, 而非 Link_11 原点(那只是 URDF 占位, 非实际放盒点). 此后方位置
-    // 可达的关键是工具 yaw≈180°朝下(非单位姿态), 故位姿含朝向一并标定. 可 GUI 复标覆盖.
-    // z 由实测"盒底贴托盘底"的 0.102 抬 4mm -> 0.106: 盒子进碰撞后, 贴合接触态目标会被
-    // 判 goal-in-collision 规划失败; 抬 4mm 让盒底离托盘底一点点, 规划得过, 释放后轻落。
-    tray_place_x_ = node_->declare_parameter<double>("tray_place_x", -0.234);
-    tray_place_y_ = node_->declare_parameter<double>("tray_place_y", -0.054);
-    tray_place_z_ = node_->declare_parameter<double>("tray_place_z", 0.106);
-    tray_place_qx_ = node_->declare_parameter<double>("tray_place_qx", 0.009);
-    tray_place_qy_ = node_->declare_parameter<double>("tray_place_qy", 0.0);
-    tray_place_qz_ = node_->declare_parameter<double>("tray_place_qz", 1.0);
-    tray_place_qw_ = node_->declare_parameter<double>("tray_place_qw", 0.0);
+    // ---- 双托盘放置 + 按类别堆叠 (标定值在 place.yaml, base_link 系) ----
+    // 托盘"空载吸盘接触托盘中心"位姿: xyz=空载 suction_tip 贴托盘中心时的位置, quat=工具朝下
+    // 标定朝向(非单位姿态). release z = tray_z + 累计下层厚度 + 本层厚度 (吸盘吸盒顶, 盒底落
+    // 在托盘/下层盒顶). 索引 0=右托盘, 1=左托盘. 缺省两组占位, 真机以 place.yaml 覆盖.
+    num_trays_ = static_cast<int>(getOrDeclare<int64_t>("num_trays", 2));
+    tray_x_  = getOrDeclare<std::vector<double>>("tray_x",  {-0.235, -0.235});
+    tray_y_  = getOrDeclare<std::vector<double>>("tray_y",  {0.047, -0.062});
+    tray_z_  = getOrDeclare<std::vector<double>>("tray_z",  {0.079, 0.081});
+    tray_qx_ = getOrDeclare<std::vector<double>>("tray_qx", {0.009, 0.009});
+    tray_qy_ = getOrDeclare<std::vector<double>>("tray_qy", {0.0, 0.0});
+    tray_qz_ = getOrDeclare<std::vector<double>>("tray_qz", {1.0, 1.0});
+    tray_qw_ = getOrDeclare<std::vector<double>>("tray_qw", {0.0, 0.0});
+    tray_capacity_ = getOrDeclare<std::vector<int64_t>>("tray_capacity", {2, 2});
+
+    // 类别 -> 托盘映射: category_ids[i] 的盒子放到 category_tray[i] 号托盘(0=右,1=左).
+    category_ids_  = getOrDeclare<std::vector<int64_t>>("category_ids",  {1, 2, 3, 4});
+    category_tray_ = getOrDeclare<std::vector<int64_t>>("category_tray", {0, 0, 1, 1});
+    // 厚度识别兜底(米, 按 category_ids 顺序): B 路线话题无有效厚度时回退到此.
+    fallback_thickness_ = getOrDeclare<std::vector<double>>(
+      "fallback_thickness", {0.025, 0.025, 0.025, 0.025});
+
+    // ---- 四步渐进安全测试 (Task #1) ----
+    // dry_run: 放置只 plan+打印不 execute; place_velocity_scaling: 放置段整体降速.
+    dry_run_ = getOrDeclare<bool>("dry_run", false);
+    place_velocity_scaling_ = getOrDeclare<double>("place_velocity_scaling", 1.0);
+
+    // ---- 类别+厚度话题 (B 路线, Task #4) ----
+    class_topic_ = getOrDeclare<std::string>("class_topic", "/perception/object_class");
+    thickness_topic_ = getOrDeclare<std::string>("thickness_topic", "/perception/object_thickness");
+    default_category_ = static_cast<int>(getOrDeclare<int64_t>("default_category", 1));
+
+    // 运行时堆叠状态: 每托盘已放盒数 + 累计厚度. reset 服务清零(新一轮).
+    tray_layers_.assign(num_trays_, 0);
+    tray_stack_h_.assign(num_trays_, 0.0);
 
     // 卸货目的地 (base_link 系, top-down, 写死车右侧地面): 从托盘取盒后, 先到上方,
     // 再笛卡尔直下到吸盘末端 z=place_z_ (盒底离地 ~5mm) 才释放, 盒子落稳而非半空抛.
@@ -135,6 +163,23 @@ public:
         have_object_ = true;
       });
 
+    // B 路线: 队友视觉侧额外发的"当前目标类别 + 厚度(米)". 回调只缓存, 放置时取最新.
+    // 收不到则 execute 用 default_category_ + fallback_thickness_ 兜底, 不阻塞抓取.
+    class_sub_ = node_->create_subscription<std_msgs::msg::Int32>(
+      class_topic_, rclcpp::SensorDataQoS(),
+      [this](std_msgs::msg::Int32::SharedPtr msg) {
+        std::lock_guard<std::mutex> lk(cls_mtx_);
+        last_category_ = msg->data;
+        have_category_ = true;
+      });
+    thickness_sub_ = node_->create_subscription<std_msgs::msg::Float32>(
+      thickness_topic_, rclcpp::SensorDataQoS(),
+      [this](std_msgs::msg::Float32::SharedPtr msg) {
+        std::lock_guard<std::mutex> lk(cls_mtx_);
+        last_thickness_ = msg->data;
+        have_thickness_ = true;
+      });
+
     pump_pub_ = node_->create_publisher<std_msgs::msg::Int8>(pump_topic_, 10);
     twist_pub_ = node_->create_publisher<geometry_msgs::msg::TwistStamped>(
       "/servo_node/delta_twist_cmds", 10);
@@ -177,6 +222,18 @@ public:
         res->message = res->success ? "arm at look pose" : "move to look failed";
       },
       rmw_qos_profile_services_default, srv_cb_group_);
+    // 堆叠计数清零 (mm_task 新一轮搬运开始时调): 每托盘层数与累计厚度归零.
+    reset_srv_ = node_->create_service<std_srvs::srv::Trigger>(
+      "/grasp/reset_stack",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        std::lock_guard<std::mutex> lk(stack_mtx_);
+        std::fill(tray_layers_.begin(), tray_layers_.end(), 0);
+        std::fill(tray_stack_h_.begin(), tray_stack_h_.end(), 0.0);
+        RCLCPP_INFO(logger_, "堆叠计数已清零 (%d 托盘)", num_trays_);
+        res->success = true; res->message = "stack counters reset";
+      },
+      rmw_qos_profile_services_default, srv_cb_group_);
 
     RCLCPP_INFO(logger_,
                 "grasp_node 就绪: group=%s ee=%s base=%s 订 %s 发 %s, "
@@ -204,34 +261,143 @@ public:
   }
 
 private:
+  // 参数取值: 节点用 automatically_declare_parameters_from_overrides, place.yaml 里的键
+  // 已被自动声明, 再 declare_parameter 会抛 already-declared. 已声明则直接取, 否则声明带默认.
+  template <typename T>
+  T getOrDeclare(const std::string & name, const T & def)
+  {
+    if (node_->has_parameter(name)) return node_->get_parameter(name).get_value<T>();
+    return node_->declare_parameter<T>(name, def);
+  }
+
   // ---- 主流程 ----
   // /grasp/execute: 三段抓取源盒 -> 放到自己的托盘(Link_11).
   void onExecute(const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
                  std::shared_ptr<std_srvs::srv::Trigger::Response> res)
   {
-    RCLCPP_INFO(logger_, "==== /grasp/execute: 抓源盒 -> 放托盘 ====");
+    // 当前目标类别 + 厚度: B 路线话题优先, 收不到用兜底. 决定放哪个托盘 + 本层厚度.
+    int category = currentCategory();
+    int ci = categoryIndex(category);
+    if (ci < 0) {
+      res->success = false;
+      res->message = "未知类别 " + std::to_string(category) + " (不在 category_ids)";
+      RCLCPP_ERROR(logger_, "%s", res->message.c_str()); return;
+    }
+    int tray = static_cast<int>(category_tray_[ci]);
+    if (tray < 0 || tray >= num_trays_) {
+      res->success = false; res->message = "类别映射托盘号越界"; return;
+    }
+    double thickness = currentThickness(ci);
+
+    RCLCPP_INFO(logger_,
+                "==== /grasp/execute: 类别 %d -> %d号托盘, 厚度 %.1fmm, 已有 %d 层 ====",
+                category, tray, thickness * 1000, trayLayers(tray));
+
+    // 满盘保护: 防撞已摞满的盒.
+    if (trayLayers(tray) >= static_cast<int>(tray_capacity_[tray])) {
+      res->success = false;
+      res->message = std::to_string(tray) + "号托盘已满(" +
+                     std::to_string(tray_capacity_[tray]) + ")";
+      RCLCPP_ERROR(logger_, "%s", res->message.c_str()); return;
+    }
+
+    // release z = 托盘空载接触 z + 累计下层厚度 + 本层厚度 (吸盘吸盒顶, 盒底落下层顶).
+    const double release_z = tray_z_[tray] + trayStackH(tray) + thickness;
+    geometry_msgs::msg::Pose target = trayContactPose(tray);
+    target.position.z = release_z;
+
+    char what[64];
+    std::snprintf(what, sizeof(what), "%d号托盘第%d层", tray, trayLayers(tray) + 1);
+
+    if (dry_run_) {
+      // 安全测试(第①②③步): 不抓真盒, 挂个虚拟盒让规划考虑几何, 只走放置轨迹规划/慢跑,
+      // 不吸不放不计堆叠. 走完清掉虚拟盒.
+      attachBox(false);
+      bool ok = placeAtPose(target, what);
+      detachBox();
+      res->success = ok;
+      res->message = ok ? std::string("[dry_run] 放置轨迹规划通过: ") + what
+                        : std::string("[dry_run] 放置轨迹规划失败: ") + what;
+      RCLCPP_WARN(logger_, "==== [dry_run] 一轮结束 (%s), 不计堆叠 ====", what);
+      return;
+    }
 
     std::string err;
     // 放托盘: 盒 attach 不允许碰托盘(否则又蹭边框)
     if (!pickCycle(err, false)) { res->success = false; res->message = err; return; }
 
-    geometry_msgs::msg::Pose tray;
-    tray.position.x = tray_place_x_;
-    tray.position.y = tray_place_y_;
-    tray.position.z = tray_place_z_;
-    tray.orientation.x = tray_place_qx_;
-    tray.orientation.y = tray_place_qy_;
-    tray.orientation.z = tray_place_qz_;
-    tray.orientation.w = tray_place_qw_;
-    if (!placeAtPose(tray, "托盘")) {
-      res->success = false; res->message = "放托盘失败(已吸取)"; return;
+    if (!placeAtPose(target, what)) {
+      res->success = false; res->message = std::string("放置失败(已吸取): ") + what; return;
     }
+    // 放置成功才计入堆叠: 层数+1, 累计厚度 += 本层厚度.
+    pushLayer(tray, thickness);
+
     if (!moveToReady()) {
-      res->success = false; res->message = "放托盘后回 ready 失败"; return;
+      res->success = false; res->message = "放置后回 ready 失败"; return;
     }
 
-    RCLCPP_INFO(logger_, "==== 抓放一轮完成 ====");
-    res->success = true; res->message = "grasp cycle done";
+    RCLCPP_INFO(logger_, "==== 抓放一轮完成 (%s, 累计高 %.1fmm) ====",
+                what, trayStackH(tray) * 1000);
+    res->success = true; res->message = std::string("grasp cycle done: ") + what;
+  }
+
+  // ---- 堆叠状态 / 类别映射 工具 ----
+  int currentCategory()
+  {
+    std::lock_guard<std::mutex> lk(cls_mtx_);
+    return have_category_ ? last_category_ : default_category_;
+  }
+
+  // 类别 -> category_ids 下标 (映射表/厚度表都按此下标索引). 找不到返回 -1.
+  int categoryIndex(int category) const
+  {
+    for (size_t i = 0; i < category_ids_.size(); ++i) {
+      if (static_cast<int>(category_ids_[i]) == category) return static_cast<int>(i);
+    }
+    return -1;
+  }
+
+  // 本层厚度(米): B 路线话题有有效值(>0)优先, 否则回退该类别 fallback_thickness.
+  double currentThickness(int ci)
+  {
+    std::lock_guard<std::mutex> lk(cls_mtx_);
+    if (have_thickness_ && last_thickness_ > 1e-4) return last_thickness_;
+    if (ci >= 0 && ci < static_cast<int>(fallback_thickness_.size())) {
+      return fallback_thickness_[ci];
+    }
+    return 0.025;
+  }
+
+  geometry_msgs::msg::Pose trayContactPose(int t) const
+  {
+    geometry_msgs::msg::Pose p;
+    p.position.x = tray_x_[t];
+    p.position.y = tray_y_[t];
+    p.position.z = tray_z_[t];
+    p.orientation.x = tray_qx_[t];
+    p.orientation.y = tray_qy_[t];
+    p.orientation.z = tray_qz_[t];
+    p.orientation.w = tray_qw_[t];
+    return p;
+  }
+
+  int trayLayers(int t)
+  {
+    std::lock_guard<std::mutex> lk(stack_mtx_);
+    return tray_layers_[t];
+  }
+
+  double trayStackH(int t)
+  {
+    std::lock_guard<std::mutex> lk(stack_mtx_);
+    return tray_stack_h_[t];
+  }
+
+  void pushLayer(int t, double thickness)
+  {
+    std::lock_guard<std::mutex> lk(stack_mtx_);
+    tray_layers_[t] += 1;
+    tray_stack_h_[t] += thickness;
   }
 
   // /grasp/unload: 从托盘取盒(此刻 object_pose 报的就是托盘上的盒) -> 放到目的地(参数).
@@ -504,15 +670,24 @@ private:
   // 顶上空旷处入、再垂直直下, 盒竖直进托盘不蹭边框, 规划器无需绕路, 路径直不甩.
   bool placeAtPose(const geometry_msgs::msg::Pose & target, const char * what)
   {
+    // 四步渐进安全测试: 放置段整体降速(默认 0.2, place_velocity_scaling 再乘一档),
+    // 收尾恢复. dry_run 时只 plan+打印, 不 execute, 也不动气泵/detach (盒仍吸着不释放).
+    const double base_v = 0.2;
+    move_group_->setMaxVelocityScalingFactor(base_v * place_velocity_scaling_);
+    move_group_->setMaxAccelerationScalingFactor(base_v * place_velocity_scaling_);
+    if (dry_run_) {
+      RCLCPP_WARN(logger_, "放置(%s): [dry_run] 只规划打印, 不执行/不释放", what);
+    }
+
     // 携盒相对抬起, 先让盒离开当前接触面
     geometry_msgs::msg::PoseStamped cur;
-    if (!currentTcp(cur)) return false;
+    if (!currentTcp(cur)) { restorePlanScaling(); return false; }
     geometry_msgs::msg::Pose up = cur.pose;
     up.position.z += lift_height_;
     std::vector<geometry_msgs::msg::Pose> wps{up};
     moveit_msgs::msg::RobotTrajectory traj;
     move_group_->setStartStateToCurrentState();
-    if (move_group_->computeCartesianPath(wps, 0.005, 0.0, traj) > 0.5) {
+    if (move_group_->computeCartesianPath(wps, 0.005, 0.0, traj) > 0.5 && !dry_run_) {
       move_group_->execute(traj);
       RCLCPP_INFO(logger_, "放置(%s): 已抬起 %.0fcm", what, lift_height_ * 100);
     }
@@ -526,9 +701,15 @@ private:
     if (move_group_->plan(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
       RCLCPP_ERROR(logger_, "放置(%s): 规划到正上方 (%.3f,%.3f,%.3f) 失败", what,
                    above.position.x, above.position.y, above.position.z);
-      return false;
+      restorePlanScaling(); return false;
     }
-    if (move_group_->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) return false;
+    RCLCPP_INFO(logger_, "放置(%s): 规划到正上方 (%.3f,%.3f,%.3f) 成功, 轨迹 %zu 点", what,
+                above.position.x, above.position.y, above.position.z,
+                plan.trajectory_.joint_trajectory.points.size());
+    if (!dry_run_ &&
+        move_group_->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+      restorePlanScaling(); return false;
+    }
 
     // 笛卡尔垂直直下到标定放置位姿: 盒竖直入托盘, 不侧向蹭边框
     std::vector<geometry_msgs::msg::Pose> dwps{target};
@@ -537,15 +718,31 @@ private:
     const double frac = move_group_->computeCartesianPath(dwps, 0.005, 0.0, dtraj);
     if (frac < 0.9) {
       RCLCPP_ERROR(logger_, "放置(%s): 垂直直下路径覆盖不足 %.0f%%", what, frac * 100);
-      return false;
+      restorePlanScaling(); return false;
     }
-    if (move_group_->execute(dtraj) != moveit::core::MoveItErrorCode::SUCCESS) return false;
+    if (dry_run_) {
+      RCLCPP_WARN(logger_, "放置(%s): [dry_run] 直下路径覆盖 %.0f%%, 目标 z=%.3f, 到此为止不执行",
+                  what, frac * 100, target.position.z);
+      restorePlanScaling();
+      return true;   // dry_run 视为通过(规划全成功), 但不真放/不计堆叠由调用侧另判
+    }
+    if (move_group_->execute(dtraj) != moveit::core::MoveItErrorCode::SUCCESS) {
+      restorePlanScaling(); return false;
+    }
 
     publishPump(PUMP_RELEASE);
     detachBox();
+    restorePlanScaling();
     RCLCPP_INFO(logger_, "放置(%s): 垂直入位到 (%.3f,%.3f,%.3f), 发 /pump_cmd 2 释放", what,
                 target.position.x, target.position.y, target.position.z);
     return true;
+  }
+
+  // 放置段结束恢复 MoveGroup 默认规划缩放 (initMoveGroup 里设的 0.2).
+  void restorePlanScaling()
+  {
+    move_group_->setMaxVelocityScalingFactor(0.2);
+    move_group_->setMaxAccelerationScalingFactor(0.2);
   }
 
   // ---- 工具 ----
@@ -626,9 +823,26 @@ private:
   rclcpp::Logger logger_;
   std::string planning_group_, ee_link_, base_frame_, tray_frame_, object_topic_, pump_topic_;
   double pregrasp_height_, refine_height_, insert_stroke_, lift_height_, tray_clearance_;
-  double tray_place_x_, tray_place_y_, tray_place_z_;
-  double tray_place_qx_, tray_place_qy_, tray_place_qz_, tray_place_qw_;
   double place_x_, place_y_, place_z_, place_clearance_;
+
+  // 双托盘放置 + 按类别堆叠
+  int num_trays_{2};
+  std::vector<double> tray_x_, tray_y_, tray_z_, tray_qx_, tray_qy_, tray_qz_, tray_qw_;
+  std::vector<int64_t> tray_capacity_, category_ids_, category_tray_;
+  std::vector<double> fallback_thickness_;
+  bool dry_run_{false};
+  double place_velocity_scaling_{1.0};
+  std::string class_topic_, thickness_topic_;
+  int default_category_{1};
+  // 运行时堆叠状态 (stack_mtx_ 保护)
+  std::mutex stack_mtx_;
+  std::vector<int> tray_layers_;
+  std::vector<double> tray_stack_h_;
+  // 类别/厚度 B 路线缓存 (cls_mtx_ 保护)
+  std::mutex cls_mtx_;
+  int last_category_{1};
+  double last_thickness_{0.0};
+  bool have_category_{false}, have_thickness_{false};
   double box_size_x_, box_size_y_, box_size_z_;
   std::string j1_name_;
   double look_j1_offset_;
@@ -644,10 +858,12 @@ private:
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr object_sub_;
+  rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr class_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr thickness_sub_;
   rclcpp::Publisher<std_msgs::msg::Int8>::SharedPtr pump_pub_;
   rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr twist_pub_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr start_servo_cli_, stop_servo_cli_;
-  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_, unload_srv_, ready_srv_, look_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_, unload_srv_, ready_srv_, look_srv_, reset_srv_;
   rclcpp::CallbackGroup::SharedPtr srv_cb_group_;
 
   std::mutex obj_mtx_;

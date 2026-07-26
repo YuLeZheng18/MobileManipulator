@@ -56,5 +56,11 @@ yolo_box_detector:
     only_largest: false             # false=检测/画/打印所有盒子; 位姿话题仍只发最大框(抓取一次一个).
                                     #   true=检测阶段就只留最大框(窗口也只显示一个).
 
+    # ---- B 路线: 当前目标 类别 + 厚度 (grasp_node 订阅, 按类别分托盘 + 视觉厚度堆叠) ----
+    # 与单目标 pose 同步发. 类别取 class_names 数字名解析为 int; 厚度=台面深度-顶面深度(米).
+    # 话题名须与 mm_grasp/config/place.yaml 的 class_topic/thickness_topic 一致.
+    class_topic: /perception/object_class        # std_msgs/Int32: 当前目标类别(1/2/3/4)
+    thickness_topic: /perception/object_thickness # std_msgs/Float32: 当前目标厚度(米)
+
     # ---- 可视化 ----
     show_window: true               # 无显示器/远程置 false
