@@ -22,6 +22,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit/planning_scene_interface/planning_scene_interface.h>
+#include <moveit/robot_state/robot_state.h>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
 #include <moveit_msgs/msg/collision_object.hpp>
 #include <shape_msgs/msg/solid_primitive.hpp>
@@ -312,7 +313,7 @@ private:
     if (dry_run_) {
       // 安全测试(第①②③步): 不抓真盒, 挂个虚拟盒让规划考虑几何, 只走放置轨迹规划/慢跑,
       // 不吸不放不计堆叠. 走完清掉虚拟盒.
-      attachBox(false);
+      attachBox(true);
       bool ok = placeAtPose(target, what);
       detachBox();
       res->success = ok;
@@ -323,8 +324,10 @@ private:
     }
 
     std::string err;
-    // 放托盘: 盒 attach 不允许碰托盘(否则又蹭边框)
-    if (!pickCycle(err, false)) { res->success = false; res->message = err; return; }
+    // 盒 attach 后豁免与托盘接触: 放到位时盒底本就落在托盘面(标定 tray_z 比 Link_11 网格
+    // 顶面低几 mm), 不豁免则直下段被判碰撞截断. 侧蹭边框的顾虑已由"正上方->垂直直下"
+    // 的入位方式消除, 不再靠碰撞检测拦.
+    if (!pickCycle(err, true)) { res->success = false; res->message = err; return; }
 
     if (!placeAtPose(target, what)) {
       res->success = false; res->message = std::string("放置失败(已吸取): ") + what; return;
@@ -542,8 +545,9 @@ private:
   // 把盒子作为 attached collision object 挂到吸盘: 吸取后吸盘末端在盒顶, 盒心在吸盘
   // -Z(工具系向下)方向 0.0125 处. 此后 MoveIt 规划放置路径会考虑这块几何, 从上方入托盘
   // 而非侧向蹭过边框. touch_links 默认只放吸盘 link (吸取处接触不误报);
-  // allow_tray_touch=true 时再把托盘 link 加进 touch_links —— 卸货取盒时盒本在托盘里,
-  // 几何与 Link_11 重叠, 不豁免这对接触则规划器判 start-in-collision, 连抬起都规划不了.
+  // allow_tray_touch=true 时再把托盘 link 加进 touch_links —— 盒与 Link_11 的接触是预期的:
+  // 卸货取盒时盒本在托盘里几何重叠, 放盒到位时盒底落在托盘面. 不豁免则规划器判碰撞,
+  // 取盒连抬起都规划不了, 放盒直下段中途被截断.
   void attachBox(bool allow_tray_touch)
   {
     moveit_msgs::msg::CollisionObject co;
@@ -687,9 +691,13 @@ private:
     std::vector<geometry_msgs::msg::Pose> wps{up};
     moveit_msgs::msg::RobotTrajectory traj;
     move_group_->setStartStateToCurrentState();
-    if (move_group_->computeCartesianPath(wps, 0.005, 0.0, traj) > 0.5 && !dry_run_) {
+    const double up_frac = move_group_->computeCartesianPath(wps, 0.005, 0.0, traj);
+    if (up_frac > 0.5 && !dry_run_) {
       move_group_->execute(traj);
       RCLCPP_INFO(logger_, "放置(%s): 已抬起 %.0fcm", what, lift_height_ * 100);
+    } else if (dry_run_) {
+      RCLCPP_WARN(logger_, "放置(%s): [dry_run] 抬起路径覆盖 %.0f%%, 不执行",
+                  what, up_frac * 100);
     }
 
     // 规划到目标正上方 (xy+朝向用标定值, z 抬 tray_clearance_)
@@ -714,7 +722,16 @@ private:
     // 笛卡尔垂直直下到标定放置位姿: 盒竖直入托盘, 不侧向蹭边框
     std::vector<geometry_msgs::msg::Pose> dwps{target};
     moveit_msgs::msg::RobotTrajectory dtraj;
-    move_group_->setStartStateToCurrentState();
+    // dry_run 下上面两段都没真执行, 臂还停在原处; 直下段起点若仍取实测当前状态, 等于要求
+    // 从原处一步笛卡尔跨到托盘正上方, 覆盖必然 0%. 故接上一段规划的终点作起点.
+    if (dry_run_) {
+      moveit::core::RobotState start(*move_group_->getCurrentState());
+      const auto & jt = plan.trajectory_.joint_trajectory;
+      start.setVariablePositions(jt.joint_names, jt.points.back().positions);
+      move_group_->setStartState(start);
+    } else {
+      move_group_->setStartStateToCurrentState();
+    }
     const double frac = move_group_->computeCartesianPath(dwps, 0.005, 0.0, dtraj);
     if (frac < 0.9) {
       RCLCPP_ERROR(logger_, "放置(%s): 垂直直下路径覆盖不足 %.0f%%", what, frac * 100);

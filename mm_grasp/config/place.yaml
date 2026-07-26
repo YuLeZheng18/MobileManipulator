@@ -32,10 +32,12 @@ grasp_node:
     fallback_thickness: [0.025, 0.025, 0.025, 0.025]
 
     # ---- 四步渐进安全测试开关 (Task #1) ----
-    # dry_run=true: 放置只 plan + 打印轨迹信息, 不 execute (第①②步看轨迹/RViz).
-    # place_velocity_scaling: 放置段整体降速 (第④步慢速真跑, 建议 0.1).
-    dry_run: false
-    place_velocity_scaling: 1.0
+    # 刻意不在此声明 dry_run / place_velocity_scaling: 具名节点条目("grasp_node")
+    # 优先级高于 launch 传的通配条目和 -p, 写在这里会把命令行值压掉, 开关静默失效.
+    # 默认值由 grasp_node.cpp 的 getOrDeclare 兜底 (dry_run=false, scaling=1.0),
+    # 测试时用 launch 参数覆盖:
+    #   ros2 launch mm_grasp grasp.launch.py dry_run:=true
+    #   ros2 launch mm_grasp grasp.launch.py place_velocity_scaling:=0.1
 
     # ---- 类别+厚度话题 (B 路线, Task #4) ----
     # 队友视觉侧额外发的轻量话题: 当前目标盒的 类别(int) + 厚度(米,float).

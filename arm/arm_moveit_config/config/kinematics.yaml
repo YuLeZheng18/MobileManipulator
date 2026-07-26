@@ -1,4 +1,7 @@
 arm:
   kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
   kinematics_solver_search_resolution: 0.0050000000000000001
-  kinematics_solver_timeout: 0.0050000000000000001
+  # 5ms 太紧: 放托盘那个肩后折回姿态雅可比条件数差(最小奇异值~0.135), KDL 迭代收敛慢,
+  # computeCartesianPath 每 5mm 调一次 IK, 常有点超时未收敛就截断 -> 直下段覆盖率
+  # 在 33%~100% 间随机波动. 放宽到 50ms 换取笛卡尔路径可重复.
+  kinematics_solver_timeout: 0.05

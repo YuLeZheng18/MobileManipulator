@@ -12,6 +12,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from moveit_configs_utils import MoveItConfigsBuilder
 
 
@@ -60,13 +61,25 @@ def generate_launch_description():
             moveit_config.robot_description_semantic,
             moveit_config.robot_description_kinematics,
             place_params,
-            {"use_sim_time": use_sim_time},
+            # dry_run/scaling 只在这里给值: place.yaml 刻意不声明它们, 否则具名条目
+            # 会压掉这里的通配条目 (见 place.yaml 注释).
+            {
+                "use_sim_time": use_sim_time,
+                "dry_run": ParameterValue(
+                    LaunchConfiguration("dry_run"), value_type=bool),
+                "place_velocity_scaling": ParameterValue(
+                    LaunchConfiguration("place_velocity_scaling"), value_type=float),
+            },
         ],
     )
 
     return LaunchDescription([
         DeclareLaunchArgument("use_sim_time", default_value="true",
                               description="仿真 true 跟 /clock; 实机 false"),
+        DeclareLaunchArgument("dry_run", default_value="false",
+                              description="true=放置只规划打印不执行 (安全测试第①②步)"),
+        DeclareLaunchArgument("place_velocity_scaling", default_value="1.0",
+                              description="放置段降速倍率 (慢速真跑用 0.1)"),
         servo_node,
         grasp_node,
     ])
