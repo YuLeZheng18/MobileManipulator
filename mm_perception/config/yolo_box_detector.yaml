@@ -11,7 +11,7 @@ yolo_box_detector:
     # NCNN/ONNX 导出格式无法自动识别 task, 必须显式指定, 否则 res.obb 变 None.
     #   用 .pt 原生权重时留空 '' (自带 task).
     model_task: obb
-    conf: 0.75                      # YOLO 置信度阈值: 只识别 >0.75 的盒子. 远处漏检就降, 误检多就升
+    conf: 0.8                       # YOLO 置信度阈值: 只识别 >0.8 的盒子. 远处漏检就降, 误检多就升
     imgsz: 640                      # 推理输入尺寸. 必须与 NCNN 导出固化尺寸一致(现 best_ncnn_model 是 640
                                     #   导出的; 不一致会框错位/不准!). 换 imgsz 须重导 NCNN 用同尺寸.
                                     #   pytorch CPU 实测: 640≈0.9 480≈1.4 416≈1.9 320≈3.2FPS (慢, 故默认走 NCNN)
