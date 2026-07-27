@@ -3,7 +3,7 @@ grasp_node:
     # ============================================================
     #  双托盘放置 + 按类别堆叠 (真机标定值, base_link 系)
     #  release z = 托盘"空载吸盘接触中心"标定 z + 累计下层厚度 + 本层厚度
-    #  厚度来源: 视觉识别值(B 路线话题带过来), 识别失败用 fallback_thickness 兜底.
+    #  厚度来源: fallback_thickness 实测标定值 (视觉厚度当前仅打印对照, 见下方注释).
     # ============================================================
 
     num_trays: 2                    # 托盘数. 数组参数长度须与此一致.
@@ -27,9 +27,13 @@ grasp_node:
     category_ids:   [1, 2, 3, 4]
     category_tray:  [1, 1, 0, 0]
 
-    # 厚度识别兜底 (米), 按 category_ids 顺序. B 路线话题给到有效厚度时优先用识别值,
-    # 收不到/无效才回退到这里对应类别的值.
-    fallback_thickness: [0.025, 0.025, 0.025, 0.025]
+    # 各类别盒子厚度 (米), 按 category_ids 顺序, 真机卡尺实测值.
+    # release_z 只用这里的值算. 视觉 /perception/object_thickness 仅打印对照不采信:
+    # 其 table 深度取自 OBB 向内收缩的 ROI, 窗口内全是盒顶(实测深度散布仅 6~10mm),
+    # table-d 恒在 3mm 量级. 视觉厚度可信后再改 grasp_node::currentThickness.
+    # 类别1 的 0.022: 2026-07-26 实测反推. 按 0.028 算出的行程下插到位吸不上, 手动再补插
+    # 5mm 才吸住; 吸住瞬间 TCP z=-0.0255, 地面常量 -0.0476 -> 真实盒顶离地 22.1mm.
+    fallback_thickness: [0.022, 0.024, 0.017, 0.017]
 
     # ---- 四步渐进安全测试开关 (Task #1) ----
     # 刻意不在此声明 dry_run / place_velocity_scaling: 具名节点条目("grasp_node")
@@ -45,3 +49,65 @@ grasp_node:
     class_topic: /perception/object_class        # std_msgs/Int32: 当前目标类别
     thickness_topic: /perception/object_thickness # std_msgs/Float32: 当前目标厚度(米)
     default_category: 1                            # 收不到类别时按此类别放 (兜底)
+
+    # ---- ② 精修: 相机系闭环对准 (不过手眼标定) ----
+    # 精修误差在相机系算: 盒心 p_cam 的横向 (y,z) 追标定目标值 cam_target_y/z.
+    # 为什么不用 base_link 坐标: 手眼标定误差(机械安装误差 + 增量式零位与 URDF 零位不一致)
+    # 让检测出的 base_link 坐标偏 2~3cm, 且随臂构型变 —— 闭环追它会变成"臂动->偏差变->
+    # 目标跑"的追逐(实测 20s 不收敛). p_cam 只过深度与相机内参, 臂动它不跳.
+    cam_point_topic: /perception/object_point_cam   # geometry_msgs/PointStamped, frame=Link_30
+    cam_frame: Link_30              # 相机机械系; 精修只借它的旋转把误差方向转到 base_link
+
+    # 横向是 (y,z) 不是 (x,y): Link_30 机械系 x 是光轴 —— 实测 p_cam.x 恒等于深度值.
+    # 标定方法: 臂开到盒上方 pregrasp_height(12cm), 人工把吸盘对准盒心, 调
+    #   ros2 service call /grasp/calib_cam_target std_srvs/srv/Trigger
+    # 读回的 (y,z) 就是目标值, 填到这里. 标定高度须与工作高度一致(都是 12cm).
+    #
+    # 彩色内参坏(camera_info K=NaN, 现用 fallback 粗估)不影响这里: 像素->深度像素换算的
+    # 内参误差是仿射的(测得 = k*真值 + b), 标定目标值与实测值同走这条链路, 闭环做差时
+    # k 和 b 精确抵消. 反投影本身用的是有效的深度(红外)内参.
+    # (注: yaw 不在此列 —— 它另有手眼外参旋转的问题, 见文件末尾"吸盘朝向对齐"一节.)
+    # 2026-07-26 实测标定: 人工把盒子推到吸盘正下方对准, 在 pregrasp 12cm 高度读得.
+    # 此刻 TCP base_link=[-0.155,-0.302,0.125], 检测报盒心 base_link=[-0.175,-0.325] ——
+    # 眼睛看着对准, base_link 却差 30mm, 这 30mm 就是手眼标定偏差. 正因如此才用相机系:
+    # 目标值记的是"对准时相机看到什么", base_link 偏多少都不进闭环.
+    cam_target_y: -0.0358
+    cam_target_z: 0.0303
+
+    cam_tol: 0.006                  # 相机系横向误差收敛阈值(米)
+    # 注: 误差方向 -> base_link 位移的映射不是标定死的符号表, 而是每轮精修开头用两次
+    # probe_step 试探实测出 2x2 雅可比, 无论中间差多少次旋转/反射都被实测吸收.
+
+    # ---- 吸盘朝向对齐: 走长轴图像角 θ_img, 不过手眼外参 ----
+    # 抓取要的是"吸盘长轴与盒长轴共线", 否则盒斜贴在吸盘上, 放进带围栏的托盘会蹭卡.
+    #
+    # 为什么不用 object_pose 里的 base_link 系盒 yaw: 那个 yaw = R @ (相机系长轴),
+    # R(base_link<-Link_30) = FK(6关节) ∘ 手眼外参. 臂是增量式编码器、上电即零位、零位靠
+    # 手摆(重复性约 1cm), 于是旋转误差经 FK 进来, 且随构型变 —— 与当初逼着 ② 精修改用
+    # 相机系坐标的是同一个根因. 2026-07-27 实测: 检测报盒 +36.2°(腕在 coarse_yaw -90°),
+    # 按它转到腕 -143.7° 后, 人工再补转 6° 到 -149.7° 才与盒边贴合. 只重标 Link_29->Link_30
+    # 也治不了: 误差主体在 FK/零位那一侧, 不在这段外参里.
+    #
+    # 绕过办法: 相机固连腕(Link_30 挂 Link_29), 所以"吸盘长轴在图像里占多少度"是与构型
+    # 无关的常数. 于是 ψ = ψ_ref + s·(θ_ref − θ_img), 三个常数实测标定一次, 整条对齐链
+    # 只过检测(θ_img)与腕转角, 不过外参也不过 FK.
+    #
+    # 标定方法: 臂开到盒上方 pregrasp 高度(/grasp/coarse_only), 手动转腕直到吸盘长轴与
+    # 盒边贴合(相机不能被吸盘挡住, 别把吸盘压在盒上), 然后
+    #   ros2 service call /grasp/calib_yaw_ref std_srvs/srv/Trigger
+    # 读回的 (θ_img, 腕 yaw) 就填到下面两个值.
+    # 缺省值来自 2026-07-27 首次标定: θ_ref 取①锁定时刻附近多帧的中位数(-37.6°),
+    # ψ_ref 是人工转到贴合后的实测腕 yaw(-149.7°). ψ_ref 是目视判断, 精度约 ±2° ——
+    # 这就是本链路的绝对精度下限; 但它是个不随构型漂的常数, 校准一次长期有效.
+    yaw_ref_theta_img: -37.6        # 贴合时长轴图像角(度)
+    yaw_ref_tool: -149.7            # 贴合时腕 yaw(度, base_link 系)
+    # 符号: 腕绕竖直轴转 +Δ, 图像里长轴角转 −Δ. 依据 Joint_16 轴 (0,0,-1) 且近竖直,
+    # 实测三次连续 +2° 关节增量各给出精确 −2° 的吸盘 yaw. 换相机安装朝向则改 +1.
+    yaw_axis_sign: -1.0
+
+    # 近正方形盒的类别: 这些盒转 90° 后占位几乎不变, 4 个等价分支就近取, 省掉大角度转动.
+    # 其余类别(2/3/4)是长方形, 转 90° 长短边互换会顶到围栏, 只按 180° 折叠.
+    square_categories: [1]
+
+    # 长轴图像角话题, 须与 mm_perception/config/yolo_box_detector.yaml 的同名参数一致.
+    axis_angle_topic: /perception/object_axis_angle

@@ -45,7 +45,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 
 import cv2
 from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import PoseStamped, Pose, PoseArray
+from geometry_msgs.msg import PoseStamped, Pose, PoseArray, PointStamped
 from std_msgs.msg import Int32, Float32
 import tf2_ros
 
@@ -124,6 +124,19 @@ class YoloBoxDetector(Node):
         # 解析失败发 0; 厚度=台面深度-顶面深度. 话题名与 grasp place.yaml 对齐.
         self.declare_parameter('class_topic', '/perception/object_class')
         self.declare_parameter('thickness_topic', '/perception/object_thickness')
+        # OBB 长轴在**彩色图像**里的角度(度, 折到 (-90,90]). 抓取对齐吸盘朝向只用它,
+        # 不用 base_link 系的盒 yaw: 后者 = R @ 相机系长轴, R(base<-Link_30) 含手眼外参
+        # 旋转与 FK, 随构型漂 (实测偏 6°). 相机固连腕, 故"吸盘长轴在图像里是多少度"是
+        # 常数, 可实测标定一次 (grasp 侧 yaw_ref_theta_img/yaw_ref_tool), 整条链不过外参.
+        self.declare_parameter('axis_angle_topic', '/perception/object_axis_angle')
+        # 盒心在相机系(Link_30)的 3D 坐标. 不过手眼标定/TF, 只依赖深度与相机内参,
+        # 供 grasp_node 做相机系闭环对准 (base_link 坐标带 2~3cm 标定偏差且随构型变).
+        self.declare_parameter('cam_point_topic', '/perception/object_point_cam')
+
+        # 逐帧打印 OBB 原始参数与选中目标, 用于定位 yaw 跳变来源 (只打印不改行为).
+        self.declare_parameter('diag_yaw', False)
+        # 非空则把标注帧写到该路径 (无显示器时替代 imshow, 覆盖写最新一帧).
+        self.declare_parameter('save_frame_path', '')
 
         # ---- 可视化 ----
         self.declare_parameter('show_window', True)
@@ -150,6 +163,8 @@ class YoloBoxDetector(Node):
         self.publish_pose = bool(gp('publish_pose').value)
         self.only_largest = bool(gp('only_largest').value)
         self.show_window = bool(gp('show_window').value)
+        self.diag_yaw = bool(gp('diag_yaw').value)
+        self.save_frame_path = str(gp('save_frame_path').value)
 
         # 预计算 光学系 -> Link_30 机械系 的固定旋转 (与 box_detector 同一约定)
         # 再右乘绕光学Z轴的安装转角修正: p_mech = R_mech_optical @ Rz(roll) @ p_opt.
@@ -208,6 +223,8 @@ class YoloBoxDetector(Node):
         self._poses_pub = None
         self._class_pub = None
         self._thickness_pub = None
+        self._cam_point_pub = None
+        self._axis_angle_pub = None
         if self.publish_pose:
             self._pose_pub = self.create_publisher(
                 PoseStamped, gp('pose_topic').value, 10)
@@ -219,6 +236,10 @@ class YoloBoxDetector(Node):
                 Int32, gp('class_topic').value, 10)
             self._thickness_pub = self.create_publisher(
                 Float32, gp('thickness_topic').value, 10)
+            self._cam_point_pub = self.create_publisher(
+                PointStamped, gp('cam_point_topic').value, 10)
+            self._axis_angle_pub = self.create_publisher(
+                Float32, gp('axis_angle_topic').value, 10)
 
         self.get_logger().info(
             'yolo_box_detector(抓取版) 就绪: 深度模式=%s, camera_frame=%s -> %s, 发位姿=%s, 类过滤=%s'
@@ -338,12 +359,13 @@ class YoloBoxDetector(Node):
             else:
                 dc = None
             pose = self._roi_to_pose(depth, bx1, by1, bx2, by2, R, t, axis, dc)
-            # 保留彩色系框坐标 + 旋转框角点 (corners) 用于可视化 (画在彩色图上)
-            results.append((x1, y1, x2, y2, name, cf, pose, corners))
+            # 保留彩色系框坐标 + 旋转框角点 (corners) 用于可视化 (画在彩色图上);
+            # axis = 长轴在彩色像素系的单位方向, 抓取端要的 θ_img 由它算 (见 _publish_pose)
+            results.append((x1, y1, x2, y2, name, cf, pose, corners, axis))
 
         self._print_results(results)
         self._publish_pose(results, msg.header.stamp)
-        if self.show_window:
+        if self.show_window or self.save_frame_path:
             self._draw_and_show(bgr, results)
 
     # ---------------- 检测收集 ----------------
@@ -371,6 +393,13 @@ class YoloBoxDetector(Node):
                 # 长轴方向 (彩色像素系): 取长边角度. rad 是 w 边角度.
                 ang = rad if rw >= rh else rad + np.pi / 2.0
                 axis = (float(np.cos(ang)), float(np.sin(ang)))
+                if self.diag_yaw:
+                    self.get_logger().warn(
+                        '[诊断OBB] %s 框中心(%.1f,%.1f) rw=%.1f rh=%.1f 比=%.2f '
+                        'rad=%+.1f° 长边=%s -> 长轴角=%+.1f° 轴对齐面积=%.0f'
+                        % (name, cx, cy, rw, rh, max(rw, rh) / max(min(rw, rh), 1e-6),
+                           np.rad2deg(rad), 'w' if rw >= rh else 'h',
+                           np.rad2deg(ang), (x2 - x1) * (y2 - y1)))
                 # center: OBB 框中心(彩色像素系), 中心点优先用它(比深度质心稳)
                 dets.append((int(round(x1)), int(round(y1)),
                              int(round(x2)), int(round(y2)),
@@ -457,7 +486,9 @@ class YoloBoxDetector(Node):
 
         p_cam = self._pixel_to_cam(cu, cv_, d)   # 相机系 3D 坐标, 不依赖 TF
         p_base = (R @ p_cam + t) if R is not None else None
-        yaw = self._estimate_yaw(c, cu, cv_, d, R, axis)
+        # yaw 的采样点要与盒顶同一水平面求交, 故传盒顶在 base_link 的高度(即中心点 z).
+        z_plane = float(p_base[2]) if p_base is not None else 0.0
+        yaw = self._estimate_yaw(c, cu, cv_, d, R, t, z_plane, axis)
         # 盒子厚度 = 台面深度 - 顶面中心深度 (凸起朝相机 -> 顶面更近, 差为正). 供堆叠放置用.
         thickness = float(table - d)
         return (cu, cv_, d, p_base, yaw, p_cam, thickness)
@@ -483,6 +514,20 @@ class YoloBoxDetector(Node):
         p_opt = np.array([(u - cx) * d / fx, (v - cy) * d / fy, d])
         return self._R_mech_optical @ p_opt if self.apply_optical_rotation else p_opt
 
+    def _ray_hit_plane(self, u, v, R, t, z_plane):
+        """像素(u,v) 的视线与 base_link 水平面 z=z_plane 的交点 (base_link 系 3D).
+
+        视线在相机系是 depth=1 处的反投影方向, 转到 base_link 得方向 dir 与原点 t,
+        解 t.z + s*dir.z = z_plane. 视线接近水平(dir.z≈0)时无稳定交点, 返回 None.
+        """
+        dir_base = R @ self._pixel_to_cam(u, v, 1.0)
+        if abs(dir_base[2]) < 1e-6:
+            return None
+        s = (z_plane - t[2]) / dir_base[2]
+        if s <= 0.0:                              # 交点在相机后方
+            return None
+        return t + s * dir_base
+
     def _lookup_base_tf(self):
         """查 TF camera_frame -> base_frame, 返回 (R, t). 查不到返回 (None, None)."""
         try:
@@ -497,16 +542,23 @@ class YoloBoxDetector(Node):
         R = quat_to_rot_matrix(q.x, q.y, q.z, q.w)
         return R, np.array([tr.x, tr.y, tr.z])
 
-    def _estimate_yaw(self, contour, cu, cv_, d, R, axis=None):
+    def _estimate_yaw(self, contour, cu, cv_, d, R, t, z_plane, axis=None):
         """估盒子绕 base_link 竖直轴的 yaw (契约 §1 第 4 自由度).
 
         长轴图像方向来源: 优先用 OBB 旋转框角度 (axis, 彩色像素系); 无则退回顶面
-        深度掩码的 minAreaRect. 沿该方向中心两侧各取一采样点, 用同一中心深度 d
-        反投影到 base_link (顶面近似水平, 等深假设成立), 两点连线在 base_link
-        xy 投影方位角即 yaw. 直接用图像角度会差一个相机->base 旋转, 故必经反投影.
+        深度掩码的 minAreaRect. 沿该方向中心两侧各取一采样点, 视线与盒顶所在的
+        **base_link 水平面** z=z_plane 求交, 两交点连线的 xy 方位角即 yaw.
         矩形长轴无向 (±180°等价), 折叠到 (-pi/2, pi/2]; 顶视吸盘对 180° 不敏感.
+
+        为什么必须求交而不能"两点同取中心深度 d": 等深反投影得到的差向量躺在相机
+        像平面里, 不在盒顶那个水平面里. 相机光轴一旦不垂直于地面(look 位约斜 28°),
+        把像平面向量投到 base xy 就会压扁一个方向 —— 角度不再保持. 实测同一个盒子
+        的两条边(几何上严格 90°)被报成相差 83.6°, 反推正是这个倾角; 单边 yaw 误差
+        最坏 ~3.6°, 若又挑中另一条边还要再叠 6.4°. 近正方形盒子带着这份歪斜下插,
+        放置时对齐托盘轴就会蹭在围栏外. 改成与水平面求交后, 两条边严格差 90°,
+        挑中哪条都能正着进托盘.
         """
-        if R is None:
+        if R is None or t is None:
             return None
         if axis is not None:
             dx, dy = axis
@@ -526,10 +578,12 @@ class YoloBoxDetector(Node):
                 return None
             theta = np.deg2rad(ang if rw >= rh else ang + 90.0)
             dx, dy = np.cos(theta), np.sin(theta)
-        L = 30.0                                  # 采样臂长(像素), 等深下不影响方位角
-        p_pos = self._pixel_to_cam(cu + L * dx, cv_ + L * dy, d)
-        p_neg = self._pixel_to_cam(cu - L * dx, cv_ - L * dy, d)
-        v = R @ (p_pos - p_neg)                   # base_link 下的长轴向量
+        L = 30.0                                  # 采样臂长(像素), 求交后不影响方位角
+        a = self._ray_hit_plane(cu + L * dx, cv_ + L * dy, R, t, z_plane)
+        b = self._ray_hit_plane(cu - L * dx, cv_ - L * dy, R, t, z_plane)
+        if a is None or b is None:
+            return None
+        v = a - b                                 # base_link 下的长轴向量(躺在水平面里)
         if abs(v[0]) < 1e-9 and abs(v[1]) < 1e-9:
             return None
         yaw = np.arctan2(v[1], v[0])
@@ -547,7 +601,7 @@ class YoloBoxDetector(Node):
             self._info_throttle('未检测到可定位盒子.')
             return
         lines = ['检测到 %d 个盒子 (顶面中心):' % len(valid)]
-        for i, (x1, y1, x2, y2, name, cf, pose, _corners) in enumerate(valid):
+        for i, (x1, y1, x2, y2, name, cf, pose, _corners, _axis) in enumerate(valid):
             cu, cv_, d, p, yaw, p_cam, _th = pose
             # 中心点坐标+深度恒有效 (相机系 Link_30, 纯几何不依赖 TF)
             base = ('   base_link=[%.3f, %.3f, %.3f]m yaw=%s'
@@ -584,6 +638,13 @@ class YoloBoxDetector(Node):
 
         # 单目标 (契约 §1): 面积最大框, 供抓取选当前目标
         target = max(cand, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]))
+        if self.diag_yaw:
+            self.get_logger().warn(
+                '[诊断选中] 候选=%d 选中 %s 中心像素(%d,%d) 轴对齐面积=%.0f yaw=%s'
+                % (len(cand), target[4], target[6][0], target[6][1],
+                   (target[2] - target[0]) * (target[3] - target[1]),
+                   ('%+.1f°' % np.rad2deg(target[6][4]))
+                   if target[6][4] is not None else 'n/a'))
         msg = PoseStamped()
         msg.header.stamp = stamp
         msg.header.frame_id = self.base_frame
@@ -602,6 +663,30 @@ class YoloBoxDetector(Node):
         if self._thickness_pub is not None:
             self._thickness_pub.publish(Float32(data=float(target[6][6])))
 
+        # θ_img: 长轴在彩色图像里的角度(度), 折到 (-90,90]. 抓取端拿它定吸盘朝向.
+        # 图像 v 轴朝下, 这里不翻符号 —— grasp 侧的 (θ_ref, ψ_ref) 与符号 s 是在同一
+        # 套约定下实测标定的, 只要两端一致, 中间差几次反射/旋转都被标定吸收.
+        # axis 为 None (普通 detect 模型无旋转框) 时不发, 抓取端会因值过期而拒抓.
+        if self._axis_angle_pub is not None and target[8] is not None:
+            dx, dy = target[8]
+            ang = float(np.degrees(np.arctan2(dy, dx)))
+            if ang > 90.0:
+                ang -= 180.0
+            elif ang <= -90.0:
+                ang += 180.0
+            self._axis_angle_pub.publish(Float32(data=ang))
+
+        # 相机系盒心 (元组第 6 位 p_cam), frame_id 用相机机械系. grasp_node 精修闭环追它.
+        if self._cam_point_pub is not None:
+            pc = target[6][5]
+            cp = PointStamped()
+            cp.header.stamp = stamp
+            cp.header.frame_id = self.camera_frame
+            cp.point.x = float(pc[0])
+            cp.point.y = float(pc[1])
+            cp.point.z = float(pc[2])
+            self._cam_point_pub.publish(cp)
+
         # 多目标数组: 所有有 base_link 坐标的盒子 (面积降序)
         if self._poses_pub is not None:
             arr = PoseArray()
@@ -612,7 +697,7 @@ class YoloBoxDetector(Node):
             self._poses_pub.publish(arr)
 
     def _draw_and_show(self, bgr, results):
-        for i, (x1, y1, x2, y2, name, cf, pose, corners) in enumerate(results):
+        for i, (x1, y1, x2, y2, name, cf, pose, corners, _axis) in enumerate(results):
             # OBB 模型: 画旋转框 (四角点); 无角点(普通 detect)退回轴对齐框
             if corners is not None:
                 cv2.polylines(bgr, [corners], True, (0, 255, 0), 2, cv2.LINE_AA)
@@ -639,6 +724,9 @@ class YoloBoxDetector(Node):
                     i + 1, name, d, p_cam[0], p_cam[1], p_cam[2])
             cv2.putText(bgr, label, (x1, y1 - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+        if self.save_frame_path:
+            cv2.imwrite(self.save_frame_path, bgr)
+            return
         cv2.imshow('yolo_box_detector', bgr)
         cv2.waitKey(1)
 

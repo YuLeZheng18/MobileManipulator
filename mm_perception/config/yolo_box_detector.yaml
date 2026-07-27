@@ -62,5 +62,14 @@ yolo_box_detector:
     class_topic: /perception/object_class        # std_msgs/Int32: 当前目标类别(1/2/3/4)
     thickness_topic: /perception/object_thickness # std_msgs/Float32: 当前目标厚度(米)
 
+    # ---- 抓取对齐用的长轴图像角 θ_img (grasp_node 订阅定吸盘朝向) ----
+    # OBB 长轴在彩色图像里的角度(度, 折到 (-90,90]), 与单目标 pose 同步发.
+    # 为什么抓取不用 object_pose 里的 base_link 系盒 yaw: 那个 yaw = R @ 相机系长轴,
+    # R(base_link<-Link_30) 含手眼外参旋转与 FK, 随构型漂 —— 2026-07-27 实测偏 6°
+    # (检测报盒 +36.2°, 人工对齐实际需要 -149.7° 而非 -143.7°). 相机固连腕, 故
+    # "吸盘长轴在图像里占多少度" 是常数, 在 grasp 侧标定一次(yaw_ref_theta_img/
+    # yaw_ref_tool), 整条对齐链不过外参, 也不随构型变.
+    axis_angle_topic: /perception/object_axis_angle  # std_msgs/Float32: θ_img(度)
+
     # ---- 可视化 ----
     show_window: true               # 无显示器/远程置 false
