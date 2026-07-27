@@ -3,7 +3,8 @@
 # 适配本车机械臂: group=arm, base=Link_20, tip=Link_29, TCP=suction_tip
 # 注: planning_frame 需与 move_group 实际 getPlanningFrame() 一致, 起 servo 前用节点日志核对
 ###############################################
-use_gazebo: true
+# 真机 false / Gazebo true. true 是给 Gazebo 控制器接口的特殊输出路径, 留在真机上输出不连续.
+use_gazebo: false
 
 ## 进来的命令: speed_units = twist 直接是 m/s 与 rad/s (P 控制器输出实际速度, 免 scale 换算)
 command_in_type: "speed_units"
