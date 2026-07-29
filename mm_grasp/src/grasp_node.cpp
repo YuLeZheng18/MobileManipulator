@@ -142,6 +142,10 @@ public:
     // 选 0.30: 远高于托盘已放盒顶 (~0.10), 且在臂可达包络内. 直下段变长但纯垂直, 不慢.
     // getOrDeclare: yaml 写了 transit_z 会触发 auto-declare, 裸 declare_parameter 撞崩.
     transit_z_ = getOrDeclare<double>("transit_z", 0.30);
+    // 笛卡尔"斜切进位"的低空航点 z: 走纯笛卡尔时抬到这个高度就横切过去, 不上 transit_z_.
+    // 为什么单独一个参数而不是直接调小 transit_z_: transit_z_ 那条 plan() 路径在 0.20 已
+    // 实测跑通四轮, 留作笛卡尔覆盖不足时的回落路, 值不动.
+    transit_cart_z_ = getOrDeclare<double>("transit_cart_z", 0.14);
 
     // ---- 手动 jog (标定用): /grasp/jog 每次相对当前 TCP 走 (jog_dx,dy,dz) 一步 ----
     // 标定 cam_target 的操作手段: coarse_only 开到 12cm 后, 设这三个参数再 call /grasp/jog
@@ -292,7 +296,11 @@ public:
     refine_max_steps_ = node_->declare_parameter<int>("refine_max_steps", 6);
     // 步长折扣: 解出来的位移乘这个再走. 留 20% 余量吸收映射误差, 宁可多走一步也不过冲.
     refine_step_gain_ = node_->declare_parameter<double>("refine_step_gain", 0.8);
-    refine_max_step_ = node_->declare_parameter<double>("refine_max_step", 0.04);
+    // 单步位移上限(米). 2026-07-29 从 0.04 抬到 0.08: 盒子摆远时 ② 起始误差达 152mm
+    // (手眼旋转误差落到位置上是 δR×p_cam, 与盒离相机距离成正比), 前 3 步全顶在 40mm
+    // 天花板上白耗, 5 步才收敛, 逼近 refine_max_steps 的 6 步余量. 抬到 80mm 后同样开局
+    // 2~3 步收完. 上限本身只是防"雅可比量歪时一步冲出去", 80mm 仍在这个量级内.
+    refine_max_step_ = node_->declare_parameter<double>("refine_max_step", 0.08);
     // 步进段规划降速. 0.15 是最初怕抖留的余量; 实测步进本身自带加减速, 不抖, 提到 0.4
     // 与全局同速, 精修那几步的起停停顿明显变短.
     refine_velocity_scaling_ = node_->declare_parameter<double>("refine_velocity_scaling", 0.4);
@@ -1653,6 +1661,35 @@ private:
   //
   // tray: 本次落盘的托盘号. 直下段前临时移出该托盘已落盒 (它们正是本层落点, 当障碍会挡住
   // 直下), 段后加回; 别的托盘已落盒全程留在场景当障碍, 防规划器横扫 (2026-07-28 蹭飞事故).
+  // 斜切进位: 一条纯笛卡尔路径从当前(已抬起)位姿走到释放位姿, 中间只过一个低空航点.
+  // 相对 plan() 到 transit_z_ 高空那条路的差别: 笛卡尔路径几何上确定(直线+slerp), 不会像
+  // OMPL 那样在关节空间随机采样绕出一个高包 —— 实测同样 transit_z_=0.20, 一轮 39 点另一轮
+  // 70 点, 中间抬多高全凭采样运气.
+  // 返回: 1=已执行成功, 0=覆盖不足(调用方回落到 plan() 那条路), -1=执行失败.
+  //
+  // ⚠️ 盒 attach 时 touch_links 含 tray_frame_, 即盒与托盘的碰撞检测全程豁免. 低空横切
+  // 蹭到围栏侧壁, 规划器不报、执行不停, 只能靠人看. 余量由 transit_cart_z_ 兜.
+  int placeCartesian(const geometry_msgs::msg::Pose & target, const char * what)
+  {
+    geometry_msgs::msg::Pose over = target;
+    over.position.z = transit_cart_z_;
+    std::vector<geometry_msgs::msg::Pose> wps{over, target};
+    moveit_msgs::msg::RobotTrajectory traj;
+    move_group_->setStartStateToCurrentState();
+    const double frac = move_group_->computeCartesianPath(wps, 0.005, 0.0, traj);
+    if (frac < 0.9) {
+      RCLCPP_WARN(logger_, "放置(%s): 斜切笛卡尔覆盖 %.0f%% (低空 z=%.3f), 回落到高空 plan()",
+                  what, frac * 100, transit_cart_z_);
+      return 0;
+    }
+    RCLCPP_INFO(logger_, "放置(%s): 斜切笛卡尔覆盖 %.0f%%, 经低空 z=%.3f 直接入位, 轨迹 %zu 点",
+                what, frac * 100, transit_cart_z_,
+                traj.joint_trajectory.points.size());
+    if (move_group_->execute(traj) != moveit::core::MoveItErrorCode::SUCCESS) return -1;
+    settle();
+    return 1;
+  }
+
   bool placeAtPose(const geometry_msgs::msg::Pose & target, const char * what, int tray)
   {
     // 四步渐进安全测试: 放置段整体降速(默认 0.2, place_velocity_scaling 再乘一档),
@@ -1687,6 +1724,23 @@ private:
     // (2026-07-29 实测 0号托盘第2层 plan() failed). 本盘已放盒是落点不是障碍, 整个放置段
     // 都不该当障碍; 别盘的留着当障碍. 中途任何失败返回前必须 showTrayBoxes 加回.
     hideTrayBoxes(tray);
+
+    // 先试斜切笛卡尔进位 (低空 transit_cart_z_ 横切 -> 直接入位): 几何确定, 不会像 OMPL
+    // 那样随机采样绕出高包. 覆盖不足则回落到下面的高空 plan() 路 (那条已实跑四轮).
+    // dry_run 不走这条: 前面抬起段没真执行, 起点仍在原处, 覆盖必然 0%, 徒增噪声.
+    if (!dry_run_) {
+      const int cart = placeCartesian(target, what);
+      if (cart < 0) { showTrayBoxes(tray); restorePlanScaling(); return false; }
+      if (cart > 0) {
+        releasePulse();
+        detachBox();
+        showTrayBoxes(tray);
+        restorePlanScaling();
+        RCLCPP_INFO(logger_, "放置(%s): 斜切入位到 (%.3f,%.3f,%.3f), 已释放并关阀", what,
+                    target.position.x, target.position.y, target.position.z);
+        return true;
+      }
+    }
 
     // 规划到高空 transit 航点 (xy+朝向用标定值, z = transit_z_ 绝对高度): 两端都在
     // 自由空间, 规划器不用钻障碍缝, 失败率≈0. 之后纯垂直直下到 target.
@@ -2006,7 +2060,7 @@ private:
   rclcpp::Node::SharedPtr node_;
   rclcpp::Logger logger_;
   std::string planning_group_, ee_link_, base_frame_, tray_frame_, object_topic_, pump_topic_;
-  double pregrasp_height_, lift_height_, tray_clearance_, transit_z_;
+  double pregrasp_height_, lift_height_, tray_clearance_, transit_z_, transit_cart_z_;
   double jog_dx_, jog_dy_, jog_dz_, jog_dyaw_deg_;
   double insert_stroke_min_, insert_stroke_max_, ground_z_, insert_shortfall_;
   double suck_duration_, release_duration_, insert_velocity_scaling_;
