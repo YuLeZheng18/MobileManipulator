@@ -25,6 +25,9 @@
 #include <moveit/robot_state/robot_state.h>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
 #include <moveit_msgs/msg/collision_object.hpp>
+#include <moveit_msgs/msg/planning_scene.hpp>
+#include <moveit_msgs/srv/apply_planning_scene.hpp>
+#include <moveit_msgs/srv/get_planning_scene.hpp>
 #include <shape_msgs/msg/solid_primitive.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
@@ -97,15 +100,19 @@ public:
     ground_z_ = node_->declare_parameter<double>("ground_z", -0.0476);
     // ③ 行程少走这么多米 (吸盘停在盒顶上方这个高度, 不压到盒顶). 单独一个参数而不是改
     // thickness: thickness 同时用来算托盘 release z (tray_z + 累计 + 本层), 动它会把堆叠
-    // 高度一起算错. 吸盘有海绵/波纹, 差 2mm 靠密封唇自己贴上, 少压一点减轻压盒和顶臂.
-    insert_shortfall_ = node_->declare_parameter<double>("insert_shortfall", 0.002);
+    // 高度一起算错.
+    // 2026-07-28 实跑后从 +0.002 改成 -0.001 (即多插 3mm): 按 +2mm 算出的行程下到位时
+    // 吸盘离盒顶仍有可见空隙. 说明 ground_z 与厚度这组标定值合起来把盒顶估高了几 mm ——
+    // 两者当初是靠"吸住瞬间 TCP z"同一组数反推的, 彼此自洽但都不独立. 这里用负值压过去,
+    // 靠吸盘海绵/波纹吃掉多压的量.
+    insert_shortfall_ = node_->declare_parameter<double>("insert_shortfall", -0.001);
     // 吸取抽真空时长(秒), 到时转 PUMP_STOP 保压. 1s 足够: 实测 3s 里负压早已建立,
     // 吸住后继续抽没有收益, 只是让泵空转发热.
     suck_duration_ = node_->declare_parameter<double>("suck_duration", 1.0);
     // 释放开阀时长(秒), 到时立刻 PUMP_STOP 关阀. 见 releasePulse(): 阀持续通电会发烫.
-    // 3s: 实测 0.5/1/1.5s 泄气都不净, 盒子仍粘在吸盘上. 吸盘腔体加气管容积不小, 破真空
-    // 比想象的慢. 3s 离"通电几分钟发烫"仍差两个数量级, 拿时长换可靠脱开.
-    release_duration_ = node_->declare_parameter<double>("release_duration", 3.0);
+    // 2026-07-28 真机降到 1.0(place.yaml 给值): 破负压几百 ms 够, 3s 拖节拍. 值写在 yaml,
+    // 故这里必须 getOrDeclare(裸 declare_parameter 会与 yaml 自动声明撞 AlreadyDeclared 崩).
+    release_duration_ = getOrDeclare<double>("release_duration", 3.0);
     // 末段下插降速倍率: 实测下降段抖动. 降速让每个轨迹点的关节增量变小, 抖动幅度随之变小.
     // 这是压制不是根治(根因待查: 疑在笛卡尔路径的时间参数化/该构型雅可比条件数).
     insert_velocity_scaling_ = node_->declare_parameter<double>("insert_velocity_scaling", 0.3);
@@ -129,6 +136,27 @@ public:
     lift_height_ = node_->declare_parameter<double>("lift_height", 0.03);
     // 放托盘"正上方"抬高量: 到此高度盒远离托盘边框, 规划器不绕圈, 再垂直直下入位.
     tray_clearance_ = node_->declare_parameter<double>("tray_clearance", 0.06);
+    // 携盒高空 transit 航点 z (绝对, base_link 系): 搬运段先 plan 到此高度再垂直直下.
+    // 两端都在自由空间, 规划器不用钻障碍缝, 失败率≈0 (2026-07-29 替代原"直接 plan 到
+    // tray_clearance_ 低空", 那版在左盘已有盒时规划会被 placed_t1 盒挡到 abort).
+    // 选 0.30: 远高于托盘已放盒顶 (~0.10), 且在臂可达包络内. 直下段变长但纯垂直, 不慢.
+    // getOrDeclare: yaml 写了 transit_z 会触发 auto-declare, 裸 declare_parameter 撞崩.
+    transit_z_ = getOrDeclare<double>("transit_z", 0.30);
+
+    // ---- 手动 jog (标定用): /grasp/jog 每次相对当前 TCP 走 (jog_dx,dy,dz) 一步 ----
+    // 标定 cam_target 的操作手段: coarse_only 开到 12cm 后, 设这三个参数再 call /grasp/jog
+    // 下插/微调 xy 对准盒心; 对准后设 jog_dz=+累计下插量 纯竖直抬回 12cm 再 calib_cam_target.
+    // Trigger 带不了数值, 故走参数. 每次 call 读当前值走一步, 不清零(连续同向可反复 call).
+    jog_dx_ = node_->declare_parameter<double>("jog_dx", 0.0);
+    jog_dy_ = node_->declare_parameter<double>("jog_dy", 0.0);
+    jog_dz_ = node_->declare_parameter<double>("jog_dz", 0.0);
+    // 转腕增量(度, 绕 base 竖直轴, 即吸盘自身轴). 标定 yaw_ref 时手动转吸盘长轴到与盒边
+    // 贴合. 单独走"直转"(不走 yawEquivalents 90°/180° 折叠), 保证转的就是你要的角度.
+    jog_dyaw_deg_ = node_->declare_parameter<double>("jog_dyaw_deg", 0.0);
+
+    // /grasp/seed_placed 用: 补登重启前已物理存在的盒. Trigger 带不了数值, 走参数.
+    node_->declare_parameter<int64_t>("seed_tray", 0);
+    node_->declare_parameter<double>("seed_thickness", 0.022);
 
     // ---- 双托盘放置 + 按类别堆叠 (标定值在 place.yaml, base_link 系) ----
     // 托盘"空载吸盘接触托盘中心"位姿: xyz=空载 suction_tip 贴托盘中心时的位置, quat=工具朝下
@@ -178,24 +206,50 @@ public:
     // 发散保护倍率: 误差涨到起始值的这么多倍就中止精修 (见 stageRefine 里的判据).
     refine_diverge_ratio_ = getOrDeclare<double>("refine_diverge_ratio", 2.0);
 
-    // ---- 吸盘朝向对齐: 走图像角 θ_img, 不过手眼外参 ----
+    // ---- 吸盘朝向对齐: 闭环追长轴图像角 θ_img, 不过手眼外参也不解算腕角 ----
     // 视觉发的 base_link 系盒 yaw = R @ 相机系长轴, R(base_link<-Link_30) 含手眼外参旋转
     // 与 FK, 随构型漂: 2026-07-27 实测检测报盒 +36.2°(腕在 coarse_yaw -90° 时), 按它转到
     // 腕 -143.7° 后人工再修 6° 到 -149.7° 才与盒边贴合. 近正方形盒斜 6° 进带围栏托盘会蹭卡.
-    // 相机固连腕(Link_30 挂 Link_29), 所以"吸盘长轴在图像里占多少度"是与构型无关的常数,
-    // 实测标定一对 (θ_ref, ψ_ref) 即可: ψ = ψ_ref + s·(θ_ref − θ_img). 整条链只过检测.
+    // 相机固连腕(Link_30 挂 Link_29), 所以"吸盘长轴在图像里占多少度"是与构型无关的常数
+    // θ_img*: 盒长轴与吸盘长轴平行 <=> θ_img == θ_img*. 于是对齐是个终点判据, 不用解算.
     axis_angle_topic_ = getOrDeclare<std::string>(
       "axis_angle_topic", "/perception/object_axis_angle");
-    // 标定常数(度): 盒轴与吸盘轴贴合时, 图像角 θ_ref 与当时的腕 yaw ψ_ref.
-    // 用 /grasp/calib_yaw_ref 读取填入. 缺省值来自 2026-07-27 首次标定.
-    yaw_ref_theta_img_ = getOrDeclare<double>("yaw_ref_theta_img", -37.6);
-    yaw_ref_tool_ = getOrDeclare<double>("yaw_ref_tool", -149.7);
-    // 符号: 腕绕竖直轴转 Δ, 图像里长轴角转 −Δ (J6 轴 (0,0,-1) 且近竖直, 实测腕每 +2°
-    // 吸盘 yaw 精确 −2°). 装反/换相机安装朝向则改 +1.
-    yaw_axis_sign_ = getOrDeclare<double>("yaw_axis_sign", -1.0);
-    // 近正方形盒的类别: 这些类别转 90° 后占位几乎不变, 故按 90° 等价折叠就近取腕转角
-    // (省掉无谓大角度转动). 其余类别是长方形, 转 90° 长短边互换会顶到围栏, 只能按 180° 折叠.
-    square_categories_ = getOrDeclare<std::vector<int64_t>>("square_categories", {1});
+    // 贴合判据(度): 吸盘长轴自身在图像里的角度. 用 /grasp/calib_yaw_ref 读取填入.
+    yaw_target_theta_img_ = getOrDeclare<double>("yaw_target_theta_img", -0.4);
+    yaw_align_tol_deg_ = getOrDeclare<double>("yaw_align_tol_deg", 2.0);
+    // 试探步幅(度): 每轮开头先转这么多, 实测 dθ_img/dψ (符号+增益一起量到), 再解剩余步长.
+    // 不用预设常数: 2026-07-28 实测该斜率在不同角区连符号都会翻(见 stageAlignYaw 注释).
+    // 10° 够用: 检测噪声 ±1°, 信噪比 10:1, 且猜错方向也只多绕 10°.
+    yaw_probe_deg_ = getOrDeclare<double>("yaw_probe_deg", 10.0);
+    // 先验斜率: 第一步直接按它下发, 省掉无条件试探那 2s. 被单调性检查证伪才回退去实测.
+    yaw_slope_prior_ = getOrDeclare<double>("yaw_slope_prior", 0.8);
+    // 实测斜率下限: |dθ_img/dψ| 低于此判"检测不跟随腕转"(视野甩飞/盒子出画), 中止.
+    yaw_slope_min_ = getOrDeclare<double>("yaw_slope_min", 0.3);
+    // 解出的步长打这个折再走, 留余量吸收斜率的局部非线性, 宁可多迭代一步也不过冲.
+    yaw_step_gain_ = getOrDeclare<double>("yaw_step_gain", 0.9);
+    // 单步转动上限(度): 斜率量歪时兜住, 不让一步就把腕甩过去.
+    yaw_max_step_deg_ = getOrDeclare<double>("yaw_max_step_deg", 60.0);
+    yaw_align_max_steps_ = static_cast<int>(
+      getOrDeclare<int64_t>("yaw_align_max_steps", 4));
+    // θ_img 单帧有噪声, 取几帧均值再判. 检测 ~11Hz, 5 帧约 0.5s.
+    axis_avg_frames_ = static_cast<int>(getOrDeclare<int64_t>("axis_avg_frames", 3));
+    // 采 θ_img 前先丢弃这么多秒内到达的帧 (排空视觉管线). settle() 只等关节停稳, 不等
+    // 检测管线 —— 相机曝光到 NCNN 推理出结果有一整段延迟, 臂停下那一刻管线里积压的还是
+    // 运动中拍的画面. 2026-07-28 实测: ② 结束后 0.36s 采到 +10.9°, 而同一姿态停稳后稳定
+    // 读 -45.1°, 那个坏数把试探斜率算成 6.21(真值 ~0.8), 整段对齐随之失败.
+    // 时间戳是接收时刻不是曝光时刻, 所以判不出某帧"拍于何时", 只能按延迟上界等过去.
+    axis_flush_sec_ = getOrDeclare<double>("axis_flush_sec", 0.3);
+    // θ_img 帧间一致性下限 (2θ 空间合成向量的集中度, 全一致=1). 见 avgAxisAngle:
+    // 低于此判长短轴互换致均值被抵消, 拒掉重采. 0.9 对应帧间散布约 ±25°, 远松于实测
+    // 的 ±0.5°, 只拦真正的互换.
+    axis_min_concentration_ = getOrDeclare<double>("axis_min_concentration", 0.9);
+    // 一致性不过时最多重采几次 (每次隔 axis_flush_sec_). 互换往往只持续一两帧, 重采
+    // 常能拿到干净的一批; 全失败才中止.
+    axis_resample_tries_ = static_cast<int>(getOrDeclare<int64_t>("axis_resample_tries", 4));
+    // 坏观测门限(度): |θ_img| 超此值判为 OBB 退化, 不采信. 见 stageAlignYaw 注释.
+    yaw_bad_theta_deg_ = getOrDeclare<double>("yaw_bad_theta_deg", 85.0);
+    // 本段累计转动上限(度): 防坏观测把腕净转到乱姿态.
+    yaw_align_max_turn_deg_ = getOrDeclare<double>("yaw_align_max_turn_deg", 120.0);
 
     class_topic_ = getOrDeclare<std::string>("class_topic", "/perception/object_class");
     thickness_topic_ = getOrDeclare<std::string>("thickness_topic", "/perception/object_thickness");
@@ -204,6 +258,9 @@ public:
     // 运行时堆叠状态: 每托盘已放盒数 + 累计厚度. reset 服务清零(新一轮).
     tray_layers_.assign(num_trays_, 0);
     tray_stack_h_.assign(num_trays_, 0.0);
+    // 已放盒持久碰撞体按托盘分组, 与堆叠状态同生命周期 (reset_stack 一并清).
+    placed_ids_.assign(num_trays_, {});
+    placed_poses_.assign(num_trays_, {});
 
     // 卸货目的地 (base_link 系, top-down, 写死车右侧地面): 从托盘取盒后, 先到上方,
     // 再笛卡尔直下到吸盘末端 z=place_z_ (盒底离地 ~5mm) 才释放, 盒子落稳而非半空抛.
@@ -216,8 +273,11 @@ public:
 
     // 被抓盒子尺寸 (world grasp_box: 0.09x0.055x0.025), 吸取后 attach 到吸盘作碰撞体,
     // 让放置规划知道吸盘下挂着盒 -> 绕开托盘边框, 不再侧向蹭入。
-    box_size_x_ = node_->declare_parameter<double>("box_size_x", 0.09);
-    box_size_y_ = node_->declare_parameter<double>("box_size_y", 0.055);
+    // 2026-07-29: xy 从 90x55 缩到 88x53 给围栏开口留 2mm 余量 (实测 90x55 进开口直下覆盖
+    //   只 87%, 盒微偏就蹭墙). z 不在此用 — attachBox 改用按类别传入的真实厚度.
+    // getOrDeclare: yaml 可覆盖, 调参不用重编.
+    box_size_x_ = getOrDeclare<double>("box_size_x", 0.088);
+    box_size_y_ = getOrDeclare<double>("box_size_y", 0.053);
     box_size_z_ = node_->declare_parameter<double>("box_size_z", 0.025);
 
     // 看货姿势: ready 位基础上把 J1(Joint_11)+90°, 让手眼相机转向货物侧, 供闭环抓取前
@@ -242,6 +302,19 @@ public:
     cam_wait_timeout_ = node_->declare_parameter<double>("cam_wait_timeout", 3.0);
     refine_timeout_ = node_->declare_parameter<double>("refine_timeout", 60.0);
     object_stale_sec_ = node_->declare_parameter<double>("object_stale_sec", 0.5);
+    // 取 object_pose 前先丢弃这么多秒内到的帧, 排空视觉管线. 与 axis_flush_sec_ 同一道理:
+    // 相机曝光到 NCNN 出框有一整段延迟, 摆臂刚停那刻管线里积压的仍是运动中拍的画面, 而
+    // 感知端用**当前** TF 把它转到 base_link -> 图像姿态与 TF 姿态错配, 坐标整体偏掉.
+    // 时间戳是接收时刻不是曝光时刻, 判不出某帧拍于何时, 只能按延迟上界等过去.
+    // 2026-07-29 实测(look 位, 盒静止): 摆臂中连续帧报 base_link (-0.199,-0.257) ->
+    // (-0.249,-0.227) 一路滑 5cm, 停稳后稳定在 (-0.035,-0.351). 而 look 一返回就抓第一帧
+    // 正落在这个瞬态里 -> ① 粗定位开偏 12~16cm, ② 精修被迫从 118~146mm 往回爬.
+    object_flush_sec_ = getOrDeclare<double>("object_flush_sec", 0.3);
+    // 采信前要连采几帧一致值, 及帧间散布上限(米). 排空是按上界等, 一致性门才是真判据:
+    // 运动中的帧彼此在滑(上例每帧滑 ~8mm), 静止帧则完全重合(实测连续帧位数全同).
+    object_consist_frames_ = getOrDeclare<int>("object_consist_frames", 3);
+    object_consist_tol_ = getOrDeclare<double>("object_consist_tol", 0.010);
+    object_resample_tries_ = getOrDeclare<int>("object_resample_tries", 4);
 
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node_->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -289,6 +362,18 @@ public:
       });
 
     pump_pub_ = node_->create_publisher<std_msgs::msg::Int8>(pump_topic_, 10);
+    // /collision_object 直发兜底: psi_->removeCollisionObjects 是异步且偶发不生效
+    // (2026-07-29 实测 placed_t1_l1 在 reset_stack 后仍留在场景, 挡下次放置直下段).
+    // reset_stack 调完 PSI 后再用这个 publisher 同步发一遍 REMOVE, 绕过 PSI 异步链路.
+    co_pub_ = node_->create_publisher<moveit_msgs::msg::CollisionObject>("/collision_object", 10);
+    // move_group 的 apply_planning_scene 是**同步**服务: 返回即表示 diff 已并进场景.
+    // 上面 PSI 与 /collision_object 两条都是异步且实测都可能不生效, 故 reset_stack 以它兜底.
+    // 单独一个回调组: reset_stack 回调在 srv_cb_group_ 里阻塞等这个响应, 同组会自锁.
+    scene_cb_group_ = node_->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    apply_scene_cli_ = node_->create_client<moveit_msgs::srv::ApplyPlanningScene>(
+      "/apply_planning_scene", rmw_qos_profile_services_default, scene_cb_group_);
+    get_scene_cli_ = node_->create_client<moveit_msgs::srv::GetPlanningScene>(
+      "/get_planning_scene", rmw_qos_profile_services_default, scene_cb_group_);
 
     // /grasp/execute 回调整轮阻塞几十秒(精修 20s 循环等). 若与 object_sub / servo 客户端
     // 同处默认互斥组, 阻塞期间它们全被饿死: object_pose 不更新→精修永远判过期超时;
@@ -352,8 +437,8 @@ public:
         if (!resolvePlaceTarget("/grasp/place_only", pt, res->message)) {
           res->success = false; return;
         }
-        attachBox(true);
-        if (!placeAtPose(pt.pose, pt.what.c_str())) {
+        attachBox(true, pt.thickness);
+        if (!placeAtPose(pt.pose, pt.what.c_str(), pt.tray)) {
           res->success = false;
           res->message = std::string("放置失败: ") + pt.what;
           return;
@@ -364,7 +449,7 @@ public:
           detachBox();
           return;
         }
-        pushLayer(pt.tray, pt.thickness);
+        pushLayer(pt.tray, pt.thickness, pt.pose);
         if (!moveToReady()) {
           res->success = false; res->message = "放置后回 ready 失败"; return;
         }
@@ -406,15 +491,55 @@ public:
         res->success = true; res->message = buf;
       },
       rmw_qos_profile_services_default, srv_cb_group_);
-    // 标定吸盘朝向基准: 人工把吸盘长轴转到与盒长轴贴合后调一次, 读回当时的
-    // (θ_img, 腕 yaw) 就是 (yaw_ref_theta_img, yaw_ref_tool). 只读不动臂.
-    // 标定时腕必须在 coarse_yaw_ 附近且相机能看清盒(吸盘别压在盒上), 否则 θ_img 不可信.
+    // 手动 jog (标定用): 每次 call 读实时参数 jog_dx/dy/dz, 相对当前 TCP 走一步纯笛卡尔
+    // 直线, 朝向不变. 用于 coarse_only 到 12cm 后: 下插(dz<0)接近盒 -> 微调 xy 对准盒心 ->
+    // 纯竖直抬回(dz=+累计下插量) -> calib_cam_target 读值. 打印走前/走后 TCP 便于记累计量.
+    jog_srv_ = node_->create_service<std_srvs::srv::Trigger>(
+      "/grasp/jog",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        const double dx = node_->get_parameter("jog_dx").as_double();
+        const double dy = node_->get_parameter("jog_dy").as_double();
+        const double dz = node_->get_parameter("jog_dz").as_double();
+        const double dyaw = node_->get_parameter("jog_dyaw_deg").as_double();
+        geometry_msgs::msg::PoseStamped before;
+        if (!currentTcp(before)) {
+          res->success = false; res->message = "取 TCP 失败"; return;
+        }
+        RCLCPP_WARN(logger_, "jog: 请求 (dx=%.4f dy=%.4f dz=%.4f dyaw=%.1f°) 从 TCP z=%.4f",
+                    dx, dy, dz, dyaw, before.pose.position.z);
+        if (!moveRelativeXYZ(dx, dy, dz)) {
+          res->success = false; res->message = "jog 笛卡尔移动失败(覆盖不足/执行失败)"; return;
+        }
+        // 有转腕增量则原地绕吸盘轴转 (位置不变). 平移在前, 转腕在后, 一次 call 可只给其一.
+        if (std::abs(dyaw) > 1e-6) {
+          move_group_->setMaxVelocityScalingFactor(rotate_velocity_scaling_);
+          move_group_->setMaxAccelerationScalingFactor(rotate_velocity_scaling_);
+          const bool rok = jogRotateYaw(dyaw * M_PI / 180.0);
+          move_group_->setMaxVelocityScalingFactor(1.0);
+          move_group_->setMaxAccelerationScalingFactor(1.0);
+          if (!rok) { res->success = false; res->message = "jog 转腕失败(规划/执行)"; return; }
+        }
+        geometry_msgs::msg::PoseStamped after;
+        currentTcp(after);
+        char buf[192];
+        std::snprintf(buf, sizeof(buf),
+                      "jog done: TCP base_link=[%.4f,%.4f,%.4f]",
+                      after.pose.position.x, after.pose.position.y, after.pose.position.z);
+        RCLCPP_WARN(logger_, "%s", buf);
+        res->success = true; res->message = buf;
+      },
+      rmw_qos_profile_services_default, srv_cb_group_);
+    // 标定对齐判据: 人工把吸盘长轴转到与盒长轴贴合后调一次, 读回当时的 θ_img 就是
+    // yaw_target_theta_img (吸盘长轴自身的图像角). 只读不动臂.
+    // 相机固连腕, 故该值与腕在哪个构型无关; 腕 yaw 一并打印仅供记录, 不再是标定量.
+    // 标定时相机必须能看清盒(吸盘别压在盒上), 否则 θ_img 不可信.
     yaw_cal_srv_ = node_->create_service<std_srvs::srv::Trigger>(
       "/grasp/calib_yaw_ref",
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
              std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
         double theta = 0.0;
-        if (!latestAxisAngle(theta)) {
+        if (!avgAxisAngle(theta)) {
           res->success = false; res->message = "无新鲜 θ_img"; return;
         }
         geometry_msgs::msg::PoseStamped tcp;
@@ -423,9 +548,9 @@ public:
         }
         char buf[192];
         std::snprintf(buf, sizeof(buf),
-                      "yaw_ref_theta_img: %.1f  yaw_ref_tool: %.1f",
+                      "yaw_target_theta_img: %.1f  (此刻腕 yaw %.1f°, 仅记录)",
                       theta, quatYaw(tcp.pose.orientation) * 180.0 / M_PI);
-        RCLCPP_WARN(logger_, "标定吸盘朝向基准 -> 填进 place.yaml: %s", buf);
+        RCLCPP_WARN(logger_, "标定对齐判据 -> 填进 place.yaml: %s", buf);
         res->success = true; res->message = buf;
       },
       rmw_qos_profile_services_default, srv_cb_group_);
@@ -437,8 +562,64 @@ public:
         std::lock_guard<std::mutex> lk(stack_mtx_);
         std::fill(tray_layers_.begin(), tray_layers_.end(), 0);
         std::fill(tray_stack_h_.begin(), tray_stack_h_.end(), 0.0);
-        RCLCPP_INFO(logger_, "堆叠计数已清零 (%d 托盘)", num_trays_);
-        res->success = true; res->message = "stack counters reset";
+        // 已落盒碰撞体一并清出规划场景. PSI removeCollisionObjects 是异步, 偶发不生效
+        // (2026-07-29 实测 placed_t1_l1 残留挡下次放置). 兜底: 紧接着直接发一遍 REMOVE
+        // 到 /collision_object, 同步链路绕过 PSI. 即便 placed_ids_ 漏追踪(历史 bug),
+        // 这条仍按已知命名 placed_t{T}_l{L} 扫一遍 0..capacity-1 兜掉.
+        std::vector<std::string> all_ids;
+        for (auto & ids : placed_ids_) {
+          if (!ids.empty()) psi_->removeCollisionObjects(ids);
+          for (const auto & id : ids) all_ids.push_back(id);
+          ids.clear();
+        }
+        for (auto & poses : placed_poses_) poses.clear();
+        // 兜底: 即便 placed_ids_ 空(计数漏追踪), 也按命名规则扫一遍清残留.
+        for (int t = 0; t < num_trays_; ++t) {
+          for (int L = 0; L < 64; ++L) {
+            char buf[32]; std::snprintf(buf, sizeof(buf), "placed_t%d_l%d", t, L);
+            all_ids.push_back(buf);
+          }
+        }
+        for (const auto & id : all_ids) {
+          moveit_msgs::msg::CollisionObject co;
+          co.id = id;
+          co.header.frame_id = base_frame_;
+          co.operation = co.REMOVE;
+          co_pub_->publish(co);
+        }
+        // 上面两条(PSI + /collision_object 直发)都是异步且实测都可能不生效:
+        // 2026-07-29 重启 grasp_node 后场景残留 placed_t* 挡放置, 两条路都没删掉,
+        // 最终只有 apply_planning_scene 服务(同步)删得掉. 故以它为准再补一刀.
+        const bool applied = removePlacedViaService();
+        RCLCPP_INFO(logger_, "堆叠计数与已落盒碰撞体已清零 (%d 托盘, REMOVE %zu 条, 服务同步 %s)",
+                    num_trays_, all_ids.size(), applied ? "成功" : "失败");
+        res->success = applied;
+        res->message = applied ? "stack counters reset"
+                              : "计数已清零, 但场景残留碰撞体未删净 (见日志)";
+      },
+      rmw_qos_profile_services_default, srv_cb_group_);
+    // 重启后补登已物理存在的盒 (restart 会清空运行时堆叠状态, 但托盘上盒还在):
+    // 读 seed_tray/seed_thickness 参数, 按当前该托盘 release z 公式补一个碰撞体+计数.
+    // 每 call 一次补一个 (对应一个实体盒); 连续同盘补多个就多 call 几次.
+    seed_srv_ = node_->create_service<std_srvs::srv::Trigger>(
+      "/grasp/seed_placed",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        const int tray = static_cast<int>(node_->get_parameter("seed_tray").as_int());
+        const double th = node_->get_parameter("seed_thickness").as_double();
+        if (tray < 0 || tray >= num_trays_) {
+          res->success = false; res->message = "seed_tray 越界"; return;
+        }
+        // release 位姿 = 该托盘标定接触位姿, z = tray_z + 已累计 + 本盒厚 (与放置同式).
+        geometry_msgs::msg::Pose pose = trayContactPose(tray);
+        pose.position.z = tray_z_[tray] + trayStackH(tray) + th;
+        pushLayer(tray, th, pose);
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "补登 %d 号托盘第 %d 层 (厚 %.0fmm, 累计高 %.1fmm)",
+                      tray, trayLayers(tray), th * 1000, trayStackH(tray) * 1000);
+        RCLCPP_WARN(logger_, "%s", buf);
+        res->success = true; res->message = buf;
       },
       rmw_qos_profile_services_default, srv_cb_group_);
 
@@ -537,8 +718,8 @@ private:
     if (dry_run_) {
       // 安全测试(第①②③步): 不抓真盒, 挂个虚拟盒让规划考虑几何, 只走放置轨迹规划/慢跑,
       // 不吸不放不计堆叠. 走完清掉虚拟盒.
-      attachBox(true);
-      bool ok = placeAtPose(target, what);
+      attachBox(true, thickness);
+      bool ok = placeAtPose(target, what, tray);
       detachBox();
       res->success = ok;
       res->message = ok ? std::string("[dry_run] 放置轨迹规划通过: ") + what
@@ -553,11 +734,11 @@ private:
     // 的入位方式消除, 不再靠碰撞检测拦.
     if (!pickCycle(err, true)) { res->success = false; res->message = err; return; }
 
-    if (!placeAtPose(target, what)) {
+    if (!placeAtPose(target, what, tray)) {
       res->success = false; res->message = std::string("放置失败(已吸取): ") + what; return;
     }
-    // 放置成功才计入堆叠: 层数+1, 累计厚度 += 本层厚度.
-    pushLayer(tray, thickness);
+    // 放置成功才计入堆叠: 层数+1, 累计厚度 += 本层厚度, 并留持久碰撞体.
+    pushLayer(tray, thickness, target);
 
     if (!moveToReady()) {
       res->success = false; res->message = "放置后回 ready 失败"; return;
@@ -630,11 +811,136 @@ private:
     return tray_stack_h_[t];
   }
 
-  void pushLayer(int t, double thickness)
+  // 放置成功后调: 层数/累计厚度 +1, 并在规划场景留一个持久世界碰撞体代表这个已落盒.
+  // release_pose = 释放时吸盘位姿 (盒顶贴吸盘末端), 盒心在其 -Z 方向半个盒高处.
+  // 该碰撞体不 detach, 生命周期到 reset_stack —— 后续放别盘时 MoveIt 自动避让, 不再横扫.
+  void pushLayer(int t, double thickness, const geometry_msgs::msg::Pose & release_pose)
   {
     std::lock_guard<std::mutex> lk(stack_mtx_);
     tray_layers_[t] += 1;
     tray_stack_h_[t] += thickness;
+
+    geometry_msgs::msg::Pose box = release_pose;
+    box.position.z -= box_size_z_ / 2.0;   // 盒心在吸盘末端下方半个盒高 (工具朝下)
+    const std::string id = "placed_t" + std::to_string(t) + "_l" +
+                           std::to_string(tray_layers_[t]);
+    placed_ids_[t].push_back(id);
+    placed_poses_[t].push_back(box);
+    addPlacedBox(id, box);
+  }
+
+  // 把一个已落盒作为独立世界碰撞体加入规划场景 (base_link 系).
+  void addPlacedBox(const std::string & id, const geometry_msgs::msg::Pose & pose)
+  {
+    moveit_msgs::msg::CollisionObject co;
+    co.id = id;
+    co.header.frame_id = base_frame_;
+    shape_msgs::msg::SolidPrimitive prim;
+    prim.type = prim.BOX;
+    prim.dimensions = {box_size_x_, box_size_y_, box_size_z_};
+    co.primitives.push_back(prim);
+    co.primitive_poses.push_back(pose);
+    co.operation = co.ADD;
+    psi_->applyCollisionObjects({co});
+    RCLCPP_INFO(logger_, "已落盒 %s 留作规划场景碰撞体 (%.3f,%.3f,%.3f)",
+                id.c_str(), pose.position.x, pose.position.y, pose.position.z);
+  }
+
+  // 问 move_group 当前场景里都有哪些世界碰撞体 (同步服务, 返回即是权威现状).
+  // 用途: reset_stack 据此只删真实存在的 id, 并在删后复查是否真的清掉了.
+  bool listSceneObjects(std::vector<std::string> & out)
+  {
+    if (!get_scene_cli_->wait_for_service(2s)) return false;
+    auto req = std::make_shared<moveit_msgs::srv::GetPlanningScene::Request>();
+    req->components.components = req->components.WORLD_OBJECT_NAMES;
+    auto fut = get_scene_cli_->async_send_request(req);
+    if (fut.wait_for(5s) != std::future_status::ready) return false;
+    out.clear();
+    for (const auto & co : fut.get()->scene.world.collision_objects) out.push_back(co.id);
+    return true;
+  }
+
+  // 用 move_group 的 apply_planning_scene 服务同步删掉场景里所有 placed_* 碰撞体.
+  // 为什么需要这条第三路: PSI removeCollisionObjects 与 /collision_object 直发都是异步的,
+  // 2026-07-29 实测重启 grasp_node 后场景里残留的 placed_t* 两条路都删不掉, 只有这个同步
+  // 服务删得动 —— 残留盒挡住放置的 transit 规划与直下段, 表现为"覆盖不足 44%"/"plan 失败".
+  // 删哪些由**现场**决定而不是按命名规则盲扫 0..63: 盲扫会把上百个不存在的 id 塞进 diff,
+  // move_group 对不存在的 id 整体返回 success=false, 于是返回值分不出"真失败"与"删了但
+  // 顺带扫了空 id"(2026-07-29 实测: 128 条 REMOVE 报失败, 场景其实已空). 改成先查现状、
+  // 只删存在的、删完复查, 返回值才是可信的判据.
+  // 空 primitives 的 REMOVE 条目按 id 删是合法的, 但 header.frame_id 必须给, 否则
+  // move_group 报 "Unknown frame" 整个 diff 被拒.
+  bool removePlacedViaService()
+  {
+    std::vector<std::string> ids;
+    if (!listSceneObjects(ids)) {
+      RCLCPP_WARN(logger_, "get_planning_scene 不可用, 跳过同步 REMOVE");
+      return false;
+    }
+    std::vector<std::string> targets;
+    for (const auto & id : ids) {
+      if (id.rfind("placed_", 0) == 0 || id == kCarriedBoxId) targets.push_back(id);
+    }
+    if (targets.empty()) return true;
+    if (!apply_scene_cli_->wait_for_service(2s)) {
+      RCLCPP_WARN(logger_, "apply_planning_scene 服务不可用, 跳过同步 REMOVE");
+      return false;
+    }
+    auto req = std::make_shared<moveit_msgs::srv::ApplyPlanningScene::Request>();
+    req->scene.is_diff = true;
+    req->scene.robot_state.is_diff = true;
+    for (const auto & id : targets) {
+      moveit_msgs::msg::CollisionObject co;
+      co.id = id;
+      co.header.frame_id = base_frame_;
+      co.operation = co.REMOVE;
+      req->scene.world.collision_objects.push_back(co);
+    }
+    auto fut = apply_scene_cli_->async_send_request(req);
+    if (fut.wait_for(5s) != std::future_status::ready) {
+      RCLCPP_WARN(logger_, "apply_planning_scene 无响应");
+      return false;
+    }
+    // 复查: 服务 success 只说 diff 被接受, 以场景里 placed_* 是否真没了为准.
+    std::vector<std::string> after;
+    if (!listSceneObjects(after)) return false;
+    for (const auto & id : after) {
+      if (id.rfind("placed_", 0) == 0) {
+        RCLCPP_ERROR(logger_, "同步 REMOVE 后场景仍残留 %s", id.c_str());
+        return false;
+      }
+    }
+    RCLCPP_INFO(logger_, "同步 REMOVE 清掉 %zu 个已落盒碰撞体", targets.size());
+    return true;
+  }
+
+  // 临时移出某托盘的所有已落盒 (放同盘下一层时它们正是落点, 不能当障碍挡住直下段).
+  void hideTrayBoxes(int t)
+  {
+    std::lock_guard<std::mutex> lk(stack_mtx_);
+    if (t < 0 || t >= static_cast<int>(placed_ids_.size()) || placed_ids_[t].empty()) return;
+    psi_->removeCollisionObjects(placed_ids_[t]);
+    RCLCPP_INFO(logger_, "临时移出 %d 号托盘 %zu 个已落盒 (本层落点)",
+                t, placed_ids_[t].size());
+  }
+
+  // 把之前 hide 的托盘已落盒原样加回 (放置完直下段结束后调).
+  void showTrayBoxes(int t)
+  {
+    std::lock_guard<std::mutex> lk(stack_mtx_);
+    if (t < 0 || t >= static_cast<int>(placed_ids_.size())) return;
+    for (size_t i = 0; i < placed_ids_[t].size(); ++i) {
+      moveit_msgs::msg::CollisionObject co;
+      co.id = placed_ids_[t][i];
+      co.header.frame_id = base_frame_;
+      shape_msgs::msg::SolidPrimitive prim;
+      prim.type = prim.BOX;
+      prim.dimensions = {box_size_x_, box_size_y_, box_size_z_};
+      co.primitives.push_back(prim);
+      co.primitive_poses.push_back(placed_poses_[t][i]);
+      co.operation = co.ADD;
+      psi_->applyCollisionObjects({co});
+    }
   }
 
   // /grasp/unload: 从托盘取盒(此刻 object_pose 报的就是托盘上的盒) -> 放到目的地(参数).
@@ -672,22 +978,18 @@ private:
   {
     geometry_msgs::msg::PoseStamped obj;
     if (!waitObject(obj, 3.0)) { err = "无 object_pose"; return false; }
-    // θ_img 必须在这里锁: 此刻腕仍在 look 姿态, 相机俯视盒子无遮挡, 是唯一干净的观测时机.
-    // ①/②走完后吸盘悬在盒正上方 12cm, 盒被吸盘遮挡, 检测退化 (转 yaw 后重测曾报出
-    // 偏 50° 的假数). 用图像角而非 obj 里的 base_link 盒 yaw, 是为绕开手眼外参旋转.
-    double theta_img = 0.0;
-    if (!latestAxisAngle(theta_img)) { err = "无新鲜 θ_img (长轴图像角)"; return false; }
-    const double tool_yaw = toolYawFromImageAngle(theta_img);
-    RCLCPP_INFO(logger_,
-                "锁定朝向: θ_img=%+.1f° -> 吸盘目标 yaw=%+.1f° "
-                "(标定 θ_ref=%+.1f°/ψ_ref=%+.1f°, s=%+.0f)",
-                theta_img, tool_yaw * 180.0 / M_PI,
-                yaw_ref_theta_img_, yaw_ref_tool_, yaw_axis_sign_);
     if (!stageCoarse(obj)) { err = "① 粗定位失败"; return false; }
     if (!stageRefine())    { err = "② 精修失败"; return false; }
     // ②之后再转 yaw (吸取前): 吸盘轴先与盒轴对齐, 吸起来盒在吸盘上的相对朝向就是 0,
     // 放置时只需把吸盘转到托盘标定朝向, 不用再算"盒相对吸盘"那一层.
-    if (!stageRotateYaw(tool_yaw, theta_img)) { err = "转 yaw 失败"; return false; }
+    if (!stageAlignYaw()) { err = "转 yaw 对齐失败"; return false; }
+    // 调试开关: 跑完 ②+对齐 yaw 后停住, 不下插. 用 ros2 param set /grasp_node
+    // pick_skip_insert true 触发, 配合 /grasp/pick_only 验精修对准效果.
+    const bool skip_insert = getOrDeclare<bool>("pick_skip_insert", false);
+    if (skip_insert) {
+      RCLCPP_WARN(logger_, "pick_skip_insert=true: ②+对齐 yaw 后停住, 跳过 ③下插");
+      return true;
+    }
     if (!stageInsert(allow_tray_touch)) { err = "③ 末段直插失败"; return false; }
     return true;
   }
@@ -725,12 +1027,36 @@ private:
     return true;
   }
 
-  // ②之后: 原地把吸盘转到"与盒长轴对齐"的朝向 tool_yaw, 为放置做准备
-  // (放置要求盒子摆正; 吸本身不需要 yaw). tool_yaw 由 θ_img 经标定常数解出, 见
-  // toolYawFromImageAngle —— 不过手眼外参, 所以不随构型漂.
+  // ②之后: 原地转腕, 闭环把吸盘长轴转到与盒长轴平行, 为放置做准备
+  // (放置要求盒子摆正; 吸本身不需要 yaw).
+  //
+  // 判据是"图像角落到 θ_img*", 不是"腕转到解算出的 ψ". 两者的区别是本段的全部要点:
+  // 相机固连腕, 所以吸盘长轴在图像里的角度是个与构型无关的常数 θ_img*; 盒长轴与吸盘
+  // 长轴平行 <=> θ_img == θ_img*. 于是对齐是个可以在机上直接看到的终点条件, 腕该转
+  // 多少不需要事先知道.
+  //
+  // 为什么不再解算 ψ (2026-07-28 推翻了前一版): 前一版写 ψ = ψ_ref + s·k·(θ_ref − θ_img),
+  // 一次开环解算就下发, 对不对全押在常斜率 k 上, 而实测斜率随角区在 0.5~0.9 间变
+  // (腕绕 base z 转而光轴不与 base z 平行, 投影把关系压成随 ψ 变化的畸变). 单次开环解算
+  // 偏 40% 就是几十度, 直接把腕甩过 (−90,90] 折叠边界. 改成闭环后 k 降级成"步长估计":
+  // 每步转完重新采 θ_img, 偏了下一步自己修回来, 终点精度只由 θ_img* 与容差决定.
+  // 斜率取 yaw_slope_prior_ 作先验直接下发第一步, 被单调性检查证伪才回退 measureYawSlope
+  // 试探实测. 原先无条件先试探(与 ② 精修实测雅可比同一思路), 但那要多付"小动一下 + 两次
+  // 排空采样"约 2s; 而闭环本就用来吸收先验偏差, 先验只需量级对.
+  // 顺带消掉旧链最恶心的性质 —— 偏差随"离标定点角距离"放大, 使得在标定点附近试必然误判
+  // 为已修好 (2026-07-27 因此踩了四轮).
+  //
+  // ⚠️ 2026-07-28 撤回两个错误诊断 (别再照它们改代码):
+  //   ① "OBB 退化/吸盘遮挡致 θ_img 假值" —— 错. 走到 ±88° 时 conf 0.83、框位置深度全稳,
+  //      那是真值, 只是腕真的被转到了那里.
+  //   ② "投影斜率连符号都会翻" —— 也错. 实测 θ_img +41.5° 处斜率 +0.86、−39.8° 处 +0.48,
+  //      同号. 真身是 rotateToolYawBy 的 90° 等价折叠把下发步长换成了反号的那个分支
+  //      (请求 +60° 实走 −30°, 请求 −46.2° 实走 +43.8°), 见 yawEquivalents 注释. 该折叠
+  //      已删 —— θ_img 判据是 180° 周期的, 与 90° 折叠根本不兼容.
+  //
   // 位置目标沿用当前实测 TCP xyz, 只换朝向 —— 绕吸盘自身轴转, 名义上盒心位置不变.
-  // 转完打印 TCP xy 漂移: 腕关节轴与吸盘轴未必严格共线, 漂多少要用实测说话, 不靠假设.
-  bool stageRotateYaw(double tool_yaw, double theta_img)
+  // 每步打印 TCP xy 漂移: 腕关节轴与吸盘轴未必严格共线, 漂多少用实测说话.
+  bool stageAlignYaw()
   {
     geometry_msgs::msg::PoseStamped before;
     if (!currentTcp(before)) { RCLCPP_ERROR(logger_, "转 yaw: 取当前位姿失败"); return false; }
@@ -738,58 +1064,178 @@ private:
     move_group_->setMaxVelocityScalingFactor(rotate_velocity_scaling_);
     move_group_->setMaxAccelerationScalingFactor(rotate_velocity_scaling_);
 
-    geometry_msgs::msg::Pose target = before.pose;
-    moveit::planning_interface::MoveGroupInterface::Plan plan;
-    bool planned = false;
-    // 等价分支就近优先: 近正方形盒(square_categories)按 90° 折, 长方形盒只能按 180° 折.
-    // 就近那个可能落在腕限位外或规划失败, 所以其余分支留作兜底.
-    for (const auto & q : yawEquivalents(yawToQuat(tool_yaw))) {
-      target.orientation = q;
-      move_group_->setStartStateToCurrentState();
-      move_group_->setPoseTarget(target);
-      if (move_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
-        RCLCPP_INFO(logger_, "转 yaw 规划成功 (解出 %+.1f° -> 就近等价 %+.1f°)",
-                    tool_yaw * 180.0 / M_PI, quatYaw(q) * 180.0 / M_PI);
-        planned = true;
+    double turned = 0.0;        // 本段累计转动量(度), 防跑飞
+    double theta = 0.0, err = 0.0;
+    if (!sampleYawErr(theta, err)) { restorePlanScaling(); return false; }
+    if (std::fabs(err) <= yaw_align_tol_deg_) {
+      RCLCPP_INFO(logger_, "转 yaw: θ_img=%+.1f° 已在容差内(差 %+.1f°), 无需转",
+                  theta, err);
+      restorePlanScaling();
+      return true;
+    }
+
+    // ---- 先按先验斜率直接下发, 只有它被证伪才回退去试探 ----
+    // 原先每轮无条件先转 yaw_probe_deg_ 试探一步实测斜率, 代价是"小动一下 + 两次排空采样"
+    // 约 2s 的顿挫. 而斜率实测四次(θ_img +41.5/+40.8/+25.9 处 +0.86/+0.84/+0.83,
+    // -39.8° 处 +0.48)符号从未翻过, 量级也只在 0.5~0.9 间 —— 这个精度对闭环足够: 步长打
+    // yaw_step_gain_ 折, 偏 20% 只是多迭代一步, 终点精度只由 θ_img* 与容差决定.
+    // 先验偏太多(含符号猜反)由单调性检查兜住: 一步后误差没降就回退试探实测, 不再直接中止.
+    double slope = yaw_slope_prior_;
+    bool slope_measured = false;
+    RCLCPP_INFO(logger_, "转 yaw: θ_img=%+.1f° (判据 %+.1f°, 差 %+.1f°), 先按先验斜率 %+.2f 走",
+                theta, yaw_target_theta_img_, err, slope);
+
+    bool aligned = false;
+    double prev_err = std::fabs(err);
+    for (int step = 0; step < yaw_align_max_steps_; ++step) {
+      if (std::fabs(err) <= yaw_align_tol_deg_) {
+        RCLCPP_INFO(logger_, "转 yaw: θ_img=%+.1f° 距判据 %+.1f° <= 容差 %.1f°, 对齐 (第%d步)",
+                    theta, err, yaw_align_tol_deg_, step);
+        aligned = true;
         break;
       }
-      RCLCPP_WARN(logger_, "转 yaw %+.1f° 规划失败, 试等价分支", quatYaw(q) * 180.0 / M_PI);
+      if (step > 0 && std::fabs(err) > prev_err * 0.8) {
+        // 转完误差没降. 两种可能: 先验斜率不准(含符号猜反), 或斜率在这个角区真变了.
+        // 先验还没被实测替换过 -> 花一次试探把它量准再继续; 已经是实测值还不收敛 -> 中止,
+        // 再迭代只会越跑越远.
+        if (slope_measured) {
+          RCLCPP_ERROR(logger_, "转 yaw 第%d步: 误差 %.1f° -> %.1f° 未收敛(实测斜率已变), 中止",
+                       step + 1, prev_err, std::fabs(err));
+          restorePlanScaling(); return false;
+        }
+        RCLCPP_WARN(logger_, "转 yaw: 先验斜率 %+.2f 下误差 %.1f° -> %.1f° 没降, 转试探步实测",
+                    slope, prev_err, std::fabs(err));
+        if (!measureYawSlope(theta, err, turned, slope)) { restorePlanScaling(); return false; }
+        slope_measured = true;
+      }
+      prev_err = std::fabs(err);
+      double d_deg = clampAbs(-err / slope * yaw_step_gain_, yaw_max_step_deg_);
+      if (std::fabs(turned) + std::fabs(d_deg) > yaw_align_max_turn_deg_) {
+        RCLCPP_ERROR(logger_, "转 yaw: 累计转动将超上限 %.0f° (已转 %+.1f°, 还要 %+.1f°), 中止",
+                     yaw_align_max_turn_deg_, turned, d_deg);
+        restorePlanScaling(); return false;
+      }
+      RCLCPP_INFO(logger_, "转 yaw 第%d步: θ_img=%+.1f° (差 %+.1f°) / 斜率 %+.2f -> 腕转 %+.1f°",
+                  step + 1, theta, err, slope, d_deg);
+      if (!rotateToolYawBy(d_deg * M_PI / 180.0)) { restorePlanScaling(); return false; }
+      turned += d_deg;
+      if (!sampleYawErr(theta, err)) { restorePlanScaling(); return false; }
     }
-    if (!planned) {
-      RCLCPP_ERROR(logger_, "转 yaw: 所有等价分支都规划失败");
-      restorePlanScaling(); return false;
-    }
-    if (move_group_->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
-      restorePlanScaling(); return false;
-    }
-    settle();
     restorePlanScaling();
+    if (!aligned) {
+      RCLCPP_ERROR(logger_, "转 yaw: %d 步未对齐 (末次差 %+.1f°)", yaw_align_max_steps_, err);
+      return false;
+    }
 
     geometry_msgs::msg::PoseStamped after;
     if (!currentTcp(after)) return false;
     const double dx = after.pose.position.x - before.pose.position.x;
     const double dy = after.pose.position.y - before.pose.position.y;
-    RCLCPP_INFO(logger_, "转 yaw 后 TCP xy 漂移 (%+.1f,%+.1f)mm |d|=%.1fmm",
+    RCLCPP_INFO(logger_, "转 yaw 完成: 腕 %+.1f° -> %+.1f°, TCP xy 漂移 (%+.1f,%+.1f)mm |d|=%.1fmm",
+                quatYaw(before.pose.orientation) * 180.0 / M_PI,
+                quatYaw(after.pose.orientation) * 180.0 / M_PI,
                 dx * 1000, dy * 1000, std::hypot(dx, dy) * 1000);
-
-    reportYawResidual(theta_img, tool_yaw, quatYaw(after.pose.orientation));
     return true;
   }
 
-  // 转完 yaw 后的自检: 只比"指令 vs 实到", 不重测盒子.
-  // 为什么不重测: 此刻吸盘悬在盒正上方 12cm, 盒被吸盘遮挡、常被挤到画面边缘, 这时的检测
-  // 是坏视角 —— 2026-07-27 实测据此算出 +50.6° 的假残差, 而人工量的真实偏差只有 6°.
-  // 真正的对齐残差无法在机上闭环量到(要量就得再看一眼被遮住的盒), 它由标定常数
-  // (yaw_ref_theta_img/yaw_ref_tool) 的准确度决定, 靠"盒能否干净落进围栏"离线校.
-  // 折到 (-90,90] 比较: 长轴无向, 差 180° 是同一朝向.
-  void reportYawResidual(double theta_img, double tool_yaw_cmd, double tool_yaw_now)
+  // 转一小步 yaw_probe_deg_ 实测 dθ_img/dψ. 只在先验斜率被单调性检查证伪时才调 ——
+  // 无条件先试探要多付"小动一下 + 两次排空采样"约 2s.
+  // 就地更新 theta/err/turned 到试探后的实况, 调用方接着按 slope 继续迭代.
+  bool measureYawSlope(double & theta, double & err, double & turned, double & slope)
   {
-    const double track = wrapAngle90(tool_yaw_now - tool_yaw_cmd);
-    RCLCPP_INFO(logger_,
-                "转 yaw 自检: θ_img=%+.1f° -> 指令 %+.1f°, 实到 %+.1f° (跟随误差 %+.1f°). "
-                "对齐残差不在此测(吸盘遮挡盒子), 由标定常数决定",
-                theta_img, tool_yaw_cmd * 180.0 / M_PI,
-                tool_yaw_now * 180.0 / M_PI, track * 180.0 / M_PI);
+    // 试探方向按误差符号取: 先验若大致对, 这一步本身也是有效位移, 不白转.
+    const double probe = (err > 0.0) ? -yaw_probe_deg_ : yaw_probe_deg_;
+    RCLCPP_INFO(logger_, "转 yaw 试探: θ_img=%+.1f° (差 %+.1f°) -> 试转 %+.1f° 量斜率",
+                theta, err, probe);
+    if (!rotateToolYawBy(probe * M_PI / 180.0)) return false;
+    turned += probe;
+
+    double theta2 = 0.0, err2 = 0.0;
+    if (!sampleYawErr(theta2, err2)) return false;
+    // 斜率也要折叠作差: 长轴无向, θ_img 在 ±90° 边界会翻符号, 直接相减会得到 ~180° 的假变化.
+    const double dtheta = wrapAngle90((theta2 - theta) * M_PI / 180.0) * 180.0 / M_PI;
+    slope = dtheta / probe;
+    RCLCPP_INFO(logger_, "转 yaw 试探结果: 腕转 %+.1f° -> θ_img %+.1f°→%+.1f° (变化 %+.1f°), 斜率 %+.2f",
+                probe, theta, theta2, dtheta, slope);
+    // 斜率太小 = 检测没跟随腕转(视野甩飞/盒子被挤出画/长短轴分不清). 拿它解步长会得到
+    // 巨大转动. 中止是安全的: 此刻还没吸盒子, 臂停在 pregrasp 高度.
+    if (std::fabs(slope) < yaw_slope_min_) {
+      RCLCPP_ERROR(logger_, "转 yaw: 实测斜率 %.2f 低于下限 %.2f, 判检测不跟随腕转, 中止",
+                   slope, yaw_slope_min_);
+      return false;
+    }
+    theta = theta2; err = err2;
+    return true;
+  }
+
+  // 采一次 θ_img 与它到判据的折叠差(度). 折到 (-90,90] 作差: 长轴无向, 差 180° 同朝向.
+  // 坏观测门在此: |θ_img| 贴 ±90° 边界时**不一定**是坏值(2026-07-28 实测 -88° 是真值,
+  // 检测健康), 但那是折叠边界, 后续做差/求斜率都可能翻符号, 单帧判不出真假 —— 故只在
+  // 这里拦掉一次, 让上层中止而不是拿它算步长. 中止是安全的: 还没吸盒子, 臂在 pregrasp 高度.
+  bool sampleYawErr(double & out_theta, double & out_err)
+  {
+    bool got = false;
+    for (int i = 0; i < axis_resample_tries_ && !got; ++i) {
+      rclcpp::sleep_for(std::chrono::milliseconds(
+        static_cast<int>(axis_flush_sec_ * 1000)));   // 排空运动中拍的积压帧
+      got = avgAxisAngle(out_theta);
+    }
+    if (!got) {
+      RCLCPP_ERROR(logger_, "转 yaw: 取不到一致的 θ_img (重采 %d 次)", axis_resample_tries_);
+      return false;
+    }
+    if (std::fabs(out_theta) > yaw_bad_theta_deg_) {
+      RCLCPP_ERROR(logger_, "转 yaw: θ_img=%+.1f° 贴 ±90° 折叠边界, 符号不可判, 中止",
+                   out_theta);
+      return false;
+    }
+    out_err = wrapAngle90((out_theta - yaw_target_theta_img_) * M_PI / 180.0) * 180.0 / M_PI;
+    return true;
+  }
+
+  // 在当前朝向上再绕 base z 补转 d 弧度, 位置不变. 等价分支(180° 折)就近优先:
+  // 就近那个可能落在腕限位外或规划失败, 另一个留作兜底.
+  bool rotateToolYawBy(double d)
+  {
+    geometry_msgs::msg::PoseStamped cur;
+    if (!currentTcp(cur)) return false;
+    geometry_msgs::msg::Pose target = cur.pose;
+    const auto want = rotateAboutBaseZ(cur.pose.orientation, d);
+
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    for (const auto & q : yawEquivalents(want)) {
+      target.orientation = q;
+      move_group_->setStartStateToCurrentState();
+      move_group_->setPoseTarget(target);
+      if (move_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+        if (move_group_->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) return false;
+        settle();
+        return true;
+      }
+      RCLCPP_WARN(logger_, "转 yaw 到 %+.1f° 规划失败, 试等价分支", quatYaw(q) * 180.0 / M_PI);
+    }
+    RCLCPP_ERROR(logger_, "转 yaw: 所有等价分支都规划失败");
+    return false;
+  }
+
+  // jog 专用直转: 绕 base 竖直轴转 d 弧度, 位置不变, 只试目标朝向本身(不走 yawEquivalents
+  // 的 90°/180° 等价折叠) —— 标定时你要转多少就转多少, 不被折叠换成别的等价姿态.
+  bool jogRotateYaw(double d)
+  {
+    geometry_msgs::msg::PoseStamped cur;
+    if (!currentTcp(cur)) return false;
+    geometry_msgs::msg::Pose target = cur.pose;
+    target.orientation = rotateAboutBaseZ(cur.pose.orientation, d);
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    move_group_->setStartStateToCurrentState();
+    move_group_->setPoseTarget(target);
+    if (move_group_->plan(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+      RCLCPP_ERROR(logger_, "jog 转腕 %+.1f° 规划失败", d * 180.0 / M_PI);
+      return false;
+    }
+    if (move_group_->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) return false;
+    settle();
+    return true;
   }
 
   geometry_msgs::msg::Quaternion yawToQuat(double yaw)
@@ -813,22 +1259,21 @@ private:
     return q;
   }
 
-  // 目标姿态的等价分支, 按"离当前吸盘朝向近"排序返回.
-  // 折叠步长按盒形状分: 近正方形盒(square_categories, 现只有类别1)转 90° 后占位几乎不变,
-  // 所以 4 个分支都等价, 就近取能省掉大角度转动; 其余类别是长方形, 转 90° 长短边互换,
-  // 进带围栏托盘会顶到边框, 只有 180° 才是真等价.
+  // 目标姿态的等价分支(只按 180° 折), 按"离当前吸盘朝向近"排序返回.
   // 排序的意义是省掉无意义的转动 —— θ_img 折到 (-90°,90°], 盒摆在边界附近时检测值在
   // +88°/-88° 间反复翻, 不排序会为 176° 的名义差白转半圈.
+  //
+  // 2026-07-28 删掉近正方形盒的 90° 折叠分支: 它与 θ_img 判据根本不兼容. θ_img 折到
+  // (-90,90], 即判据本身是 180° 周期的 —— 姿态转 90° 后 θ_img 读出的是 90° 误差而不是 0.
+  // 于是 90° 折叠会把闭环解出的步长静默换成"最近的那个", 只要 |步长| > 45° 就换成一个
+  // 反号的步长: 实测请求 +60° 实走 -30°(60-90), 请求 -46.2° 实走 +43.8°. 这正是早前
+  // 误判成"投影斜率连符号都会翻"的真身 —— 斜率一直是 +0.8 上下, 是下发的步长被折反了.
   std::vector<geometry_msgs::msg::Quaternion> yawEquivalents(
     const geometry_msgs::msg::Quaternion & target)
   {
-    const bool square = isSquareCategory(currentCategory());
-    const double step = square ? M_PI / 2.0 : M_PI;
-    const int n = square ? 4 : 2;
-
     std::vector<geometry_msgs::msg::Quaternion> out;
-    out.reserve(n);
-    for (int k = 0; k < n; ++k) out.push_back(rotateAboutBaseZ(target, step * k));
+    out.reserve(2);
+    for (int k = 0; k < 2; ++k) out.push_back(rotateAboutBaseZ(target, M_PI * k));
 
     geometry_msgs::msg::PoseStamped cur;
     if (!currentTcp(cur)) return out;
@@ -842,13 +1287,6 @@ private:
     return out;
   }
 
-  bool isSquareCategory(int category) const
-  {
-    for (const auto & c : square_categories_) {
-      if (static_cast<int>(c) == category) return true;
-    }
-    return false;
-  }
 
   // ② 精修: 相机系闭环, 把盒心在相机系的横向 (y,z) 推到标定目标值 (cam_target_y/z).
   // 误差在相机系算, 不经手眼标定/TF, 所以臂移动不会让目标跳 (见 cam_point_topic_ 注释).
@@ -955,20 +1393,24 @@ private:
   }
 
   // 相对当前 TCP 在 base_link 水平面移动 (dx,dy), 姿态与高度不变. 笛卡尔路径, 自带加减速.
-  bool moveRelativeXY(double dx, double dy)
+  bool moveRelativeXY(double dx, double dy) { return moveRelativeXYZ(dx, dy, 0.0); }
+
+  // 相对当前 TCP 走一步纯笛卡尔直线 (base_link 系位移 dx,dy,dz). 朝向不变.
+  bool moveRelativeXYZ(double dx, double dy, double dz)
   {
-    if (std::hypot(dx, dy) < 1e-4) return true;
+    if (std::sqrt(dx * dx + dy * dy + dz * dz) < 1e-4) return true;
     geometry_msgs::msg::PoseStamped cur;
     if (!currentTcp(cur)) return false;
     geometry_msgs::msg::Pose wp = cur.pose;
     wp.position.x += dx;
     wp.position.y += dy;
+    wp.position.z += dz;
     std::vector<geometry_msgs::msg::Pose> wps{wp};
     moveit_msgs::msg::RobotTrajectory traj;
     move_group_->setStartStateToCurrentState();
     const double frac = move_group_->computeCartesianPath(wps, 0.002, 0.0, traj);
     if (frac < 0.9) {
-      RCLCPP_ERROR(logger_, "② 水平步进路径覆盖不足 %.0f%%", frac * 100);
+      RCLCPP_ERROR(logger_, "笛卡尔步进路径覆盖不足 %.0f%%", frac * 100);
       return false;
     }
     if (move_group_->execute(traj) != moveit::core::MoveItErrorCode::SUCCESS) return false;
@@ -1046,6 +1488,12 @@ private:
     RCLCPP_INFO(logger_, "③ 直插笛卡尔路径覆盖 %.0f%%", fraction * 100);
     if (fraction < 0.9) { RCLCPP_ERROR(logger_, "③ 直插路径覆盖不足"); return false; }
     // 下插降速: 压 J6 间隙窜动 (见 insert_velocity_scaling_ 声明处注释).
+    // ⚠️ 这两个 setMax*ScalingFactor 在 computeCartesianPath 之后调用, 对 cartesian path 的
+    // 时间参数化无影响 (MoveIt 的 cartesian path 不读这俩因子, 只有 plan() 读). 留着是历史
+    // 遗物, 实际全速跑. 真要降速得在 computeCartesianPath 前调 + 用 plan() 而非 cartesian path.
+    // 之前这里曾加手动重参数化 (time_from_start * 1/scaling + 清空 v/a) 想真把 30% 落下去,
+    // 结果直插变 5s 太慢, 用户实测反馈"之前好好的", 已撤回. 偶发 TIMED_OUT 用放宽
+    // move_group 的 allowed_execution_duration_multiplier 解决 (见 move_group.launch.py).
     move_group_->setMaxVelocityScalingFactor(insert_velocity_scaling_);
     move_group_->setMaxAccelerationScalingFactor(insert_velocity_scaling_);
     const bool moved = move_group_->execute(traj) == moveit::core::MoveItErrorCode::SUCCESS;
@@ -1061,7 +1509,7 @@ private:
     rclcpp::sleep_for(std::chrono::milliseconds(static_cast<int>(suck_duration_ * 1000)));
     publishPump(PUMP_STOP);
     RCLCPP_INFO(logger_, "③ 发 /pump_cmd 0 转入保压 (关泵关阀, 盒仍吸着)");
-    attachBox(allow_tray_touch);  // 盒进规划场景: 后续放置绕开托盘边框
+    attachBox(allow_tray_touch, thickness);  // 盒进规划场景: 后续放置绕开托盘边框
     return true;
   }
 
@@ -1071,17 +1519,20 @@ private:
   // allow_tray_touch=true 时再把托盘 link 加进 touch_links —— 盒与 Link_11 的接触是预期的:
   // 卸货取盒时盒本在托盘里几何重叠, 放盒到位时盒底落在托盘面. 不豁免则规划器判碰撞,
   // 取盒连抬起都规划不了, 放盒直下段中途被截断.
-  void attachBox(bool allow_tray_touch)
+  // box_z: 当前类别真实盒高 (用 currentThickness(ci) 传进来), 替代 box_size_z_ 默认值 25mm.
+  // 2026-07-29: 25mm 对 category 1 (22mm) 多 3mm, 碰撞体偏低撞托盘围栏顶, 直下覆盖 84%.
+  // 改成按类别传真实厚度, 碰撞体贴近真实, 围栏 clearance 多 3mm.
+  void attachBox(bool allow_tray_touch, double box_z)
   {
     moveit_msgs::msg::CollisionObject co;
     co.id = kCarriedBoxId;
     co.header.frame_id = ee_link_;
     shape_msgs::msg::SolidPrimitive prim;
     prim.type = prim.BOX;
-    prim.dimensions = {box_size_x_, box_size_y_, box_size_z_};
+    prim.dimensions = {box_size_x_, box_size_y_, box_z};
     geometry_msgs::msg::Pose p;
     p.orientation.w = 1.0;
-    p.position.z = -box_size_z_ / 2.0;   // 盒心在吸盘末端下方半个盒高
+    p.position.z = -box_z / 2.0;   // 盒心在吸盘末端下方半个盒高
     co.primitives.push_back(prim);
     co.primitive_poses.push_back(p);
     co.operation = co.ADD;
@@ -1093,7 +1544,7 @@ private:
     if (allow_tray_touch) aco.touch_links.push_back(tray_frame_);
     psi_->applyAttachedCollisionObject(aco);
     RCLCPP_INFO(logger_, "盒子已 attach 到 %s 作碰撞体 (%.0fx%.0fx%.0fmm)%s", ee_link_.c_str(),
-                box_size_x_ * 1000, box_size_y_ * 1000, box_size_z_ * 1000,
+                box_size_x_ * 1000, box_size_y_ * 1000, box_z * 1000,
                 allow_tray_touch ? " [豁免与托盘接触]" : "");
   }
 
@@ -1192,12 +1643,17 @@ private:
     return true;
   }
 
-  // 放到"标定好的绝对目标位姿"(含朝向), 顶向下入位: 相对抬起(携盒) -> 规划到目标正上方
-  // (标定 xy+朝向, z 抬 tray_clearance_) -> 笛卡尔垂直直下到标定位姿 -> 释放 + detach.
+  // 放到"标定好的绝对目标位姿"(含朝向), 顶向下入位: 相对抬起(携盒) -> 规划到高空 transit
+  // (标定 xy+朝向, z = transit_z_ 绝对) -> 笛卡尔垂直直下到标定位姿 -> 释放 + detach.
   // 放托盘用: 托盘在肩后死区, 唯一可达是工具 yaw≈180°朝下的特定位姿(RViz 实测标定).
   // 早前直接 plan() 到标定位姿: 盒 attach 后规划器为让盒全程避开边框会绕大圈甩臂; 改成
   // 顶上空旷处入、再垂直直下, 盒竖直进托盘不蹭边框, 规划器无需绕路, 路径直不甩.
-  bool placeAtPose(const geometry_msgs::msg::Pose & target, const char * what)
+  // 2026-07-29 再改: 原 plan 到 tray_clearance_ 低空 (target.z+0.06), 左盘有盒时规划被
+  // placed_t1 挡到 abort; 改成 plan 到 transit_z_ 高空 (0.30), 两端都在自由空间, 失败率≈0.
+  //
+  // tray: 本次落盘的托盘号. 直下段前临时移出该托盘已落盒 (它们正是本层落点, 当障碍会挡住
+  // 直下), 段后加回; 别的托盘已落盒全程留在场景当障碍, 防规划器横扫 (2026-07-28 蹭飞事故).
+  bool placeAtPose(const geometry_msgs::msg::Pose & target, const char * what, int tray)
   {
     // 四步渐进安全测试: 放置段整体降速(默认 0.2, place_velocity_scaling 再乘一档),
     // 收尾恢复. dry_run 时只 plan+打印, 不 execute, 也不动气泵/detach (盒仍吸着不释放).
@@ -1226,34 +1682,46 @@ private:
                   what, up_frac * 100);
     }
 
-    // 规划到目标正上方 (xy+朝向用标定值, z 抬 tray_clearance_)
-    geometry_msgs::msg::Pose above = target;
-    above.position.z = target.position.z + tray_clearance_;
+    // 本托盘已落盒从 transit 规划前就移出, 而非只在直下段前移出: transit 航点在本盘正上方,
+    // 手上盒是 attach 的, 规划器要算"盒 vs 已放盒"的碰撞, 第2层时间隙不够会直接 plan 失败
+    // (2026-07-29 实测 0号托盘第2层 plan() failed). 本盘已放盒是落点不是障碍, 整个放置段
+    // 都不该当障碍; 别盘的留着当障碍. 中途任何失败返回前必须 showTrayBoxes 加回.
+    hideTrayBoxes(tray);
+
+    // 规划到高空 transit 航点 (xy+朝向用标定值, z = transit_z_ 绝对高度): 两端都在
+    // 自由空间, 规划器不用钻障碍缝, 失败率≈0. 之后纯垂直直下到 target.
+    geometry_msgs::msg::Pose transit = target;
+    transit.position.z = transit_z_;
     move_group_->setStartStateToCurrentState();
-    move_group_->setPoseTarget(above);
+    move_group_->setPoseTarget(transit);
     moveit::planning_interface::MoveGroupInterface::Plan plan;
     if (move_group_->plan(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
-      RCLCPP_ERROR(logger_, "放置(%s): 规划到正上方 (%.3f,%.3f,%.3f) 失败", what,
-                   above.position.x, above.position.y, above.position.z);
-      restorePlanScaling(); return false;
+      RCLCPP_ERROR(logger_, "放置(%s): 规划到 transit (%.3f,%.3f,%.3f) 失败", what,
+                   transit.position.x, transit.position.y, transit.position.z);
+      showTrayBoxes(tray); restorePlanScaling(); return false;
     }
-    RCLCPP_INFO(logger_, "放置(%s): 规划到正上方 (%.3f,%.3f,%.3f) 成功, 轨迹 %zu 点", what,
-                above.position.x, above.position.y, above.position.z,
+    RCLCPP_INFO(logger_, "放置(%s): 规划到 transit (%.3f,%.3f,%.3f) 成功, 轨迹 %zu 点", what,
+                transit.position.x, transit.position.y, transit.position.z,
                 plan.trajectory_.joint_trajectory.points.size());
     if (!dry_run_) {
       if (move_group_->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
-        restorePlanScaling(); return false;
+        showTrayBoxes(tray); restorePlanScaling(); return false;
       }
       settle();
     }
 
-    // 笛卡尔垂直直下到标定放置位姿: 盒竖直入托盘, 不侧向蹭边框
+    // 笛卡尔垂直直下到标定放置位姿: 盒竖直入托盘, 不侧向蹭边框.
     std::vector<geometry_msgs::msg::Pose> dwps{target};
     moveit_msgs::msg::RobotTrajectory dtraj;
     // dry_run 下上面两段都没真执行, 臂还停在原处; 直下段起点若仍取实测当前状态, 等于要求
     // 从原处一步笛卡尔跨到托盘正上方, 覆盖必然 0%. 故接上一段规划的终点作起点.
     if (dry_run_) {
-      moveit::core::RobotState start(*move_group_->getCurrentState());
+      const auto cur_state = move_group_->getCurrentState();
+      if (!cur_state) {
+        RCLCPP_ERROR(logger_, "放置: 取当前状态失败");
+        showTrayBoxes(tray); restorePlanScaling(); return false;
+      }
+      moveit::core::RobotState start(*cur_state);
       const auto & jt = plan.trajectory_.joint_trajectory;
       start.setVariablePositions(jt.joint_names, jt.points.back().positions);
       move_group_->setStartState(start);
@@ -1263,21 +1731,22 @@ private:
     const double frac = move_group_->computeCartesianPath(dwps, 0.005, 0.0, dtraj);
     if (frac < 0.9) {
       RCLCPP_ERROR(logger_, "放置(%s): 垂直直下路径覆盖不足 %.0f%%", what, frac * 100);
-      restorePlanScaling(); return false;
+      showTrayBoxes(tray); restorePlanScaling(); return false;
     }
     if (dry_run_) {
       RCLCPP_WARN(logger_, "放置(%s): [dry_run] 直下路径覆盖 %.0f%%, 目标 z=%.3f, 到此为止不执行",
                   what, frac * 100, target.position.z);
-      restorePlanScaling();
+      showTrayBoxes(tray); restorePlanScaling();
       return true;   // dry_run 视为通过(规划全成功), 但不真放/不计堆叠由调用侧另判
     }
     if (move_group_->execute(dtraj) != moveit::core::MoveItErrorCode::SUCCESS) {
-      restorePlanScaling(); return false;
+      showTrayBoxes(tray); restorePlanScaling(); return false;
     }
     settle();
 
     releasePulse();
     detachBox();
+    showTrayBoxes(tray);   // 落盘后本托盘旧盒加回; pushLayer 再把这个新盒加进去
     restorePlanScaling();
     RCLCPP_INFO(logger_, "放置(%s): 垂直入位到 (%.3f,%.3f,%.3f), 已释放并关阀", what,
                 target.position.x, target.position.y, target.position.z);
@@ -1300,7 +1769,16 @@ private:
       rclcpp::sleep_for(
         std::chrono::milliseconds(static_cast<int>(settle_poll_sec_ * 1000)));
       std::vector<double> cur;
-      move_group_->getCurrentState(0.1)->copyJointGroupPositions(planning_group_, cur);
+      // getCurrentState 拿不到 100ms 内的新状态时返回空指针, 直接 -> 解引用会段错误
+      // (2026-07-29 实机: 精修第2步后 joint_states 晚到 42ms, 整个 grasp_node SIGSEGV 挂掉,
+      // 服务调用永不返回). 空了当"这拍没采到"跳过继续轮询, 不进停稳判据.
+      const auto state = move_group_->getCurrentState(0.1);
+      if (!state) {
+        RCLCPP_WARN(logger_, "静置采样: joint_states 未在 100ms 内更新, 跳过本拍");
+        quiet = 0;
+        continue;
+      }
+      state->copyJointGroupPositions(planning_group_, cur);
       if (prev.size() == cur.size()) {
         double dmax = 0.0;
         for (size_t i = 0; i < cur.size(); ++i) {
@@ -1326,15 +1804,60 @@ private:
   }
 
   // ---- 工具 ----
+  // 等一个**可信**的 object_pose: 先排空视觉管线, 再要求连采几帧彼此一致才采信.
+  // 不能只抓"第一帧新鲜的": 摆臂刚停那刻管线里积压的是运动中拍的画面, 感知端却用当前 TF
+  // 转到 base_link, 于是坐标整体偏掉 (见 object_flush_sec_ 声明处实测数据).
+  // 全败则返回 false 让上层中止 —— 此刻还没吸盒子, 臂停在 look 位, 中止是安全的.
   bool waitObject(geometry_msgs::msg::PoseStamped & out, double timeout_s)
   {
+    for (int t = 0; t < object_resample_tries_; ++t) {
+      rclcpp::sleep_for(std::chrono::milliseconds(
+        static_cast<int>(object_flush_sec_ * 1000)));   // 排空运动中拍的积压帧
+      if (sampleObjectStable(out, timeout_s)) return true;
+    }
+    RCLCPP_ERROR(logger_, "取不到一致的 object_pose (重采 %d 次)", object_resample_tries_);
+    return false;
+  }
+
+  // 连采 object_consist_frames_ 帧新鲜 object_pose, 要求彼此散布 < object_consist_tol_.
+  // 只收 stamp 比上一帧新的, 避免同一帧被重复计入(检测 ~11Hz, 轮询快得多).
+  // 输出取末帧(而非均值): 静止时各帧本就重合, 取均值无收益; 末帧最新, 姿态字段也无需插值.
+  bool sampleObjectStable(geometry_msgs::msg::PoseStamped & out, double timeout_s)
+  {
+    std::vector<geometry_msgs::msg::PoseStamped> buf;
+    rclcpp::Time last(0, 0, RCL_ROS_TIME);
     const rclcpp::Time t0 = node_->now();
-    rclcpp::WallRate r(20.0);
-    while (rclcpp::ok() && (node_->now() - t0).seconds() < timeout_s) {
-      if (latestObject(out)) return true;
+    rclcpp::WallRate r(60.0);
+    while (rclcpp::ok() && static_cast<int>(buf.size()) < object_consist_frames_) {
+      if ((node_->now() - t0).seconds() > timeout_s) {
+        RCLCPP_WARN(logger_, "object_pose 采样超时 (%.1fs 内只收到 %zu/%d 帧)",
+                    timeout_s, buf.size(), object_consist_frames_);
+        return false;
+      }
+      geometry_msgs::msg::PoseStamped p;
+      if (latestObject(p)) {
+        const rclcpp::Time st(p.header.stamp);
+        if (st > last) { last = st; buf.push_back(p); }
+      }
       r.sleep();
     }
-    return false;
+    double spread = 0.0;
+    for (const auto & a : buf) {
+      spread = std::max(spread,
+                        std::hypot(a.pose.position.x - buf.back().pose.position.x,
+                                   a.pose.position.y - buf.back().pose.position.y));
+    }
+    if (spread > object_consist_tol_) {
+      RCLCPP_WARN(logger_,
+                  "object_pose %d 帧不一致 (散布 %.1fmm > %.1fmm, 疑摆臂中拍的帧), 重采",
+                  object_consist_frames_, spread * 1000, object_consist_tol_ * 1000);
+      return false;
+    }
+    out = buf.back();
+    RCLCPP_INFO(logger_, "object_pose 已稳定: (%.3f,%.3f,%.3f) 散布 %.1fmm",
+                out.pose.position.x, out.pose.position.y, out.pose.position.z,
+                spread * 1000);
+    return true;
   }
 
   bool latestObject(geometry_msgs::msg::PoseStamped & out)
@@ -1367,12 +1890,60 @@ private:
     return true;
   }
 
-  // θ_img(度) -> 吸盘目标 yaw(弧度). ψ = ψ_ref + s·(θ_ref − θ_img), 三个常数实测标定,
-  // 不含手眼外参与 FK, 故不随构型漂 (见 axis_angle_topic_ 声明处注释).
-  double toolYawFromImageAngle(double theta_img_deg)
+  // 取 axis_avg_frames_ 帧新鲜 θ_img 的均值(度), 压掉单帧噪声.
+  // 只收 stamp 比上一帧新的, 避免同一帧被重复计入(检测 ~11Hz, 轮询快得多).
+  // 折到 (-90,90] 的角度不能直接求算术均值 —— 盒摆在边界附近时检测值在 +88/−88 间反复翻,
+  // 算术均值会得到 0. 故走单位向量的 2θ 表示 (长轴无向, 差 180° 同朝向) 再折回.
+  bool avgAxisAngle(double & out_deg)
   {
-    const double d = yaw_axis_sign_ * (yaw_ref_theta_img_ - theta_img_deg);
-    return wrapAngle((yaw_ref_tool_ + d) * M_PI / 180.0);
+    double sx = 0.0, sy = 0.0;
+    int n = 0;
+    rclcpp::Time last(0, 0, RCL_ROS_TIME);
+    const rclcpp::Time t0 = node_->now();
+    rclcpp::WallRate r(60.0);
+    std::vector<double> raw;
+    raw.reserve(axis_avg_frames_);
+    while (rclcpp::ok() && n < axis_avg_frames_) {
+      if ((node_->now() - t0).seconds() > cam_wait_timeout_) return false;
+      {
+        std::lock_guard<std::mutex> lk(axis_mtx_);
+        if (have_axis_angle_ &&
+            (node_->now() - last_axis_stamp_).seconds() <= object_stale_sec_ &&
+            last_axis_stamp_ > last)
+        {
+          last = last_axis_stamp_;
+          raw.push_back(last_axis_angle_);
+          const double a2 = 2.0 * last_axis_angle_ * M_PI / 180.0;
+          sx += std::cos(a2);
+          sy += std::sin(a2);
+          ++n;
+        }
+      }
+      r.sleep();
+    }
+    // 一致性门: 合成向量长度 |R|/n 是 2θ 空间的集中度, 帧间一致时 ≈1. 长短边互换(近正方形
+    // 盒长宽比仅 1.11~1.14)在 2θ 空间是 180° 反向, 几帧 -45° 混几帧 +45° 求和会互相抵消,
+    // atan2(0,0) 吐出 0 —— 一个**任何单帧里都不存在**的值, 却看着像"已对齐".
+    // 2026-07-28 实测: 原始帧全是 -44°, 本段首次采样报 +2.5°(前一轮 +10.9°), 正是这个抵消.
+    // 抵消出的假值比噪声危险得多: 它把斜率算成 5.4~6.2(真值 ~0.9), 一步只转几度, 直接
+    // 让整段对齐失败. 故不一致就拒掉让上层中止/重采, 绝不把它当真值往下传.
+    const double concentration = std::hypot(sx, sy) / n;
+    out_deg = 0.5 * std::atan2(sy, sx) * 180.0 / M_PI;
+    if (concentration < axis_min_concentration_) {
+      std::string dump;
+      for (const auto & v : raw) dump += string_format("%+.1f ", v);
+      RCLCPP_ERROR(logger_, "θ_img %d 帧不一致 (集中度 %.2f < %.2f, 疑长短轴互换), 原始帧: %s",
+                   n, concentration, axis_min_concentration_, dump.c_str());
+      return false;
+    }
+    return true;
+  }
+
+  static std::string string_format(const char * fmt, double v)
+  {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), fmt, v);
+    return std::string(buf);
   }
 
   bool currentTcp(geometry_msgs::msg::PoseStamped & out)
@@ -1435,7 +2006,8 @@ private:
   rclcpp::Node::SharedPtr node_;
   rclcpp::Logger logger_;
   std::string planning_group_, ee_link_, base_frame_, tray_frame_, object_topic_, pump_topic_;
-  double pregrasp_height_, lift_height_, tray_clearance_;
+  double pregrasp_height_, lift_height_, tray_clearance_, transit_z_;
+  double jog_dx_, jog_dy_, jog_dz_, jog_dyaw_deg_;
   double insert_stroke_min_, insert_stroke_max_, ground_z_, insert_shortfall_;
   double suck_duration_, release_duration_, insert_velocity_scaling_;
   double settle_sec_, settle_eps_, settle_poll_sec_;
@@ -1452,8 +2024,12 @@ private:
   std::string class_topic_, thickness_topic_, cam_point_topic_, cam_frame_;
   // 吸盘朝向对齐 (走图像角, 不过手眼外参)
   std::string axis_angle_topic_;
-  double yaw_ref_theta_img_, yaw_ref_tool_, yaw_axis_sign_;
-  std::vector<int64_t> square_categories_;
+  double yaw_target_theta_img_, yaw_align_tol_deg_;
+  double yaw_probe_deg_, yaw_slope_prior_, yaw_slope_min_, yaw_step_gain_, yaw_max_step_deg_;
+  double yaw_bad_theta_deg_, yaw_align_max_turn_deg_;
+  double axis_flush_sec_, axis_min_concentration_;
+  int axis_resample_tries_;
+  int yaw_align_max_steps_, axis_avg_frames_;
   std::mutex axis_mtx_;
   double last_axis_angle_{0.0};
   rclcpp::Time last_axis_stamp_{0, 0, RCL_ROS_TIME};
@@ -1467,6 +2043,12 @@ private:
   std::mutex stack_mtx_;
   std::vector<int> tray_layers_;
   std::vector<double> tray_stack_h_;
+  // 已放盒的持久碰撞体 id, 按托盘分组 (stack_mtx_ 保护). 放置成功后留在规划场景, 使后续
+  // 放另一盘时 MoveIt 自动避让, 不再横扫已放盒 (2026-07-28 蹭飞事故). detach 的是携带盒
+  // (carried_box), 这些是"已落盘"的独立世界碰撞体, 生命周期到 reset_stack 才清.
+  std::vector<std::vector<std::string>> placed_ids_;
+  // 每个已放盒的 base_link 系落位姿 (与 id 一一对应), 供临时移出后原样加回.
+  std::vector<std::vector<geometry_msgs::msg::Pose>> placed_poses_;
   // 类别/厚度 B 路线缓存 (cls_mtx_ 保护)
   std::mutex cls_mtx_;
   int last_category_{1};
@@ -1478,6 +2060,8 @@ private:
   double probe_step_, refine_step_gain_, refine_max_step_, refine_velocity_scaling_;
   int refine_max_steps_, cam_avg_frames_;
   double cam_wait_timeout_, refine_timeout_, object_stale_sec_;
+  double object_flush_sec_, object_consist_tol_;
+  int object_consist_frames_, object_resample_tries_;
 
   static constexpr const char * kCarriedBoxId = "carried_box";
 
@@ -1492,9 +2076,13 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr cam_point_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr axis_angle_sub_;
   rclcpp::Publisher<std_msgs::msg::Int8>::SharedPtr pump_pub_;
+  rclcpp::Publisher<moveit_msgs::msg::CollisionObject>::SharedPtr co_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_, unload_srv_, ready_srv_, look_srv_,
-    pick_srv_, place_srv_, coarse_srv_, cam_cal_srv_, yaw_cal_srv_, reset_srv_;
-  rclcpp::CallbackGroup::SharedPtr srv_cb_group_;
+    pick_srv_, place_srv_, coarse_srv_, cam_cal_srv_, yaw_cal_srv_, reset_srv_, jog_srv_,
+    seed_srv_;
+  rclcpp::Client<moveit_msgs::srv::ApplyPlanningScene>::SharedPtr apply_scene_cli_;
+  rclcpp::Client<moveit_msgs::srv::GetPlanningScene>::SharedPtr get_scene_cli_;
+  rclcpp::CallbackGroup::SharedPtr srv_cb_group_, scene_cb_group_;
 
   std::mutex obj_mtx_;
   geometry_msgs::msg::PoseStamped last_object_;

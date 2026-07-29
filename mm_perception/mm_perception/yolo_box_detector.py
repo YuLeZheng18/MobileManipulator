@@ -119,6 +119,16 @@ class YoloBoxDetector(Node):
         # 多目标: 所有盒子位姿数组 (PoseArray). 单目标 pose_topic 仍恒发最大框.
         self.declare_parameter('poses_topic', '/perception/object_poses')
         self.declare_parameter('only_largest', True)    # 单目标: 只发最大框
+        # 单目标候选的 base_link z 上限(米): 高于此的框不参与"当前抓取目标"选择.
+        # 用来排掉已放进托盘的盒子 —— 托盘装在车身(Link_11)上, 在 base_link 里位置恒定,
+        # 已放盒实测 z≈+0.116~+0.151, 而地面待抓盒 z≈-0.013~-0.007, 差 13cm, 远大于手眼
+        # 偏差(2~3cm). 不用 x/y 范围: 那个随底盘位姿与盒子摆位变, z 门限不随底盘动.
+        # 2026-07-29 加: 原先单目标恒取"图像面积最大"框, 而托盘在肩后离相机 0.22~0.25m、
+        # 地面盒 0.36~0.37m, 近的成像更大 -> 只要托盘上有盒子进视野, object_pose /
+        # object_class / object_thickness / object_point_cam 四个话题一起指向那个已放好的
+        # 盒子. 实机后果: ① 粗定位开向托盘方向偏 12~16cm, ② 精修被迫从 118~146mm 爬,
+        # 6 步用尽仍差最后一步 (类别也报错, 会把盒放进错托盘).
+        self.declare_parameter('pick_z_max', 0.06)
         # B 路线(队友停工本人补): 与单目标 pose 同步发"当前目标类别 + 厚度(米)",
         # grasp_node 订阅以按类别分托盘 + 视觉厚度堆叠. 类别取 class_names 里的数字名,
         # 解析失败发 0; 厚度=台面深度-顶面深度. 话题名与 grasp place.yaml 对齐.
@@ -162,6 +172,7 @@ class YoloBoxDetector(Node):
         self.use_raw_depth = bool(gp('use_raw_depth').value)
         self.publish_pose = bool(gp('publish_pose').value)
         self.only_largest = bool(gp('only_largest').value)
+        self.pick_z_max = float(gp('pick_z_max').value)
         self.show_window = bool(gp('show_window').value)
         self.diag_yaw = bool(gp('diag_yaw').value)
         self.save_frame_path = str(gp('save_frame_path').value)
@@ -333,6 +344,8 @@ class YoloBoxDetector(Node):
         res = self.model.predict(bgr, conf=self.conf, imgsz=self.imgsz,
                                  device=self.device, verbose=False)[0]
         dets = self._collect_detections(res)
+        if not dets:
+            self._drop('YOLO无框(conf/类别过滤)', 'conf阈值 %.2f' % self.conf)
         if self.only_largest and dets:
             dets = [max(dets, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))]
 
@@ -437,10 +450,12 @@ class YoloBoxDetector(Node):
         rx1, ry1 = max(0, x1 + sx), max(0, y1 + sy)
         rx2, ry2 = min(w, x2 - sx), min(h, y2 - sy)
         if rx2 - rx1 < 3 or ry2 - ry1 < 3:
+            self._drop('ROI越界/过小', 'roi=(%d,%d)-(%d,%d)' % (rx1, ry1, rx2, ry2))
             return None
         roi = depth[ry1:ry2, rx1:rx2]
         valid = (roi > self.min_depth) & (roi < self.max_depth)
         if not np.any(valid):
+            self._drop('ROI内无有效深度', 'roi %dx%d' % (rx2 - rx1, ry2 - ry1))
             return None
 
         # 台面深度: ROI 内有效深度直方图主峰 (盒子占框大半时用较远的峰更稳, 这里取
@@ -461,12 +476,14 @@ class YoloBoxDetector(Node):
         contours, _ = cv2.findContours(
             mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
+            self._drop('掩码无轮廓', '掩码像素 %d' % int(np.count_nonzero(box_mask)))
             return None
         c = max(contours, key=cv2.contourArea)
         c = c + np.array([[rx1, ry1]])           # 轮廓坐标搬回整图系
 
         M = cv2.moments(c)
         if M['m00'] <= 0:
+            self._drop('轮廓零面积')
             return None
         # 深度掩码轮廓质心 (兜底中心)
         cu = int(round(M['m10'] / M['m00']))
@@ -482,6 +499,8 @@ class YoloBoxDetector(Node):
                     cu, cv_ = ou, ov
         d = self._center_depth(depth, cu, cv_)   # 顶面中心深度(米)
         if d <= 0.0:
+            self._drop('中心深度无效(空洞)',
+                       '中心px=(%d,%d) patch=%d 台面%.3fm' % (cu, cv_, self.center_patch, table))
             return None
 
         p_cam = self._pixel_to_cam(cu, cv_, d)   # 相机系 3D 坐标, 不依赖 TF
@@ -636,8 +655,21 @@ class YoloBoxDetector(Node):
             ps.orientation.w = float(np.cos(yaw / 2.0))
             return ps
 
-        # 单目标 (契约 §1): 面积最大框, 供抓取选当前目标
-        target = max(cand, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]))
+        # 单目标 (契约 §1): 先按 base_link z 排掉已放进托盘的盒子, 再取面积最大框.
+        # 必须先过滤: 托盘离相机比地面近, 已放盒成像恒定更大, 不过滤则单目标永远选中它
+        # (见 pick_z_max 声明处). 过滤后为空则整帧不发 —— 让 grasp_node 如实报"无
+        # object_pose" 中止, 比发一个错目标去粗定位安全.
+        pickable = [r for r in cand if r[6][3][2] <= self.pick_z_max]
+        if not pickable:
+            self._info_throttle(
+                '无可抓目标: %d 个候选全高于 pick_z_max %.3fm (疑为已放进托盘的盒子)'
+                % (len(cand), self.pick_z_max))
+            return
+        target = max(pickable, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]))
+        if len(pickable) < len(cand):
+            self._info_throttle(
+                '单目标选择: %d 候选中滤掉 %d 个 z>%.3fm 的(托盘已放盒)'
+                % (len(cand), len(cand) - len(pickable), self.pick_z_max))
         if self.diag_yaw:
             self.get_logger().warn(
                 '[诊断选中] 候选=%d 选中 %s 中心像素(%d,%d) 轴对齐面积=%.0f yaw=%s'
@@ -782,6 +814,21 @@ class YoloBoxDetector(Node):
         if now - getattr(self, '_last_info_ns', 0) >= period_ns:
             self._last_info_ns = now
             self.get_logger().info(text)
+
+    # 丢帧原因诊断: _roi_to_pose 的五个 return None 共用一条 "未检测到可定位盒子",
+    # 日志分不出是哪条分支. 按 tag 各自节流(否则先触发的那条会把别的压掉), 并累计次数
+    # —— 要看的是"哪条分支占了大头", 单次消息不够判断.
+    def _drop(self, tag, detail=''):
+        counts = getattr(self, '_drop_counts', None)
+        if counts is None:
+            counts = self._drop_counts = {}
+            self._drop_ns = {}
+        cnt = counts.get(tag, 0) + 1
+        counts[tag] = cnt
+        now = self.get_clock().now().nanoseconds
+        if now - self._drop_ns.get(tag, 0) >= 2_000_000_000:
+            self._drop_ns[tag] = now
+            self.get_logger().warn('[丢帧] %s (累计%d) %s' % (tag, cnt, detail))
 
 
 def main(args=None):
