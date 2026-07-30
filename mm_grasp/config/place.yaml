@@ -54,7 +54,13 @@ grasp_node:
     # 2026-07-29 二次调整: 0.30 在场景干净时跑通, 但同日发现 0.18/0.25 失败的根因是
     # reset_stack 没清掉的残留 placed_t1_l1 碰撞体, 不是高度不够. 修了 reset_stack 兜底
     # 直发 REMOVE 后, 降回 0.20 折中: 起点盒底 ~0.178, 围栏顶 ~0.120, 间隙 5.8cm 直下无遮挡.
-    transit_z: 0.20
+    # 2026-07-30: 0.20 -> 0.26. 两盘都摞到第 2 层后放第四个盒, plan 到 transit 被 abort:
+    #   "Invalid states at index [39] out of 65", 接触对 placed_t1_l2 <-> carried_box.
+    # 即携盒从右前飞到左后托盘时, 路径贴着**别盘**那摞 2 层盒的顶过. 0.20 下携盒底 ~0.188、
+    # 左盘 2 层顶 ~0.137, 名义间隙 5cm, 但 RRTConnect 采样能钻进去 —— 且碰撞是在 pipeline
+    # 之后的 postprocessing 加密插值时才暴露, setNumPlanningAttempts(10) 不会重试, 直接 abort.
+    # 抬到 0.26 让采样空间整体上移. 前三轮没暴露是因为两盘各只有 1 层, 通道够宽.
+    transit_z: 0.26
 
     # ---- ① 取 object_pose 前的管线排空 + 一致性门 (2026-07-29 加) ----
     # 症状: ① 粗定位开偏 12~16cm, ② 精修被迫从 118~146mm 往回爬, 前几步全被
@@ -87,6 +93,17 @@ grasp_node:
     # 2026-07-28 真机实跑后从 3.0 降到 1.0: 破负压只需几百 ms, 3s 纯等待拖慢节拍(用户实测反馈).
     # 注: releasePulse 读的是启动缓存的成员变量, 改这里须重启 grasp_node 才生效(ros2 param set 不热更).
     release_duration: 1.0
+
+    # ③ 下插行程少走这么多米(负值=多插). 行程 = TCP z - 盒顶 z - 这个值, 盒顶 z 由
+    # ground_z + 该类别 fallback_thickness 算出. 单独一个参数而不是改 thickness:
+    # thickness 还要算托盘释放高度(tray_z + 累计 + 本层), 动它会把堆叠高度一起算错.
+    # 2026-07-28: +0.002 -> -0.001 (多插 3mm), 按 +2mm 下到位时吸盘离盒顶仍有可见空隙.
+    # 2026-07-30: -0.001 -> -0.006 (再多插 5mm). 类别 2 盒(厚 24mm)实跑 147.5mm 行程
+    # 下到位后没吸住. ground_z 与厚度这组标定值当初靠"吸住瞬间 TCP z"同一组数反推,
+    # 彼此自洽但都不独立, 合起来把盒顶估高了几 mm; 用负值压过去, 多压的量靠吸盘海绵吃掉.
+    # 注: 启动时读进成员变量, ros2 param set 不热更(节点无 on_set_parameters_callback),
+    # 改这里必须重启 grasp_node.
+    insert_shortfall: -0.006
 
     # ---- 四步渐进安全测试开关 (Task #1) ----
     # 刻意不在此声明 dry_run / place_velocity_scaling: 具名节点条目("grasp_node")

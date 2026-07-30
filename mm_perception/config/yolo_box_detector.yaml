@@ -78,6 +78,18 @@ yolo_box_detector:
     # 若改成从托盘取盒(卸货 /grasp/unload), 需把此值调高到能覆盖托盘高度, 否则选不到目标.
     pick_z_max: 0.06
 
+    # ---- p_cam 多候选跟踪 (pick_z_max 把所有候选滤掉时, 靠这个决定 object_point_cam 追谁) ----
+    # object_point_cam 是 ② 精修的相机系闭环输入, 不受 pick_z_max 门控 (那是过 FK 的判据,
+    # 用它掐 p_cam 会把免疫 FK 误差的通道反绑到 FK 上). 但多候选时得选一个:
+    # 不能按面积最大选(托盘已放盒离相机近、成像恒定更大, 见上), 改按"与上一帧发出的 p_cam
+    # 最近"选 —— ② 精修期间目标在相机系连续小步移动(帧间 <5mm), 而两盒相距十几 cm, 无歧义.
+    #
+    # 2026-07-30 加. 起因: 臂下插过程中彩色内参坏导致重建 z 随相机距离单调爬升(1:1),
+    # 越过 pick_z_max 后四个话题一起哑; 此前的兜底只在"单候选"时发 p_cam, 而托盘上已有盒
+    # 进视野时候选=2, 兜底失效 -> ② 试探后取不到 p_cam -> "② 精修失败"(第三个盒实测复现).
+    cam_track_timeout: 2.0          # 上一帧 p_cam 超过这么多秒未发则视为无锚点, 多候选时不发
+    cam_track_max_jump: 0.10        # 最近候选比上一帧跳超过这么多米视为跟丢, 不发(宁缺勿错)
+
     # ---- B 路线: 当前目标 类别 + 厚度 (grasp_node 订阅, 按类别分托盘 + 视觉厚度堆叠) ----
     # 与单目标 pose 同步发. 类别取 class_names 数字名解析为 int; 厚度=台面深度-顶面深度(米).
     # 话题名须与 mm_grasp/config/place.yaml 的 class_topic/thickness_topic 一致.
@@ -94,4 +106,6 @@ yolo_box_detector:
     axis_angle_topic: /perception/object_axis_angle  # std_msgs/Float32: θ_img(度)
 
     # ---- 可视化 ----
-    show_window: true               # 无显示器/远程置 false
+    # 真机在 Nano 上跑(SSH 无 DISPLAY): true 会让 cv2.imshow 撞 xcb 插件初始化失败,
+    # 整个节点 abort (exit -6). 故默认 false. 本机带显示器调试时临时传 -p show_window:=true.
+    show_window: false              # 无显示器/远程置 false

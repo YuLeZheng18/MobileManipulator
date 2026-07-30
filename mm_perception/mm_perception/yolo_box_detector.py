@@ -142,6 +142,11 @@ class YoloBoxDetector(Node):
         # 盒心在相机系(Link_30)的 3D 坐标. 不过手眼标定/TF, 只依赖深度与相机内参,
         # 供 grasp_node 做相机系闭环对准 (base_link 坐标带 2~3cm 标定偏差且随构型变).
         self.declare_parameter('cam_point_topic', '/perception/object_point_cam')
+        # 多候选时 p_cam 追谁: 与上一帧发出的 p_cam 最近的那个. 上一帧超过 cam_track_timeout
+        # 秒未发则视为无锚点; 最近候选比上一帧跳超过 cam_track_max_jump 米视为跟丢, 不猜.
+        # 帧间隔约 0.09s, ② 精修期间盒在相机系每帧移动 < 5mm, 故 0.10m 门限很宽松.
+        self.declare_parameter('cam_track_timeout', 2.0)
+        self.declare_parameter('cam_track_max_jump', 0.10)
 
         # 逐帧打印 OBB 原始参数与选中目标, 用于定位 yaw 跳变来源 (只打印不改行为).
         self.declare_parameter('diag_yaw', False)
@@ -176,6 +181,10 @@ class YoloBoxDetector(Node):
         self.show_window = bool(gp('show_window').value)
         self.diag_yaw = bool(gp('diag_yaw').value)
         self.save_frame_path = str(gp('save_frame_path').value)
+        self.cam_track_timeout = float(gp('cam_track_timeout').value)
+        self.cam_track_max_jump = float(gp('cam_track_max_jump').value)
+        self._last_cam_pt = None        # 上一帧发出的 p_cam (numpy 3,), 多候选跟踪锚点
+        self._last_cam_ns = 0
 
         # 预计算 光学系 -> Link_30 机械系 的固定旋转 (与 box_detector 同一约定)
         # 再右乘绕光学Z轴的安装转角修正: p_mech = R_mech_optical @ Rz(roll) @ p_opt.
@@ -657,13 +666,17 @@ class YoloBoxDetector(Node):
 
         # 单目标 (契约 §1): 先按 base_link z 排掉已放进托盘的盒子, 再取面积最大框.
         # 必须先过滤: 托盘离相机比地面近, 已放盒成像恒定更大, 不过滤则单目标永远选中它
-        # (见 pick_z_max 声明处). 过滤后为空则整帧不发 —— 让 grasp_node 如实报"无
-        # object_pose" 中止, 比发一个错目标去粗定位安全.
+        # (见 pick_z_max 声明处). 过滤后为空则不发 object_pose —— 让 grasp_node 如实报
+        # "无 object_pose" 中止, 比发一个错目标去粗定位安全 (但 p_cam 例外, 见下).
         pickable = [r for r in cand if r[6][3][2] <= self.pick_z_max]
         if not pickable:
             self._info_throttle(
                 '无可抓目标: %d 个候选全高于 pick_z_max %.3fm (疑为已放进托盘的盒子)'
                 % (len(cand), self.pick_z_max))
+            # p_cam 仍要发: 它是 ② 精修的相机系闭环输入, 与"这盒能不能抓"无关, 而
+            # pick_z_max 判的是过 FK 的 p_base —— 让它门控 p_cam 会把免疫 FK 误差的
+            # 通道反过来绑到 FK 上.
+            self._publish_cam_point_tracked(cand, stamp)
             return
         target = max(pickable, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]))
         if len(pickable) < len(cand):
@@ -708,16 +721,7 @@ class YoloBoxDetector(Node):
                 ang += 180.0
             self._axis_angle_pub.publish(Float32(data=ang))
 
-        # 相机系盒心 (元组第 6 位 p_cam), frame_id 用相机机械系. grasp_node 精修闭环追它.
-        if self._cam_point_pub is not None:
-            pc = target[6][5]
-            cp = PointStamped()
-            cp.header.stamp = stamp
-            cp.header.frame_id = self.camera_frame
-            cp.point.x = float(pc[0])
-            cp.point.y = float(pc[1])
-            cp.point.z = float(pc[2])
-            self._cam_point_pub.publish(cp)
+        self._publish_cam_point(target, stamp)
 
         # 多目标数组: 所有有 base_link 坐标的盒子 (面积降序)
         if self._poses_pub is not None:
@@ -727,6 +731,55 @@ class YoloBoxDetector(Node):
             arr.poses = [to_pose(r) for r in sorted(
                 cand, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]), reverse=True)]
             self._poses_pub.publish(arr)
+
+    def _publish_cam_point_tracked(self, cand, stamp):
+        """pick_z_max 全滤掉时选一个候选发 p_cam: 与上一帧发出的 p_cam 最近的那个.
+
+        为什么不能按"面积最大"选: 托盘装在车身上, 离相机比地面盒近, 已放盒成像恒定更大
+        (见 pick_z_max 声明处), 面积最大会稳定选中托盘上那个已放好的盒.
+        为什么最近邻是无歧义的: ② 精修期间目标在相机系连续小步移动 (帧间 <5mm), 而两个
+        盒子在相机系相距十几 cm, 最近邻不会跳错. 无锚点(上一帧太旧)或最近候选跳得过远
+        (跟丢)时**不发** —— 发错目标会把 ② 引到别的盒子上, 比断流更危险.
+        """
+        if self._cam_point_pub is None:
+            return
+        if len(cand) == 1:
+            self._publish_cam_point(cand[0], stamp)
+            return
+        now = self.get_clock().now().nanoseconds
+        if (self._last_cam_pt is None
+                or now - self._last_cam_ns > self.cam_track_timeout * 1e9):
+            self._info_throttle(
+                'p_cam 多候选(%d)但无跟踪锚点(上一帧过旧), 本帧不发 —— 宁缺勿错'
+                % len(cand))
+            return
+        best = min(cand, key=lambda r: float(
+            np.linalg.norm(np.asarray(r[6][5], float) - self._last_cam_pt)))
+        d = float(np.linalg.norm(np.asarray(best[6][5], float) - self._last_cam_pt))
+        if d > self.cam_track_max_jump:
+            self._info_throttle(
+                'p_cam 跟丢: %d 候选里最近的也跳了 %.0fmm (>%.0fmm), 本帧不发'
+                % (len(cand), d * 1000, self.cam_track_max_jump * 1000))
+            return
+        self._publish_cam_point(best, stamp)
+
+    def _publish_cam_point(self, r, stamp):
+        """发相机系盒心 (元组第 6 位 p_cam), frame_id 用相机机械系. grasp_node 精修闭环追它.
+
+        同时记下这一帧的 p_cam 作跟踪锚点, 供下一帧多候选时最近邻选目标.
+        """
+        if self._cam_point_pub is None:
+            return
+        pc = r[6][5]
+        self._last_cam_pt = np.asarray(pc, float).copy()
+        self._last_cam_ns = self.get_clock().now().nanoseconds
+        cp = PointStamped()
+        cp.header.stamp = stamp
+        cp.header.frame_id = self.camera_frame
+        cp.point.x = float(pc[0])
+        cp.point.y = float(pc[1])
+        cp.point.z = float(pc[2])
+        self._cam_point_pub.publish(cp)
 
     def _draw_and_show(self, bgr, results):
         for i, (x1, y1, x2, y2, name, cf, pose, corners, _axis) in enumerate(results):

@@ -105,7 +105,10 @@ public:
     // 吸盘离盒顶仍有可见空隙. 说明 ground_z 与厚度这组标定值合起来把盒顶估高了几 mm ——
     // 两者当初是靠"吸住瞬间 TCP z"同一组数反推的, 彼此自洽但都不独立. 这里用负值压过去,
     // 靠吸盘海绵/波纹吃掉多压的量.
-    insert_shortfall_ = node_->declare_parameter<double>("insert_shortfall", -0.001);
+    // 2026-07-30 值移到 place.yaml (类别 2 盒实跑没吸住, 要再多插 5mm). 故这里必须
+    // getOrDeclare: yaml 给了值时 automatically_declare_parameters_from_overrides 已声明,
+    // 裸 declare_parameter 会撞 AlreadyDeclared 崩 (release_duration 踩过, exit -6).
+    insert_shortfall_ = getOrDeclare<double>("insert_shortfall", -0.001);
     // 吸取抽真空时长(秒), 到时转 PUMP_STOP 保压. 1s 足够: 实测 3s 里负压早已建立,
     // 吸住后继续抽没有收益, 只是让泵空转发热.
     suck_duration_ = node_->declare_parameter<double>("suck_duration", 1.0);
@@ -296,10 +299,12 @@ public:
     refine_max_steps_ = node_->declare_parameter<int>("refine_max_steps", 6);
     // 步长折扣: 解出来的位移乘这个再走. 留 20% 余量吸收映射误差, 宁可多走一步也不过冲.
     refine_step_gain_ = node_->declare_parameter<double>("refine_step_gain", 0.8);
-    // 单步位移上限(米). 2026-07-29 从 0.04 抬到 0.08: 盒子摆远时 ② 起始误差达 152mm
-    // (手眼旋转误差落到位置上是 δR×p_cam, 与盒离相机距离成正比), 前 3 步全顶在 40mm
-    // 天花板上白耗, 5 步才收敛, 逼近 refine_max_steps 的 6 步余量. 抬到 80mm 后同样开局
-    // 2~3 步收完. 上限本身只是防"雅可比量歪时一步冲出去", 80mm 仍在这个量级内.
+    // 单步位移上限(米). 2026-07-29 从 0.04 抬到 0.08: ② 起始误差偶发到 118~152mm 时,
+    // 前 3 步全顶在 40mm 天花板上白耗, 5 步才收敛, 逼近 refine_max_steps 的 6 步余量.
+    // 抬到 80mm 后同样开局 2~3 步收完. 上限本身只是防"雅可比量歪时一步冲出去".
+    // ⚠️ 别再照"误差与盒离相机距离成正比"那条解释调参 —— 已被数据否掉: 误差不随距离平滑
+    // 放大而是跳变(前 6cm 稳在 30~39mm), 且同一位置(相距 6mm)出现过 32.8 与 127.4mm 两种
+    // 结果. 大误差的真身疑为感知订阅被饿死后拿到运动中的积压旧帧, 见订阅回调组处注释.
     refine_max_step_ = node_->declare_parameter<double>("refine_max_step", 0.08);
     // 步进段规划降速. 0.15 是最初怕抖留的余量; 实测步进本身自带加减速, 不抖, 提到 0.4
     // 与全局同速, 精修那几步的起停停顿明显变短.
@@ -327,13 +332,37 @@ public:
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node_->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
+    // 感知订阅单独一个 Reentrant 回调组, 不能留在默认组.
+    // 默认组在 MultiThreadedExecutor 下是**互斥**的, 而 move_group 的 action 客户端回调
+    // (Execute request / current_state_monitor) 也落在默认组: ① 执行那几秒它占住默认组,
+    // 同组的感知订阅回调只能排队. 2026-07-30 实测: ① 执行完到 ② 取样的 3 秒里 yolo 每秒
+    // 稳定发 11~12 帧 (日志逐秒计数), grasp_node 一帧未收, avgCamPoint 等满 cam_wait_timeout_
+    // 报 "② 无新鲜 p_cam". 时钟无偏差(实测 age 0.14~0.19s), 检测未断流, 手调
+    // calib_cam_target 立刻能读到新鲜值.
+    // ⚠️ 2026-07-30 修正: 当初据上面三条断言"只有执行期间被饿死能解释", 那个推断是错的 ——
+    // 同日定位到"② 无新鲜 p_cam"的真身在感知侧: yolo 的 pick_z_max 把候选全滤掉时会连
+    // object_point_cam 一起哑, 而托盘上有已放盒时候选=2, 旧的单候选兜底正好失效
+    // (已由 yolo 侧改最近邻跟踪修掉). 分组本身仍然要留: 默认组互斥是事实, 感知回调与
+    // move_group action 回调同组确实会排队, 只是它不是那次故障的成因.
+    // 另一种可能的表现(仍是**未证实**的猜测, 别当结论): 挤进来的是积压的旧帧(① 运动中拍的),
+    // ② 拿它当起点, 起始误差虚高. 这条能自洽解释 2026-07-29 那批 118~152mm 异常, 以及
+    // "Δp_cam 模长 96mm 对应 Δp_base 模长 11mm"的矛盾(base = R·p_cam + t, R 保长度, 同一 R
+    // 压不出这个比例; 若两帧来自不同臂构型则 R 不同, 矛盾消解). 但 2026-07-30 改完分组 +
+    // 感知侧最近邻跟踪后连跑五轮, ② 起始误差稳定在 36~41mm, 那批异常再没复现过, 所以到底
+    // 是分组治好的还是感知侧治好的, 无法区分. 别据此再推新结论.
+    // 用 Reentrant 而非 MutuallyExclusive: 五个感知回调彼此无共享状态(各自锁各自的 mutex),
+    // 允许并发进入, 一个都不会被另一个挡住.
+    perc_cb_group_ = node_->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    rclcpp::SubscriptionOptions perc_opt;
+    perc_opt.callback_group = perc_cb_group_;
+
     object_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
       object_topic_, rclcpp::SensorDataQoS(),
       [this](geometry_msgs::msg::PoseStamped::SharedPtr msg) {
         std::lock_guard<std::mutex> lk(obj_mtx_);
         last_object_ = *msg;
         have_object_ = true;
-      });
+      }, perc_opt);
 
     // B 路线: 队友视觉侧额外发的"当前目标类别 + 厚度(米)". 回调只缓存, 放置时取最新.
     // 收不到则 execute 用 default_category_ + fallback_thickness_ 兜底, 不阻塞抓取.
@@ -343,14 +372,14 @@ public:
         std::lock_guard<std::mutex> lk(cls_mtx_);
         last_category_ = msg->data;
         have_category_ = true;
-      });
+      }, perc_opt);
     cam_point_sub_ = node_->create_subscription<geometry_msgs::msg::PointStamped>(
       cam_point_topic_, rclcpp::SensorDataQoS(),
       [this](geometry_msgs::msg::PointStamped::SharedPtr msg) {
         std::lock_guard<std::mutex> lk(cam_mtx_);
         last_cam_point_ = *msg;
         have_cam_point_ = true;
-      });
+      }, perc_opt);
     // θ_img: OBB 长轴在彩色图像里的角度(度). 只在 ① 之前(腕仍在 coarse_yaw_、相机没被
     // 吸盘遮挡)采样一次; ② 之后臂已贴近, 吸盘悬在盒上方挡住视野, 此时的检测不可信.
     axis_angle_sub_ = node_->create_subscription<std_msgs::msg::Float32>(
@@ -360,14 +389,14 @@ public:
         last_axis_angle_ = msg->data;
         last_axis_stamp_ = node_->now();
         have_axis_angle_ = true;
-      });
+      }, perc_opt);
     thickness_sub_ = node_->create_subscription<std_msgs::msg::Float32>(
       thickness_topic_, rclcpp::SensorDataQoS(),
       [this](std_msgs::msg::Float32::SharedPtr msg) {
         std::lock_guard<std::mutex> lk(cls_mtx_);
         last_thickness_ = msg->data;
         have_thickness_ = true;
-      });
+      }, perc_opt);
 
     pump_pub_ = node_->create_publisher<std_msgs::msg::Int8>(pump_topic_, 10);
     // /collision_object 直发兜底: psi_->removeCollisionObjects 是异步且偶发不生效
@@ -2136,7 +2165,7 @@ private:
     seed_srv_;
   rclcpp::Client<moveit_msgs::srv::ApplyPlanningScene>::SharedPtr apply_scene_cli_;
   rclcpp::Client<moveit_msgs::srv::GetPlanningScene>::SharedPtr get_scene_cli_;
-  rclcpp::CallbackGroup::SharedPtr srv_cb_group_, scene_cb_group_;
+  rclcpp::CallbackGroup::SharedPtr srv_cb_group_, scene_cb_group_, perc_cb_group_;
 
   std::mutex obj_mtx_;
   geometry_msgs::msg::PoseStamped last_object_;
