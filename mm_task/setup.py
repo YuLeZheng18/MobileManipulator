@@ -26,7 +26,6 @@ setup(
     entry_points={
         'console_scripts': [
             'mission_manager = mm_task.mission_manager:main',
-            'grasp_node = mm_task.grasp_node:main',
         ],
     },
 )

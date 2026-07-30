@@ -16,9 +16,12 @@ def generate_launch_description():
     default_mission = os.path.join(
         get_package_share_directory('mm_task'), 'config', 'mission.yaml')
 
+    # 默认仿真值 mission.yaml; 真机传 config/mission_real.yaml.
+    # 上层 (real_bringup/dev_bringup) 可能传空串表示"用默认" —— mission_manager 见空串
+    # 会自己回退到包内 mission.yaml, 故这里不必再判.
     mission_file_arg = DeclareLaunchArgument(
         'mission_file', default_value=default_mission,
-        description='任务列表 YAML 路径')
+        description='任务列表 YAML 路径 (仿真 mission.yaml / 真机 mission_real.yaml)')
     use_sim_time_arg = DeclareLaunchArgument(
         'use_sim_time', default_value='true',
         description='仿真用 true (跟 Gazebo 时钟)')

@@ -11,13 +11,21 @@
   t=10  Nav2 (无 RViz) + cmd_vel 平滑 + lane_navigator
   t=14  MoveIt move_group
   t=18  moveit_servo + grasp_node
-  t=20  mm_perception 真感知 (队友节点, 默认关; 调试就绪后 use_perception:=true)
+  t=20  mm_perception 真感知 (yolo_box_detector + aruco_localizer; 默认关)
   t=25  mm_task 状态机 (默认关; run_mission:=true 自动跑 S0->S5)
+
+抓取相关的开关连带关系 (三者要一起开, 少一个抓取跑不了):
+  use_cameras:=true      -> 车体两路 USB + 手眼 D435i (align_depth 必开, 在 cameras.launch.py 里)
+  use_perception:=true   -> yolo_box_detector 吃 D435i 出 /perception/object_pose 等
+  run_mission:=true      -> mm_task 串起 S0-S5 (真机记得配 mission_file:=.../mission_real.yaml)
+整机自主一条命令:
+  ros2 launch mm_bringup real_bringup.launch.py use_cameras:=true use_perception:=true \
+      run_mission:=true mission_file:=<mm_task share>/config/mission_real.yaml
 
 ⚠️ 运行前置 (目标机 Nano 上现装/现 source, 不进本 colcon ws):
   - micro_ros_agent: 需先 `source ~/microros_ws/install/setup.bash` 再起本 launch,
     否则找不到 micro_ros_agent 可执行 (代理是独立 ws, 见架构 §5.2 记忆)。
-  - rplidar_ros / 深度相机驱动 / robot_localization: apt 或源码装在 Nano 上。
+  - rplidar_ros / realsense2_camera / usb_cam / robot_localization: apt 装在 Nano 上。
   - CAN: 机械臂 can_bridge 需 CAN 接口已 up (ip link set can0 up ...)。
 """
 import os
@@ -49,6 +57,7 @@ def generate_launch_description():
     use_perception = LaunchConfiguration('use_perception')
     agent_serial_dev = LaunchConfiguration('agent_serial_dev')
     lidar_serial_port = LaunchConfiguration('lidar_serial_port')
+    mission_file = LaunchConfiguration('mission_file')
     map_yaml = LaunchConfiguration('map')
     nav2_params = LaunchConfiguration('params_file')
 
@@ -63,9 +72,14 @@ def generate_launch_description():
         DeclareLaunchArgument('use_lidar', default_value='true',
                               description='起 rplidar_ros (思岚 A3 -> /scan, frame Link_12)'),
         DeclareLaunchArgument('use_cameras', default_value='false',
-                              description='起深度相机/车体相机驱动 (TODO: 驱动型号确定后接线)'),
+                              description='起相机驱动: 车体两路 USB (cam_a/cam_b) + 手眼 D435i'),
         DeclareLaunchArgument('use_perception', default_value='false',
-                              description='起 mm_perception 真感知 (队友节点调试中, 就绪后开)'),
+                              description='起 mm_perception 真感知 (yolo_box_detector + aruco); '
+                                          '需连带 use_cameras:=true'),
+        DeclareLaunchArgument(
+            'mission_file', default_value='',
+            description='mm_task 任务列表 (留空用包内 mission.yaml=仿真值; '
+                        '真机传 config/mission_real.yaml)'),
         DeclareLaunchArgument('agent_serial_dev', default_value='/dev/ttyACM0',
                               description='micro-ROS 代理串口 (ESP32-S3 native USB)'),
         DeclareLaunchArgument('lidar_serial_port', default_value='/dev/rplidar',
@@ -182,15 +196,18 @@ def generate_launch_description():
     grasp = _include('mm_grasp', 'grasp.launch.py', launch_arguments=real_arg)
     stage5 = TimerAction(period=18.0, actions=[grasp])
 
-    # ===== 阶段6 (t=20): mm_perception 真感知 (队友节点, 默认关) =====
-    # 仿真用 mock (mock_object_detector/mock_aruco); 真机换队友真节点, 话题接口一致上层无感。
-    # 队友节点仍在调试, 故 IfCondition(use_perception) 默认 false; 就绪后 use_perception:=true。
-    # 真节点 (interface_contract §1/§2): object_detector -> /perception/object_pose;
-    #   aruco_localizer -> /tf 广播 aruco_<id> (parent base_link)。均吃深度/车体相机, 故连带 use_cameras。
-    object_detector = Node(
-        package='mm_perception', executable='object_detector', name='object_detector',
-        output='screen', parameters=[{'use_sim_time': use_sim_time}],
-        condition=IfCondition(use_perception))
+    # ===== 阶段6 (t=20): mm_perception 真感知 (默认关) =====
+    # 仿真用 mock (mock_object_detector/mock_aruco); 真机换真节点, 话题接口一致上层无感。
+    # 盒子识别 = yolo_box_detector (自训练 YOLO, NCNN 后端): 发 /perception/object_pose
+    #   + /object_poses(可抓盒数组) + /object_point_cam(相机系, 精修闭环用) + /object_axis_angle。
+    #   必须走它自己的 launch 而不是裸 Node: 那个 launch 要读 yaml 再把 NCNN 模型目录拼成
+    #   share 下的绝对路径 (yaml 里存的是相对名), 裸起会因模型路径找不到而挂。
+    #   with_rsp:=false —— 整车 TF 由阶段1 的臂 RSP 发, 别再起第二个 rsp 抢 /robot_description。
+    # ArUco: aruco_localizer -> /tf 广播 aruco_<id> (parent base_link), 吃 cam_a 转正流。
+    # 两者都吃相机, 故需连带 use_cameras:=true。
+    yolo = _include('mm_perception', 'yolo_box_detector.launch.py',
+                    launch_arguments={'with_rsp': 'false'}.items(),
+                    condition=IfCondition(use_perception))
     aruco_localizer = Node(
         package='mm_perception', executable='aruco_localizer', name='aruco_localizer',
         output='screen',
@@ -200,11 +217,15 @@ def generate_launch_description():
             {'use_sim_time': use_sim_time},
         ],
         condition=IfCondition(use_perception))
-    stage6 = TimerAction(period=20.0, actions=[object_detector, aruco_localizer])
+    stage6 = TimerAction(period=20.0, actions=[yolo, aruco_localizer])
 
     # ===== 阶段7 (t=25): mm_task 状态机 (默认关, run_mission:=true 自动跑) =====
+    # mission_file 留空时传空串: mission_manager 见空串会自己回退到包内 mission.yaml,
+    # 故这里无需在 launch 侧再判一次 (真机传 mission_real.yaml)。
     mission = _include('mm_task', 'mission.launch.py',
-                       launch_arguments=real_arg, condition=IfCondition(run_mission))
+                       launch_arguments={'use_sim_time': use_sim_time,
+                                         'mission_file': mission_file}.items(),
+                       condition=IfCondition(run_mission))
     stage7 = TimerAction(period=25.0, actions=[mission])
 
     return LaunchDescription(

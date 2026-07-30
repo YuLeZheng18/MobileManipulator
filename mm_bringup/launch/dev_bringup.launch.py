@@ -41,11 +41,17 @@ from launch_ros.actions import Node
 def generate_launch_description():
     run_mission = LaunchConfiguration('run_mission')
     view_cameras = LaunchConfiguration('view_cameras')
+    mission_file = LaunchConfiguration('mission_file')
 
     args = [
         DeclareLaunchArgument('run_mission', default_value='false',
                               description='true=起 mm_task 自动跑 S0->S5; '
                                           'false=只起 RViz, 手动派命令调试 (推荐)'),
+        DeclareLaunchArgument(
+            'mission_file',
+            default_value=os.path.join(get_package_share_directory('mm_task'),
+                                       'config', 'mission_real.yaml'),
+            description='任务列表 (本机调度的是真机, 故默认 mission_real.yaml)'),
         DeclareLaunchArgument('view_cameras', default_value='false',
                               description='本机监视三路相机 (需 Nano use_cameras:=true + '
                                           'D435i 就绪); 每路 republish 解码 compressed 再 rqt'),
@@ -86,7 +92,8 @@ def generate_launch_description():
         PythonLaunchDescriptionSource(
             os.path.join(get_package_share_directory('mm_task'),
                          'launch', 'mission.launch.py')),
-        launch_arguments={'use_sim_time': 'false'}.items(),
+        launch_arguments={'use_sim_time': 'false',
+                          'mission_file': mission_file}.items(),
         condition=IfCondition(run_mission),
     )
 

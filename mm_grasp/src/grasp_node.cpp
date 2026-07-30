@@ -32,6 +32,7 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <geometry_msgs/msg/point_stamped.hpp>
+#include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <std_msgs/msg/int8.hpp>
 #include <std_msgs/msg/int32.hpp>
@@ -85,6 +86,9 @@ public:
     ee_link_ = node_->declare_parameter<std::string>("ee_link", "suction_tip");
     base_frame_ = node_->declare_parameter<std::string>("base_frame", "base_link");
     tray_frame_ = node_->declare_parameter<std::string>("tray_frame", "Link_11");
+    // 吸盘**本体**链接 (带网格的那个). ee_link_=suction_tip 是它下面的空坐标系, 没有几何,
+    // 所以 attachBox 的 touch_links 必须把这个也放进去, 否则盒子与吸盘本体照样判碰撞.
+    suction_body_link_ = node_->declare_parameter<std::string>("suction_body_link", "suction_link");
     object_topic_ = node_->declare_parameter<std::string>("object_topic", "/perception/object_pose");
     pump_topic_ = node_->declare_parameter<std::string>("pump_topic", "/pump_cmd");
 
@@ -262,9 +266,20 @@ public:
     // 本段累计转动上限(度): 防坏观测把腕净转到乱姿态.
     yaw_align_max_turn_deg_ = getOrDeclare<double>("yaw_align_max_turn_deg", 120.0);
 
+    // 可抓候选数组 (PoseArray): 感知侧发的**过了 pick_z_max 的**盒子, 长度就是"还剩几个
+    // 盒要抓". /grasp/look 把它报给调用方, 状态机据此决定同一货架循环抓几次, 不必在
+    // mission.yaml 里按盒数写死几条 task.
+    // 只用长度不用坐标: 坐标缓存下来跳过第二次识别会拆掉 ② 精修的目标锁 —— 那个锁必须在
+    // 无遮挡的 look 位建立 (2026-07-30 目标中途被换掉的成因), 臂悬在盒上方时框会被吸盘
+    // 遮掉一块, 重新锁定按面积最大就可能锁到旁边那个盒.
+    poses_topic_ = getOrDeclare<std::string>("poses_topic", "/perception/object_poses");
     class_topic_ = getOrDeclare<std::string>("class_topic", "/perception/object_class");
     thickness_topic_ = getOrDeclare<std::string>("thickness_topic", "/perception/object_thickness");
     default_category_ = static_cast<int>(getOrDeclare<int64_t>("default_category", 1));
+    // /grasp/look 摆到位后等一个**新鲜**候选数最多多久 (秒). 检测 ~11Hz, 但摆臂刚停那刻
+    // 管线里积压的还是运动中拍的帧, 得等它过去 (同 axis_flush_sec / object_flush_sec 的
+    // 道理). 1.5s 够: 实测 look 停稳后 0.3s 内就有新帧.
+    look_count_wait_sec_ = getOrDeclare<double>("look_count_wait_sec", 1.5);
 
     // 运行时堆叠状态: 每托盘已放盒数 + 累计厚度. reset 服务清零(新一轮).
     tray_layers_.assign(num_trays_, 0);
@@ -298,10 +313,46 @@ public:
     // 放偏. 厚度口径沿用 fallback_thickness 那套实跑反推的等效值 (非卡尺物理盒高), 与取盒
     // 共用同一体系, 取放两头一起对.
     unload_z_ = getOrDeclare<double>("unload_z", -0.044);
-    // 取盒时吸盘要压到已落盒顶面: 释放位姿就是当初放它时吸盘所在处, 理论上直接回去即可.
-    // 留一个可调的下压量兜住"放下去后盒被压实/略有沉降"—— 与抓取的 insert_shortfall 同理,
-    // 负值=多压一点. 默认 0 (先按对称几何走, 吸不上再调).
-    unload_pick_shortfall_ = getOrDeclare<double>("unload_pick_shortfall", 0.0);
+    // 取盒时吸盘要压到已落盒顶面. 释放位姿并不等于盒子落定后的高度: 放置时刻意在盒底与
+    // 托盘面间留了空隙 (tray_z 那次"抬 1cm 让盒子松松落进去而不是被压着塞"), 释放后盒子
+    // 还要自己往下掉这一截, 原路返回必然差这么多.
+    // 按 category_ids 顺序逐类别给 (负值=多压): 差多少是这个类别盒子自己的性质 (盒面软硬、
+    // 落进托盘沉多少), 与它摞在第几层无关.
+    // 2026-07-30 实跑标定: 先全取 -0.010, 0 号盘两盒观察到类别3(12mm) 压多了要抬 2mm ->
+    //   -0.008, 类别4(15mm) 还要再压 2mm -> -0.012. 类别 1/2 尚无观察, 暂留 -0.010.
+    unload_pick_shortfall_ = getOrDeclare<std::vector<double>>(
+      "unload_pick_shortfall", {-0.010, -0.010, -0.008, -0.012});
+
+    // 卸货点释放朝向 (吸盘朝下, yaw≈-90°), 2026-07-30 RViz 实标两点读得且两点一致.
+    // 必须与托盘释放朝向 (tray_q*, yaw≈-175°) 区分: 后者为对齐托盘围栏左旋过, 沿用它
+    // 盒子会歪 85° 落地 (实跑观察). 这个 yaw 也正是 look 位的 TCP 朝向.
+    // 卸货这一段的横移高度, 替代抓取放置用的 transit_z_(0.26). transit_z_ 那么高是为了
+    // "携盒越过别盘那摞 2 层盒的顶", 而卸货目的地在地面、路上没有那摞盒, 白飞 10cm.
+    // 下限由托盘围栏顶(实测 ~0.120)定: 盒 attach 时 touch_links 含 tray_frame_, 盒↔托盘
+    // 碰撞全程豁免, 低于围栏顶横穿会蹭侧壁而规划器不报、执行不停, 只能靠人看.
+    // 2026-07-30 实跑发现挑不出一个定值: 0.16 时 transit 规划成功(68点)但直下只覆盖 87%
+    // (< 0.9 阈值), 抬到 0.20 反而 transit 本身规划不出来, 0.26 两段都通. 卸货点这一带的
+    // IK 可达区间很窄且两段各有各的约束, 中间高度落在两个可行构型之间的空隙里.
+    // 故改成候选列表从低到高试, 取第一个两段都过的 —— 想走低的意图由排序表达, 可行性交给
+    // 规划器判, 不再靠人猜一个数.
+    // 2026-07-30 收尾: 候选只留 0.26 —— 试了 0.16/0.18/0.20 一路都不成. 0.16 那档最接近:
+    // 取盒段 100% 通过, 放置段试算 92% 也过, 但执行完 transit 后按实测起点重算掉到 87%
+    // (试算用的是 transit 终点理论关节值, 实际停位有误差, 92% 的裕度一吃就破阈值).
+    // 即低高度是"理论上刚过、实测就不过"的边缘可行, 不是稳定可用. 0.26 是唯一实跑验证过的
+    // 高度(四个盒两轮全成功), 空行程多几厘米换稳定, 值得. 候选机制留着, 以后要试新高度
+    // 往这个列表前面加一档即可, 不用改代码.
+    unload_transit_candidates_ = getOrDeclare<std::vector<double>>(
+      "unload_transit_candidates", {0.26});
+    // 装货(放托盘)的 transit 高度候选, 同样从低到高试. 默认只给 transit_z_ 那一档, 由
+    // place.yaml 显式配多档 —— 默认值保守是为了参数没配时行为与改动前完全一致.
+    transit_candidates_ = getOrDeclare<std::vector<double>>(
+      "transit_candidates", {transit_z_});
+
+    // 纯 yaw -90° (roll/pitch 实标 ≈0, 吸盘严格朝下): q = (0,0,sin-45°,cos-45°).
+    unload_quat_.x = getOrDeclare<double>("unload_qx", 0.0);
+    unload_quat_.y = getOrDeclare<double>("unload_qy", 0.0);
+    unload_quat_.z = getOrDeclare<double>("unload_qz", -0.707107);
+    unload_quat_.w = getOrDeclare<double>("unload_qw", 0.707107);
 
     // 被抓盒子尺寸 (world grasp_box: 0.09x0.055x0.025), 吸取后 attach 到吸盘作碰撞体,
     // 让放置规划知道吸盘下挂着盒 -> 绕开托盘边框, 不再侧向蹭入。
@@ -389,6 +440,17 @@ public:
         have_object_ = true;
       }, perc_opt);
 
+    // 可抓候选数: 只记数组长度与到达时刻, 供 /grasp/look 报给调用方.
+    // 空数组也要收 (感知侧刻意在"一个都没检测到"时也发): 抓完最后一个盒正是靠它归 0,
+    // 若只在非空时更新, 计数会永远停在 1, 状态机的同货架循环停不下来.
+    poses_sub_ = node_->create_subscription<geometry_msgs::msg::PoseArray>(
+      poses_topic_, rclcpp::SensorDataQoS(),
+      [this](geometry_msgs::msg::PoseArray::SharedPtr msg) {
+        std::lock_guard<std::mutex> lk(poses_mtx_);
+        last_pick_count_ = static_cast<int>(msg->poses.size());
+        last_poses_stamp_ = node_->now();
+      }, perc_opt);
+
     // B 路线: 队友视觉侧额外发的"当前目标类别 + 厚度(米)". 回调只缓存, 放置时取最新.
     // 收不到则 execute 用 default_category_ + fallback_thickness_ 兜底, 不阻塞抓取.
     class_sub_ = node_->create_subscription<std_msgs::msg::Int32>(
@@ -464,12 +526,25 @@ public:
       },
       rmw_qos_profile_services_default, srv_cb_group_);
     // 看货姿势 (mm_task 抓取前 S3 调): ready + J1+90°, 相机转向货物再做闭环抓取.
+    // message 带上"看见几个可抓盒": 状态机据此决定同一货架循环抓几次, 不必在 mission.yaml
+    // 里按盒数写死几条 task. 格式固定为 "arm at look pose, pickable=N", 调用方按前缀解析.
+    // 摆到 look 位后要等一会儿再读: moveToLook 收尾的 settle() 只等关节停稳, 而相机曝光到
+    // NCNN 出框有一整段延迟, 那一刻缓存里还是运动中拍的画面 (同 axis_flush_sec 的道理).
     look_srv_ = node_->create_service<std_srvs::srv::Trigger>(
       "/grasp/look",
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
              std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
         res->success = moveToLook();
-        res->message = res->success ? "arm at look pose" : "move to look failed";
+        if (!res->success) { res->message = "move to look failed"; return; }
+        int n = 0;
+        const bool fresh = waitPickCount(n, look_count_wait_sec_);
+        const int free_slots = trayFreeTotal();
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "arm at look pose, pickable=%d, tray_free=%d%s",
+                      n, free_slots, fresh ? "" : " (计数已过期, 感知侧可能没在发)");
+        RCLCPP_INFO(logger_, "看货姿势: 可抓候选 %d 个, 托盘余位 %d%s",
+                    n, free_slots, fresh ? "" : " [过期]");
+        res->message = buf;
       },
       rmw_qos_profile_services_default, srv_cb_group_);
     // 只抓不放 (真机分段验证用): 跑完①粗定位②精修③直插吸取就停, 盒仍吸着不放置.
@@ -762,10 +837,14 @@ private:
                 caller, category, tray, thickness * 1000, trayLayers(tray));
 
     // 满盘保护: 防撞已摞满的盒.
+    // 前缀 TRAY_FULL: 是给状态机的机器可读信号 —— 货架盒数不定(1~4), 同货架连抓的终止
+    // 条件有两个: 识别数归零, 或托盘装满. 后者不是故障而是"该去卸货了", 状态机不能把它
+    // 当异常中止整条任务. 判据是**本类别映射到的那个盘**满没满, 不是总余量: 4 个同类盒
+    // 只进一个盘(capacity 2), 装 2 个就得走, 另一个盘空着也没用.
     if (trayLayers(tray) >= static_cast<int>(tray_capacity_[tray])) {
-      err = std::to_string(tray) + "号托盘已满(" +
+      err = "TRAY_FULL: " + std::to_string(tray) + "号托盘已满(" +
             std::to_string(tray_capacity_[tray]) + ")";
-      RCLCPP_ERROR(logger_, "%s", err.c_str());
+      RCLCPP_WARN(logger_, "%s", err.c_str());
       return false;
     }
 
@@ -818,13 +897,26 @@ private:
     // 放置成功才计入堆叠: 层数+1, 累计厚度 += 本层厚度, 并留持久碰撞体.
     pushLayer(tray, thickness, target);
 
-    if (!moveToReady()) {
-      res->success = false; res->message = "放置后回 ready 失败"; return;
+    // 收尾摆到 look 而非 ready (2026-07-31 改): 下一轮开工需要的姿态是 look 不是 ready ——
+    // pickCycle 第一步就取 object_pose, 前提是相机已经对着货物. 原先回 ready 使得同一货架
+    // 连抓多个盒时每轮都要多走一趟 ready->look 的空行程, 而那一趟是整段里最长的.
+    // 回 ready 只在"底盘要走了"时才必需 (臂收身前不拖着走), 那是状态机知道的事, 由它在
+    // 离开货架前显式调 /grasp/ready.
+    // ⚠️ 别把这里改回 ready 来"图省事": 状态机侧的同货架循环依赖收尾在 look.
+    if (!moveToLook()) {
+      res->success = false; res->message = "放置后摆看货姿势失败"; return;
     }
 
-    RCLCPP_INFO(logger_, "==== 抓放一轮完成 (%s, 累计高 %.1fmm) ====",
-                what, trayStackH(tray) * 1000);
-    res->success = true; res->message = std::string("grasp cycle done: ") + what;
+    int left = 0;
+    waitPickCount(left, look_count_wait_sec_);
+    const int free_slots = trayFreeTotal();
+    RCLCPP_INFO(logger_,
+                "==== 抓放一轮完成 (%s, 累计高 %.1fmm), 已在 look 位, 还剩 %d 个可抓, 托盘余位 %d ====",
+                what, trayStackH(tray) * 1000, left, free_slots);
+    res->success = true;
+    res->message = std::string("grasp cycle done: ") + what +
+                   ", at look pose, pickable=" + std::to_string(left) +
+                   ", tray_free=" + std::to_string(free_slots);
   }
 
   // ---- 堆叠状态 / 类别映射 工具 ----
@@ -889,6 +981,20 @@ private:
     return tray_stack_h_[t];
   }
 
+  // 全部托盘还能放几个盒. 报给状态机作"还能不能接着抓"的参考量.
+  // 只是参考不是判据: 真正拦下一轮的是 resolvePlaceTarget 的 TRAY_FULL —— 盒能不能放取决于
+  // 它自己的类别映射到的那个盘满没满, 而下一个盒的类别在抓之前不知道. 总余量 >0 而映射盘
+  // 已满是可能的, 那种情况由 TRAY_FULL 兜.
+  int trayFreeTotal()
+  {
+    std::lock_guard<std::mutex> lk(stack_mtx_);
+    int free_slots = 0;
+    for (int t = 0; t < num_trays_; ++t) {
+      free_slots += std::max(0, static_cast<int>(tray_capacity_[t]) - tray_layers_[t]);
+    }
+    return free_slots;
+  }
+
   // 放置成功后调: 层数/累计厚度 +1, 并在规划场景留一个持久世界碰撞体代表这个已落盒.
   // release_pose = 释放时吸盘位姿 (盒顶贴吸盘末端), 盒心在其 -Z 方向半个盒高处.
   // 该碰撞体不 detach, 生命周期到 reset_stack —— 后续放别盘时 MoveIt 自动避让, 不再横扫.
@@ -917,26 +1023,35 @@ private:
   // 场景碰撞体一并删掉: 盒已经被取走, 留着会挡住后续规划 (幽灵碰撞体教训).
   bool popLayer(int t, geometry_msgs::msg::Pose & release_pose, double & thickness)
   {
-    std::lock_guard<std::mutex> lk(stack_mtx_);
-    if (t < 0 || t >= static_cast<int>(placed_ids_.size()) || placed_ids_[t].empty()) {
-      return false;
+    std::string id;
+    {
+      std::lock_guard<std::mutex> lk(stack_mtx_);
+      if (t < 0 || t >= static_cast<int>(placed_ids_.size()) || placed_ids_[t].empty()) {
+        return false;
+      }
+      release_pose = placed_release_[t].back();   // 吸盘位姿 (非盒心), 原路取回
+      thickness = placed_th_[t].back();
+      id = placed_ids_[t].back();
+      placed_poses_[t].pop_back();
+      placed_release_[t].pop_back();
+      placed_th_[t].pop_back();
+      placed_ids_[t].pop_back();
+
+      tray_layers_[t] -= 1;
+      tray_stack_h_[t] -= thickness;
+      if (tray_layers_[t] < 0) tray_layers_[t] = 0;
+      if (tray_stack_h_[t] < 0.0) tray_stack_h_[t] = 0.0;
+
+      RCLCPP_INFO(logger_, "取走 %s (厚 %.1fmm), %d 号托盘余 %d 层, 累计高 %.1fmm",
+                  id.c_str(), thickness * 1000, t, tray_layers_[t], tray_stack_h_[t] * 1000);
     }
-    release_pose = placed_release_[t].back();   // 吸盘位姿 (非盒心), 原路取回
-    thickness = placed_th_[t].back();
-    const std::string id = placed_ids_[t].back();
-    placed_poses_[t].pop_back();
-    placed_release_[t].pop_back();
-    placed_th_[t].pop_back();
-    placed_ids_[t].pop_back();
-
-    tray_layers_[t] -= 1;
-    tray_stack_h_[t] -= thickness;
-    if (tray_layers_[t] < 0) tray_layers_[t] = 0;
-    if (tray_stack_h_[t] < 0.0) tray_stack_h_[t] = 0.0;
-
-    psi_->removeCollisionObjects({id});
-    RCLCPP_INFO(logger_, "取走 %s (厚 %.1fmm), %d 号托盘余 %d 层, 累计高 %.1fmm",
-                id.c_str(), thickness * 1000, t, tray_layers_[t], tray_stack_h_[t] * 1000);
+    // 同步删 (锁外, 服务调用会阻塞几十 ms): 盒已在吸盘上, 场景里那个碰撞体必须在下一次
+    // 规划前真的消失, 否则它与 attach 的 carried_box 重叠, 起点即判碰撞 (同 hideTrayBoxes
+    // 那条竞态, 2026-07-31).
+    if (!removeObjectsSync({id})) {
+      psi_->removeCollisionObjects({id});
+      RCLCPP_WARN(logger_, "取走 %s: 同步 REMOVE 失败, 已退回异步", id.c_str());
+    }
     return true;
   }
 
@@ -1026,13 +1141,51 @@ private:
   }
 
   // 临时移出某托盘的所有已落盒 (放同盘下一层时它们正是落点, 不能当障碍挡住直下段).
+  //
+  // ⚠️ 必须走 apply_planning_scene 同步等回执, 不能用 psi_->removeCollisionObjects():
+  // 后者只往话题发一条 diff 就返回, 场景何时真的更新不确定. 调用方紧接着就
+  // computeCartesianPath, 盒可能还在场景里 -> 起点判在碰撞中 -> 覆盖 0%.
+  // 2026-07-31 实跑证据 (卸货, 手上盒底低于同盘下层盒顶, 两次几何相同):
+  //   0 号盘: 吸取->爬升 隔 1.77s, 异步移出来得及生效, 覆盖 100% (侥幸赢了竞态)
+  //   1 号盘: 只隔 54ms, 移出还没到, 覆盖 0% -> 臂没爬, 贴着托盘规划 transit -> 擦到别盘
+  // 时序决定成败正是竞态的特征, 所以"上一轮过了"不代表安全.
   void hideTrayBoxes(int t)
   {
-    std::lock_guard<std::mutex> lk(stack_mtx_);
-    if (t < 0 || t >= static_cast<int>(placed_ids_.size()) || placed_ids_[t].empty()) return;
-    psi_->removeCollisionObjects(placed_ids_[t]);
-    RCLCPP_INFO(logger_, "临时移出 %d 号托盘 %zu 个已落盒 (本层落点)",
-                t, placed_ids_[t].size());
+    std::vector<std::string> ids;
+    {
+      std::lock_guard<std::mutex> lk(stack_mtx_);
+      if (t < 0 || t >= static_cast<int>(placed_ids_.size()) || placed_ids_[t].empty()) return;
+      ids = placed_ids_[t];
+    }
+    if (!removeObjectsSync(ids)) {
+      // 退回异步 (服务不可用时总比什么都不做好), 并明确告警: 此时覆盖 0% 就是这个原因.
+      psi_->removeCollisionObjects(ids);
+      RCLCPP_WARN(logger_, "移出 %d 号托盘已落盒: 同步 REMOVE 失败, 已退回异步 (后续笛卡尔"
+                  "覆盖可能因场景未更新而偏低)", t);
+      return;
+    }
+    RCLCPP_INFO(logger_, "临时移出 %d 号托盘 %zu 个已落盒 (本层落点, 同步已确认)",
+                t, ids.size());
+  }
+
+  // 同步删一批碰撞体: 发 apply_planning_scene 并等回执, 返回时场景已更新.
+  bool removeObjectsSync(const std::vector<std::string> & ids)
+  {
+    if (ids.empty()) return true;
+    if (!apply_scene_cli_->wait_for_service(2s)) return false;
+    auto req = std::make_shared<moveit_msgs::srv::ApplyPlanningScene::Request>();
+    req->scene.is_diff = true;
+    req->scene.robot_state.is_diff = true;
+    for (const auto & id : ids) {
+      moveit_msgs::msg::CollisionObject co;
+      co.id = id;
+      co.header.frame_id = base_frame_;
+      co.operation = co.REMOVE;
+      req->scene.world.collision_objects.push_back(co);
+    }
+    auto fut = apply_scene_cli_->async_send_request(req);
+    if (fut.wait_for(5s) != std::future_status::ready) return false;
+    return fut.get()->success;
   }
 
   // 把之前 hide 的托盘已落盒原样加回 (放置完直下段结束后调).
@@ -1106,12 +1259,16 @@ private:
         release = placed_release_[tray].back();
         thickness = placed_th_[tray].back();
       }
-      // 下压量: 与抓取的 insert_shortfall 同理, 负值多压一点, 兜住盒放下后的沉降.
-      release.position.z += unload_pick_shortfall_;
+      // 下压量按类别取 (负值多压): 释放位姿不等于盒落定后的高度, 差多少是这个类别盒子
+      // 自己的性质 (盒面软硬/落进托盘沉多少), 与它摞在第几层无关.
+      const double shortfall = unloadShortfallFor(thickness);
+      release.position.z += shortfall;
 
       const std::string what = std::to_string(tray) + "号托盘第" +
                                std::to_string(trayLayers(tray)) + "层";
-      if (!pickFromTray(release, thickness, what.c_str(), tray)) {
+      RCLCPP_INFO(logger_, "取盒(%s): 厚 %.0fmm, 下压量 %+.0fmm -> 目标 z=%.3f",
+                  what.c_str(), thickness * 1000, shortfall * 1000, release.position.z);
+      if (!pickFromTray(release, thickness, what.c_str(), tray, true)) {
         err = "取盒失败: " + what; return false;
       }
 
@@ -1127,20 +1284,31 @@ private:
       dest.position.y = unload_base_y_;
       // 释放高度按本盒厚度现算 (吸盘吸着盒顶面, 盒底落地): 同盘两盒厚度可能不同.
       dest.position.z = unload_z_ + thickness;
-      // 朝向沿用取盒时的工具朝向: 取盒后吸盘已是朝下的托盘标定朝向, 与实标卸货点姿态
-      // (yaw≈-90°) 一致, 直接沿用不额外转腕.
-      dest.orientation = release.orientation;
+      // 朝向用实标卸货点的朝向, **不**沿用取盒时的托盘标定朝向: 托盘朝向 yaw≈-175°
+      // (tray_q*, 为对齐托盘围栏而左旋过), 卸货点实标朝向 yaw≈-90°, 差 85° —— 沿用托盘
+      // 朝向盒子会歪着落在地上 (2026-07-30 实跑观察). yaw -90° 也正是 look 位的 TCP 朝向
+      // (look = ready + J1 +90°, ready yaw -180°), 与实标读值 -90.02° 吻合.
+      dest.orientation = unload_quat_;
 
-      RCLCPP_INFO(logger_, "卸货: 第 %d 个盒 -> 卸货点 %d (%.3f,%.3f,%.3f) 厚 %.0fmm",
+      RCLCPP_INFO(logger_, "卸货: 第 %d 个盒 -> 卸货点 %d (%.3f,%.3f,%.3f) 厚 %.0fmm yaw %.1f°",
                   k + 1, k, dest.position.x, dest.position.y, dest.position.z,
-                  thickness * 1000);
-      if (!placeAtPose(dest, ("卸货点" + std::to_string(k)).c_str(), tray)) {
+                  thickness * 1000, quatYaw(dest.orientation) * 180.0 / M_PI);
+      if (!placeAtPose(dest, ("卸货点" + std::to_string(k)).c_str(), tray, true)) {
         if (dry_run_) detachBox();   // 失败也要清掉虚拟盒, 否则残留在吸盘上
         err = "放到卸货点失败(已吸取): 卸货点" + std::to_string(k);
         return false;
       }
       // dry_run 下取盒段挂的虚拟盒到此清掉, 否则它会一直挂在吸盘上进下一轮.
       if (dry_run_) detachBox();
+      // 先竖直退开再登记碰撞体: 释放那刻吸盘末端正贴在盒顶上 (释放 z = 盒顶 z), 原地登记
+      // 出来的碰撞体与 suction_link 立刻接触 -> 后续每次 plan 都判"起点在碰撞中"直接作废
+      // (2026-07-30 实跑: 取第二个盒时 transit 规划 "Invalid states at index [0 1]",
+      //  接触对 placed_unloaded_1_0 <-> suction_link). 几何本就是贴着的, 停位误差几 mm
+      // 就决定判不判碰撞, 所以早几轮侥幸过了不代表安全.
+      if (!dry_run_ && !moveRelativeXYZ(0.0, 0.0, lift_height_)) {
+        err = "卸货后竖直退开失败: 卸货点" + std::to_string(k);
+        return false;
+      }
       // 卸到地面的盒不进堆叠 (那是托盘的账), 但要留个碰撞体防下一个盒放到它身上.
       // id 必须带 placed_ 前缀: reset_stack 的同步 REMOVE 与其复查都只认这个前缀,
       // 叫别的名字就成了连重启都清不掉的幽灵碰撞体 (2026-07-29 事故), 而卸货点就在
@@ -1152,6 +1320,33 @@ private:
     if (!moveToReady()) { err = "卸货后回 ready 失败"; return false; }
     RCLCPP_INFO(logger_, "==== %d 号托盘 %d 个盒已全部卸完 ====", tray, n);
     return true;
+  }
+
+  // transit 高度候选, 从低到高试, 取第一个"transit 规划 + 直下段"两段都通的.
+  // 装货与卸货各一组 (目的地不同: 托盘里 vs 地面), 但机制相同.
+  // 2026-07-31 装货也改成多档 (原先只有 transit_z_ 一档 0.26): 当初写死高值是因为起点贴地、
+  // 只有终点在高空, 规划器有自由先横移再爬, 低档会低空掠过别盘那摞盒. 现在爬升先把臂拉到
+  // transit 高度、两端同高, 那个理由不再成立. 试档全是纯规划不动臂, 通不过自动退高档.
+  // 空列表兜底回 transit_z_, 免得参数没配时候选为空直接失败.
+  std::vector<double> transitCandidates(bool unload_mode) const
+  {
+    const auto & c = unload_mode ? unload_transit_candidates_ : transit_candidates_;
+    if (c.empty()) return {transit_z_};
+    return c;
+  }
+
+  // 取盒下压量: 按类别取. 类别由厚度反查 fallback_thickness_ —— 四个类别的标定厚度互不
+  // 相同 (22/24/12/15mm), 反查是唯一的, 于是不必在堆叠里再存一份类别字段 (存了还要管
+  // seed_placed 那条路径怎么填). 查不到就退回第一个值.
+  double unloadShortfallFor(double thickness) const
+  {
+    for (size_t i = 0; i < fallback_thickness_.size(); ++i) {
+      if (std::abs(fallback_thickness_[i] - thickness) < 1e-6 &&
+          i < unload_pick_shortfall_.size()) {
+        return unload_pick_shortfall_[i];
+      }
+    }
+    return unload_pick_shortfall_.empty() ? 0.0 : unload_pick_shortfall_.front();
   }
 
   // 从吸盘释放位姿推盒心位姿 (工具朝下, 盒心在吸盘末端下方半个盒高).
@@ -1167,7 +1362,7 @@ private:
   // 吸 -> attach. 与 placeAtPose 严格对称 (它是: 抬起 -> transit -> 直下 -> 释放),
   // 故放得进去就取得出来.
   bool pickFromTray(const geometry_msgs::msg::Pose & release, double thickness,
-                    const char * what, int tray)
+                    const char * what, int tray, bool unload_mode = false)
   {
     const double v = plan_velocity_scaling_ * place_velocity_scaling_;
     move_group_->setMaxVelocityScalingFactor(v);
@@ -1177,58 +1372,80 @@ private:
     // 别盘的留着当障碍, 防规划器横扫 (2026-07-28 蹭飞事故).
     hideTrayBoxes(tray);
 
-    // 规划到正上方高空 transit: 两端都在自由空间, 失败率≈0 (放置段实测四轮).
-    geometry_msgs::msg::Pose transit = release;
-    transit.position.z = transit_z_;
-    move_group_->setStartStateToCurrentState();
-    move_group_->setPoseTarget(transit);
+    // 规划到正上方高空 transit, 高度逐级试 (同 placeAtPose, 理由见那边注释): 两段都验过
+    // 才执行, 免得执行完 transit 才发现直下段不行. 取盒这头执行前臂上还没盒子, 卡住的
+    // 后果比放置那头轻, 但同一套逻辑更好维护.
+    // 重算失败退下一档重来 (同 placeAtPose, 理由见那边): 试算起点是 transit 规划终点的理论
+    // 关节值, 执行后有停位误差, 重算可能掉档 —— 旧代码此时直接失败, 而更高档次根本没试过.
     moveit::planning_interface::MoveGroupInterface::Plan plan;
-    if (move_group_->plan(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
-      RCLCPP_ERROR(logger_, "取盒(%s): 规划到 transit (%.3f,%.3f,%.3f) 失败", what,
-                   transit.position.x, transit.position.y, transit.position.z);
-      showTrayBoxes(tray); restorePlanScaling(); return false;
-    }
-    if (dry_run_) {
-      RCLCPP_WARN(logger_, "取盒(%s): [dry_run] transit 规划通过 (%zu 点), 不执行", what,
-                  plan.trajectory_.joint_trajectory.points.size());
-    } else {
-      if (move_group_->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
-        showTrayBoxes(tray); restorePlanScaling(); return false;
-      }
-      settle();
-    }
-
-    // 笛卡尔垂直直下到释放位姿 (吸盘回到当初放这个盒时所在处).
-    std::vector<geometry_msgs::msg::Pose> dwps{release};
     moveit_msgs::msg::RobotTrajectory dtraj;
-    if (dry_run_) {
-      // dry_run 下上一段没真执行, 臂仍在原处; 直下起点接上一段规划的终点, 否则覆盖必然 0%.
+    geometry_msgs::msg::Pose transit = release;
+    std::vector<geometry_msgs::msg::Pose> dwps{release};
+    const auto cands = transitCandidates(unload_mode);
+    bool descended = false;
+    double used_z = 0.0;
+
+    for (size_t ci = 0; ci < cands.size() && !descended; ++ci) {
+      const double z = cands[ci];
+      transit.position.z = z;
+      move_group_->setStartStateToCurrentState();
+      move_group_->setPoseTarget(transit);
+      if (move_group_->plan(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+        RCLCPP_WARN(logger_, "取盒(%s): transit z=%.3f 规划失败, 试下一档", what, z);
+        continue;
+      }
       const auto cur_state = move_group_->getCurrentState();
       if (!cur_state) { showTrayBoxes(tray); restorePlanScaling(); return false; }
       moveit::core::RobotState start(*cur_state);
       const auto & jt = plan.trajectory_.joint_trajectory;
       start.setVariablePositions(jt.joint_names, jt.points.back().positions);
       move_group_->setStartState(start);
-    } else {
+      const double frac = move_group_->computeCartesianPath(dwps, 0.005, 0.0, dtraj);
+      // 阈值 0.99 而非 0.9: 卡在 0.9 上的档次实测必破, 早点让给下一档.
+      if (frac < 0.99) {
+        RCLCPP_WARN(logger_, "取盒(%s): transit z=%.3f 的直下段试算只覆盖 %.0f%% (<99%%), 试下一档",
+                    what, z, frac * 100);
+        continue;
+      }
+      RCLCPP_INFO(logger_,
+                  "取盒(%s): transit z=%.3f 两段试算全通 (transit %zu 点, 直下 %.0f%%)",
+                  what, z, plan.trajectory_.joint_trajectory.points.size(), frac * 100);
+
+      if (dry_run_) {
+        RCLCPP_WARN(logger_, "取盒(%s): [dry_run] 目标 z=%.3f, 到此为止", what,
+                    release.position.z);
+        // 挂虚拟盒 (同 onExecute/place_only 的 dry_run): 没有它后面放到卸货点那段是按
+        // "吸盘上空着"规划的, 验不到盒子几何在目的地会不会撞. 由 unloadTray 走完一轮 detach.
+        attachBox(true, thickness);
+        showTrayBoxes(tray); restorePlanScaling(); return true;
+      }
+      if (move_group_->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+        RCLCPP_WARN(logger_, "取盒(%s): transit z=%.3f 执行失败, 试下一档", what, z);
+        continue;
+      }
+      settle();
+      // 按实测起点重算 (理论轨迹会被 start-state 校验拒掉).
       move_group_->setStartStateToCurrentState();
+      const double frac2 = move_group_->computeCartesianPath(dwps, 0.005, 0.0, dtraj);
+      if (frac2 < 0.9) {
+        RCLCPP_WARN(logger_,
+                    "取盒(%s): transit z=%.3f 直下段按实测起点重算只覆盖 %.0f%% (试算 %.0f%%), 试下一档",
+                    what, z, frac2 * 100, frac * 100);
+        continue;   // 臂停在本档 transit 点, 吸盘上还没盒子, 退档安全
+      }
+      if (move_group_->execute(dtraj) != moveit::core::MoveItErrorCode::SUCCESS) {
+        RCLCPP_WARN(logger_, "取盒(%s): transit z=%.3f 直下段执行失败, 试下一档", what, z);
+        continue;
+      }
+      settle();
+      descended = true; used_z = z;
     }
-    const double frac = move_group_->computeCartesianPath(dwps, 0.005, 0.0, dtraj);
-    if (frac < 0.9) {
-      RCLCPP_ERROR(logger_, "取盒(%s): 垂直直下覆盖不足 %.0f%%", what, frac * 100);
+    if (!descended) {
+      RCLCPP_ERROR(logger_, "取盒(%s): 所有 transit 高度都没能走完两段 (%.3f,%.3f)", what,
+                   release.position.x, release.position.y);
       showTrayBoxes(tray); restorePlanScaling(); return false;
     }
-    if (dry_run_) {
-      RCLCPP_WARN(logger_, "取盒(%s): [dry_run] 直下覆盖 %.0f%% (目标 z=%.3f), 到此为止",
-                  what, frac * 100, release.position.z);
-      // 挂虚拟盒 (同 onExecute/place_only 的 dry_run): 没有它后面放到卸货点那段是按
-      // "吸盘上空着"规划的, 验不到盒子几何在目的地会不会撞. 由 unloadTray 走完一轮 detach.
-      attachBox(true, thickness);
-      showTrayBoxes(tray); restorePlanScaling(); return true;
-    }
-    if (move_group_->execute(dtraj) != moveit::core::MoveItErrorCode::SUCCESS) {
-      showTrayBoxes(tray); restorePlanScaling(); return false;
-    }
-    settle();
+    RCLCPP_INFO(logger_, "取盒(%s): 已用 transit z=%.3f 走完两段", what, used_z);
 
     // 吸取 + 转保压 (与 stageInsert 同一套: 抽真空建立负压, 再 STOP 关泵关阀维持).
     publishPump(PUMP_SUCK);
@@ -1818,7 +2035,12 @@ private:
     moveit_msgs::msg::AttachedCollisionObject aco;
     aco.link_name = ee_link_;
     aco.object = co;
-    aco.touch_links = {ee_link_};
+    // ee_link_ (suction_tip) 本身没有几何体, 它只是 suction_link 的一个子坐标系; 真正带
+    // 网格的是父链接 suction_link. 光豁免 suction_tip 等于没豁免 —— 盒顶面就贴在吸盘本体
+    // 上, 盒 vs suction_link 判碰撞是必然的, 只看 OMPL 采样到哪个点才暴露.
+    // 2026-07-30 实跑: 卸货第二个盒 transit 规划 "Invalid states at index [21] out of 61",
+    // 接触对 carried_box <-> suction_link, 而同一段前几轮都过 —— 典型的边缘几何偶发.
+    aco.touch_links = {ee_link_, suction_body_link_};
     if (allow_tray_touch) aco.touch_links.push_back(tray_frame_);
     psi_->applyAttachedCollisionObject(aco);
     RCLCPP_INFO(logger_, "盒子已 attach 到 %s 作碰撞体 (%.0fx%.0fx%.0fmm)%s", ee_link_.c_str(),
@@ -1930,7 +2152,7 @@ private:
     return true;
   }
 
-  // 放到"标定好的绝对目标位姿"(含朝向), 顶向下入位: 相对抬起(携盒) -> 规划到高空 transit
+  // 放到"标定好的绝对目标位姿"(含朝向), 顶向下入位: 竖直爬升到 transit 高度(携盒) -> 规划到高空 transit
   // (标定 xy+朝向, z = transit_z_ 绝对) -> 笛卡尔垂直直下到标定位姿 -> 释放 + detach.
   // 放托盘用: 托盘在肩后死区, 唯一可达是工具 yaw≈180°朝下的特定位姿(RViz 实测标定).
   // 早前直接 plan() 到标定位姿: 盒 attach 后规划器为让盒全程避开边框会绕大圈甩臂; 改成
@@ -1947,7 +2169,11 @@ private:
   //  被碰撞体挡的, 抬高到 0.20 也已逼近 transit_z_ 没有意义. 且盒 attach 时 touch_links
   //  含 tray_frame_, 盒与托盘碰撞全程豁免, 低空横切蹭围栏侧壁规划器不报、执行不停, 只能
   //  靠人看. 零收益 + 无声风险, 故放置统一走下面的高空 transit_z_ 一条路.)
-  bool placeAtPose(const geometry_msgs::msg::Pose & target, const char * what, int tray)
+  // unload_mode: 走卸货那组 transit 高度候选 (从低到高试) 而非抓取放置的单一 transit_z_.
+  // 卸货目的地在地面而非托盘里, 不需要 transit_z_ 那么高 (它是为"携盒越过别盘那摞 2 层盒"
+  // 定的), 白飞 10cm.
+  bool placeAtPose(const geometry_msgs::msg::Pose & target, const char * what, int tray,
+                   bool unload_mode = false)
   {
     // 四步渐进安全测试: 放置段整体降速(默认 0.2, place_velocity_scaling 再乘一档),
     // 收尾恢复. dry_run 时只 plan+打印, 不 execute, 也不动气泵/detach (盒仍吸着不释放).
@@ -1958,11 +2184,30 @@ private:
       RCLCPP_WARN(logger_, "放置(%s): [dry_run] 只规划打印, 不执行/不释放", what);
     }
 
-    // 携盒相对抬起, 先让盒离开当前接触面
+    // 本托盘已落盒必须在**爬升之前**就移出, 而非只在 transit 规划前移出.
+    // 2026-07-31 实跑: 卸货取完第 2 层后吸盘停在 z≈0.104, 手上盒底 0.089 比同盘第 1 层盒顶
+    // 0.101 还低 12mm —— 而 pickFromTray 收尾已把第 1 层加回场景, 于是笛卡尔爬升的**起点
+    // 状态就判在碰撞里**, 第一步即断, 覆盖 0%. 臂没爬, 贴着托盘去规划 transit, 又退化成
+    // "只有一端在高空", 横移时擦到别盘那摞盒 (用户实机观察到撞左托盘).
+    // 四次卸货完全对上: 取 l2(下面还有 l1) 两次都是 0%, 取 l1(下面空) 两次都是 100%.
+    // 本盘已放盒是落点/来源, 不是障碍, 整个放置段都不该当障碍; 别盘的留着当障碍.
+    // ⚠️ 此行之后任何失败返回前都必须 showTrayBoxes 加回.
+    hideTrayBoxes(tray);
+
+    // 携盒纯竖直爬升到 transit 高度, 之后才去规划 transit (原先只相对抬 lift_height_=3cm).
+    // 2026-07-30: 抬 3cm 后 TCP 仍在 z≈-0.008 基本贴地, 而 transit 航点在 0.26 —— 只有一端
+    // 在高空. RRTConnect 在哪一段爬升是随机的, 它可以先横移再爬, 于是低空掠过**别盘**那摞
+    // 2 层盒: plan 在 95ms 后报 "Invalid states at index [26] out of 48", 接触对
+    // placed_t1_l2 <-> carried_box (0 号托盘第 1 层实跑). 两端同高后, 路径没有理由往下钻。
+    // 爬升是笛卡尔纯直线, 截断安全: 覆盖不足时执行到的那段仍然只是竖直向上, 不会横移蹭东西,
+    // 故拿到多少覆盖就走多少, 没到位只告警 (transit 规划失败会在下面正常报错返回).
+    // 取 transitCandidates 的第一档(最低)作爬升目标: 更高的档次起点已在高空, 无需再爬。
+    const auto climb_cands = transitCandidates(unload_mode);
+    const double climb_z = climb_cands.empty() ? 0.0 : climb_cands.front();
     geometry_msgs::msg::PoseStamped cur;
-    if (!currentTcp(cur)) { restorePlanScaling(); return false; }
+    if (!currentTcp(cur)) { showTrayBoxes(tray); restorePlanScaling(); return false; }
     geometry_msgs::msg::Pose up = cur.pose;
-    up.position.z += lift_height_;
+    up.position.z = std::max(cur.pose.position.z + lift_height_, climb_z);
     std::vector<geometry_msgs::msg::Pose> wps{up};
     moveit_msgs::msg::RobotTrajectory traj;
     move_group_->setStartStateToCurrentState();
@@ -1970,46 +2215,75 @@ private:
     if (up_frac > 0.5 && !dry_run_) {
       move_group_->execute(traj);
       settle();
-      RCLCPP_INFO(logger_, "放置(%s): 已抬起 %.0fcm", what, lift_height_ * 100);
+      geometry_msgs::msg::PoseStamped now;
+      const double reached = currentTcp(now) ? now.pose.position.z : up.position.z;
+      RCLCPP_INFO(logger_, "放置(%s): 已竖直爬升到 z=%.3f (目标 %.3f, 覆盖 %.0f%%)",
+                  what, reached, up.position.z, up_frac * 100);
+      if (reached < up.position.z - 0.02) {
+        RCLCPP_WARN(logger_, "放置(%s): 爬升未到位 (差 %.0fmm), transit 规划可能被别盘已放盒挡到",
+                    what, (up.position.z - reached) * 1000);
+      }
     } else if (dry_run_) {
-      RCLCPP_WARN(logger_, "放置(%s): [dry_run] 抬起路径覆盖 %.0f%%, 不执行",
+      RCLCPP_WARN(logger_, "放置(%s): [dry_run] 爬升到 z=%.3f 路径覆盖 %.0f%%, 不执行",
+                  what, up.position.z, up_frac * 100);
+    } else {
+      RCLCPP_WARN(logger_, "放置(%s): 爬升路径只覆盖 %.0f%%, 不执行爬升, 直接试 transit",
                   what, up_frac * 100);
     }
 
-    // 本托盘已落盒从 transit 规划前就移出, 而非只在直下段前移出: transit 航点在本盘正上方,
-    // 手上盒是 attach 的, 规划器要算"盒 vs 已放盒"的碰撞, 第2层时间隙不够会直接 plan 失败
-    // (2026-07-29 实测 0号托盘第2层 plan() failed). 本盘已放盒是落点不是障碍, 整个放置段
-    // 都不该当障碍; 别盘的留着当障碍. 中途任何失败返回前必须 showTrayBoxes 加回.
-    hideTrayBoxes(tray);
-
-    // 规划到高空 transit 航点 (xy+朝向用标定值, z = transit_z_ 绝对高度): 两端都在
-    // 自由空间, 规划器不用钻障碍缝, 失败率≈0. 之后纯垂直直下到 target.
-    geometry_msgs::msg::Pose transit = target;
-    transit.position.z = transit_z_;
-    move_group_->setStartStateToCurrentState();
-    move_group_->setPoseTarget(transit);
+    // 规划到高空 transit 航点 (xy+朝向用标定值, z 绝对高度): 两端都在自由空间, 规划器不用
+    // 钻障碍缝. 之后纯垂直直下到 target.
+    //
+    // 高度逐级试 (2026-07-30 改): 原先写死一个高度, 实跑发现卸货点这一带的 IK 可达区间很窄
+    // 且两段各有各的约束 —— 0.16 时 transit 规划成功(68点)但直下只覆盖 87%; 抬到 0.20 反而
+    // transit 本身规划不出来; 0.26 两段都通. 中间高度落在两个可行构型之间的空隙里, 挑不出
+    // 一个"够低又两段都过"的定值, 故改成从低到高试, 取第一个两段都过的.
+    // ⚠️ 必须两段都验过才执行 transit: 先执行再发现直下段不行, 盒子就吸着卡在半空了
+    // (0.16 那轮的实际后果). 直下段试算的起点接 transit 规划的终点, 不动真臂.
+    // ⚠️ 重算失败必须退下一档重来, 不能直接返回失败 (2026-07-31 实跑教训):
+    // 试算用 transit 规划终点的**理论**关节值, 执行后有停位误差, 按实测起点重算可能掉档 ——
+    // 0.18 档实测 试算 100% -> 重算 88%. 收紧试算阈值治不了: 差异不是裕度不够, 而是停位误差
+    // 把起点挪到了另一个 IK 分支附近. 旧代码此时直接 return false, 盒吸着卡半空, 而 0.20/
+    // 0.26 两档根本没试过. 现在整个"transit 规划 + 试算 + 执行 + 重算"都在循环里, 重算破了
+    // 就换下一档重新爬升+规划, 只有全部档次都败才算失败.
     moveit::planning_interface::MoveGroupInterface::Plan plan;
-    if (move_group_->plan(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
-      RCLCPP_ERROR(logger_, "放置(%s): 规划到 transit (%.3f,%.3f,%.3f) 失败", what,
-                   transit.position.x, transit.position.y, transit.position.z);
-      showTrayBoxes(tray); restorePlanScaling(); return false;
-    }
-    RCLCPP_INFO(logger_, "放置(%s): 规划到 transit (%.3f,%.3f,%.3f) 成功, 轨迹 %zu 点", what,
-                transit.position.x, transit.position.y, transit.position.z,
-                plan.trajectory_.joint_trajectory.points.size());
-    if (!dry_run_) {
-      if (move_group_->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
-        showTrayBoxes(tray); restorePlanScaling(); return false;
-      }
-      settle();
-    }
-
-    // 笛卡尔垂直直下到标定放置位姿: 盒竖直入托盘, 不侧向蹭边框.
-    std::vector<geometry_msgs::msg::Pose> dwps{target};
     moveit_msgs::msg::RobotTrajectory dtraj;
-    // dry_run 下上面两段都没真执行, 臂还停在原处; 直下段起点若仍取实测当前状态, 等于要求
-    // 从原处一步笛卡尔跨到托盘正上方, 覆盖必然 0%. 故接上一段规划的终点作起点.
-    if (dry_run_) {
+    geometry_msgs::msg::Pose transit = target;
+    std::vector<geometry_msgs::msg::Pose> dwps{target};
+    const auto cands = transitCandidates(unload_mode);
+    bool descended = false;
+    double used_z = 0.0;
+
+    for (size_t ci = 0; ci < cands.size() && !descended; ++ci) {
+      const double z = cands[ci];
+      // 退档后先补爬到本档高度: 上面那次爬升只爬到首档(最低档), 而更高档的 transit 航点在
+      // 更高处. 不补爬就又变成"起点低、终点高"那个让规划器低空横移的老毛病.
+      // 首档(ci==0)不用补, 循环前已经爬过.
+      if (ci > 0) {
+        geometry_msgs::msg::PoseStamped c2;
+        if (currentTcp(c2) && c2.pose.position.z < z - 0.005) {
+          geometry_msgs::msg::Pose u2 = c2.pose;
+          u2.position.z = z;
+          std::vector<geometry_msgs::msg::Pose> w2{u2};
+          moveit_msgs::msg::RobotTrajectory t2;
+          move_group_->setStartStateToCurrentState();
+          const double f2 = move_group_->computeCartesianPath(w2, 0.005, 0.0, t2);
+          if (f2 > 0.5) {
+            move_group_->execute(t2);
+            settle();
+          }
+          RCLCPP_INFO(logger_, "放置(%s): 退档补爬到 z=%.3f (覆盖 %.0f%%)", what, z, f2 * 100);
+        }
+      }
+      transit.position.z = z;
+      move_group_->setStartStateToCurrentState();
+      move_group_->setPoseTarget(transit);
+      if (move_group_->plan(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+        RCLCPP_WARN(logger_, "放置(%s): transit z=%.3f 规划失败, 试下一档", what, z);
+        continue;
+      }
+      // 直下段试算: 起点接上面 transit 规划的终点 (真机也这么接, 因为此刻还没执行 transit).
+      // 试算阈值 0.99 而非执行时的 0.9: 卡在 0.9 上的档次实测必破, 早点让给下一档.
       const auto cur_state = move_group_->getCurrentState();
       if (!cur_state) {
         RCLCPP_ERROR(logger_, "放置: 取当前状态失败");
@@ -2019,24 +2293,49 @@ private:
       const auto & jt = plan.trajectory_.joint_trajectory;
       start.setVariablePositions(jt.joint_names, jt.points.back().positions);
       move_group_->setStartState(start);
-    } else {
+      const double frac = move_group_->computeCartesianPath(dwps, 0.005, 0.0, dtraj);
+      if (frac < 0.99) {
+        RCLCPP_WARN(logger_, "放置(%s): transit z=%.3f 的直下段试算只覆盖 %.0f%% (<99%%), 试下一档",
+                    what, z, frac * 100);
+        continue;
+      }
+      RCLCPP_INFO(logger_,
+                  "放置(%s): transit z=%.3f 两段试算全通 (transit %zu 点, 直下 %.0f%%)",
+                  what, z, plan.trajectory_.joint_trajectory.points.size(), frac * 100);
+
+      if (dry_run_) {
+        RCLCPP_WARN(logger_, "放置(%s): [dry_run] 目标 z=%.3f, 到此为止不执行",
+                    what, target.position.z);
+        showTrayBoxes(tray); restorePlanScaling();
+        return true;   // dry_run 视为通过(规划全成功), 但不真放/不计堆叠由调用侧另判
+      }
+      if (move_group_->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+        RCLCPP_WARN(logger_, "放置(%s): transit z=%.3f 执行失败, 试下一档", what, z);
+        continue;
+      }
+      settle();
+      // 按实测起点重算 (理论轨迹会被 MoveIt 的 start-state 校验拒掉).
       move_group_->setStartStateToCurrentState();
+      const double frac2 = move_group_->computeCartesianPath(dwps, 0.005, 0.0, dtraj);
+      if (frac2 < 0.9) {
+        RCLCPP_WARN(logger_,
+                    "放置(%s): transit z=%.3f 直下段按实测起点重算只覆盖 %.0f%% (试算 %.0f%%), 试下一档",
+                    what, z, frac2 * 100, frac * 100);
+        continue;   // 臂此刻停在 z 高度的 transit 点上, 下一档从这里重新规划, 安全
+      }
+      if (move_group_->execute(dtraj) != moveit::core::MoveItErrorCode::SUCCESS) {
+        RCLCPP_WARN(logger_, "放置(%s): transit z=%.3f 直下段执行失败, 试下一档", what, z);
+        continue;
+      }
+      settle();
+      descended = true; used_z = z;
     }
-    const double frac = move_group_->computeCartesianPath(dwps, 0.005, 0.0, dtraj);
-    if (frac < 0.9) {
-      RCLCPP_ERROR(logger_, "放置(%s): 垂直直下路径覆盖不足 %.0f%%", what, frac * 100);
+    if (!descended) {
+      RCLCPP_ERROR(logger_, "放置(%s): 所有 transit 高度都没能走完两段 (%.3f,%.3f)", what,
+                   target.position.x, target.position.y);
       showTrayBoxes(tray); restorePlanScaling(); return false;
     }
-    if (dry_run_) {
-      RCLCPP_WARN(logger_, "放置(%s): [dry_run] 直下路径覆盖 %.0f%%, 目标 z=%.3f, 到此为止不执行",
-                  what, frac * 100, target.position.z);
-      showTrayBoxes(tray); restorePlanScaling();
-      return true;   // dry_run 视为通过(规划全成功), 但不真放/不计堆叠由调用侧另判
-    }
-    if (move_group_->execute(dtraj) != moveit::core::MoveItErrorCode::SUCCESS) {
-      showTrayBoxes(tray); restorePlanScaling(); return false;
-    }
-    settle();
+    RCLCPP_INFO(logger_, "放置(%s): 已用 transit z=%.3f 走完两段", what, used_z);
 
     releasePulse();
     detachBox();
@@ -2165,6 +2464,30 @@ private:
     if (age > object_stale_sec_) return false;
     out = last_object_;
     return true;
+  }
+
+  // 等一个到达时刻晚于"进入本函数"的候选数 —— 即摆到 look 位之后才拍的那一帧.
+  // 不看消息 stamp 而看接收时刻: 判据是"这一帧是不是臂停稳后才进来的", 接收时刻正是这个
+  // 量; 消息 stamp 是曝光/发布时刻, 与"管线里积压了多久"无关 (轮询期间会连收好几帧,
+  // 取最后一个即最新).
+  // 超时则返回最后已知值 + false, 让调用方在 message 里注明过期而不是假装看见 0 个 ——
+  // 报 0 会让状态机以为抓完了直接收工, 而真相可能是感知节点没起.
+  bool waitPickCount(int & out, double timeout_s)
+  {
+    const rclcpp::Time t0 = node_->now();
+    rclcpp::WallRate r(60.0);
+    while (rclcpp::ok() && (node_->now() - t0).seconds() < timeout_s) {
+      {
+        std::lock_guard<std::mutex> lk(poses_mtx_);
+        if (last_poses_stamp_ > t0) { out = last_pick_count_; return true; }
+      }
+      r.sleep();
+    }
+    std::lock_guard<std::mutex> lk(poses_mtx_);
+    out = last_pick_count_;
+    RCLCPP_WARN(logger_, "候选数: %.1fs 内没收到新的 %s (报最后已知值 %d)",
+                timeout_s, poses_topic_.c_str(), out);
+    return false;
   }
 
   bool latestCamPoint(geometry_msgs::msg::PointStamped & out)
@@ -2303,13 +2626,18 @@ private:
   rclcpp::Node::SharedPtr node_;
   rclcpp::Logger logger_;
   std::string planning_group_, ee_link_, base_frame_, tray_frame_, object_topic_, pump_topic_;
+  std::string suction_body_link_;   // 吸盘本体(带网格), attach 时须与 ee_link_ 一同豁免
   double pregrasp_height_, lift_height_, tray_clearance_, transit_z_;
   double jog_dx_, jog_dy_, jog_dz_, jog_dyaw_deg_;
   double insert_stroke_min_, insert_stroke_max_, ground_z_, insert_shortfall_;
   double suck_duration_, release_duration_, insert_velocity_scaling_;
   double settle_sec_, settle_eps_, settle_poll_sec_;
   double place_x_, place_y_, place_z_, place_clearance_;
-  double unload_base_x_, unload_base_y_, unload_x_offset_, unload_z_, unload_pick_shortfall_;
+  double unload_base_x_, unload_base_y_, unload_x_offset_, unload_z_;
+  std::vector<double> unload_transit_candidates_;  // 卸货 transit 高度候选, 从低到高试
+  std::vector<double> transit_candidates_;         // 装货(放托盘) transit 高度候选, 同上
+  std::vector<double> unload_pick_shortfall_;    // 按 category_ids 顺序的取盒下压量
+  geometry_msgs::msg::Quaternion unload_quat_;   // 卸货点释放朝向 (实标, 非托盘朝向)
   double plan_velocity_scaling_, rotate_velocity_scaling_;
 
   // 双托盘放置 + 按类别堆叠
@@ -2320,6 +2648,12 @@ private:
   bool dry_run_{false};
   double place_velocity_scaling_{1.0};
   std::string class_topic_, thickness_topic_, cam_point_topic_, cam_frame_;
+  // 可抓候选数 (poses_mtx_ 保护): 只记长度与接收时刻, 供 /grasp/look 报给状态机.
+  std::string poses_topic_;
+  double look_count_wait_sec_{1.5};
+  std::mutex poses_mtx_;
+  int last_pick_count_{0};
+  rclcpp::Time last_poses_stamp_{0, 0, RCL_ROS_TIME};
   // 吸盘朝向对齐 (走图像角, 不过手眼外参)
   std::string axis_angle_topic_;
   double yaw_target_theta_img_, yaw_align_tol_deg_;
@@ -2373,6 +2707,7 @@ private:
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr object_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr poses_sub_;
   rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr class_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr thickness_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr cam_point_sub_;

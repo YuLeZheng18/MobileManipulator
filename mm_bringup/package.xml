@@ -26,10 +26,16 @@
   <exec_depend>arm_control</exec_depend>        <!-- CAN 桥 (经 arm_moveit_config 间接起) -->
   <exec_depend>mm_grasp</exec_depend>           <!-- grasp.launch (servo + grasp_node) -->
   <exec_depend>robot_localization</exec_depend> <!-- EKF 状态估计 (/wheel_odom+/imu -> /odom+TF) -->
-  <exec_depend>rplidar_ros</exec_depend>        <!-- 思岚 A3 雷达驱动 (目标机安装) -->
-  <!-- micro_ros_agent: 独立 ws (~/microros_ws), 需先 source, 不走本包 rosdep -->
+  <!-- ⚠️ 以下"只装在目标机(Nano)"的硬件驱动刻意**不**写 exec_depend:
+       colcon 拿 exec_depend 解析构建顺序, 本机(笔记本)没装它们就直接
+       "Failed to find .../package.sh" 让整个 mm_bringup 编不过 —— 而本机只跑 RViz +
+       状态机, 压根不需要这些驱动 (2026-07-31 踩: rplidar_ros 卡住本机编译).
+       Nano 上 apt 装好即可, launch 里各有开关控制起不起:
+         rplidar_ros        思岚 A3 雷达      (use_lidar, 默认开)
+         realsense2_camera  手眼 D435i        (use_cameras -> cameras.launch.py)
+         usb_cam            车体两路 USB 相机  (同上)
+         micro_ros_agent    独立 ws (~/microros_ws), 起 launch 前需先 source -->
   <!-- nav2_bringup: Nav2 无头栈 (由 mm_navigation 间接依赖) -->
-  <!-- 深度相机/车体相机驱动: 型号确定后补 (realsense2_camera / usb_cam 等) -->
 
   <exec_depend>nav2_bringup</exec_depend>
 

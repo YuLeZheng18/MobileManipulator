@@ -694,8 +694,6 @@ class YoloBoxDetector(Node):
         if self._pose_pub is None:
             return
         cand = [r for r in results if r[6] is not None and r[6][3] is not None]
-        if not cand:
-            return
 
         def to_pose(r):
             _cu, _cv, _d, p, yaw, _p_cam, _th = r[6]
@@ -708,11 +706,34 @@ class YoloBoxDetector(Node):
             ps.orientation.w = float(np.cos(yaw / 2.0))
             return ps
 
-        # 单目标 (契约 §1): 先按 base_link z 排掉已放进托盘的盒子, 再取面积最大框.
+        # 单目标 (契约 §1): 先按 base_link z 排掉已放进托盘的盒子, 再交给 _select_target
+        # (有锚点跟锚点, 无锚点才按面积最大新锁定).
         # 必须先过滤: 托盘离相机比地面近, 已放盒成像恒定更大, 不过滤则单目标永远选中它
         # (见 pick_z_max 声明处). 过滤后为空则不发 object_pose —— 让 grasp_node 如实报
         # "无 object_pose" 中止, 比发一个错目标去粗定位安全 (但 p_cam 例外, 见下).
         pickable = [r for r in cand if r[6][3][2] <= self.pick_z_max]
+
+        # 多目标数组: **可抓**的盒子 (过了 pick_z_max, 面积降序).
+        # 必须在下面那些 early return 之前发, 且空列表也要发: 抓取端拿这个数组的长度当
+        # "还剩几个盒要抓" (/grasp/look 报候选数, 状态机据此决定同货架循环几次).
+        # 全抓完时恰恰走的是 `not pickable` 那条 early return —— 在那之后发就永远发不出
+        # 空数组, 抓取端一直握着旧的非零计数, 循环停不下来.
+        # 用 pickable 而非 cand: 后者含托盘上已放的盒, 每放一个就多一个, 数字只增不减.
+        # 单目标 pose_topic 走的也是 pickable, 两者口径一致.
+        if self._poses_pub is not None:
+            arr = PoseArray()
+            arr.header.stamp = stamp
+            arr.header.frame_id = self.base_frame
+            arr.poses = [to_pose(r) for r in sorted(
+                pickable, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]), reverse=True)]
+            self._poses_pub.publish(arr)
+
+        # 一个盒子都没检测到: 数组(空)已发完, 其余话题无从发起.
+        # 提前拦在这里是必需的 —— 下面 _select_target / _publish_cam_point_tracked 都要对
+        # 候选列表求 max/min, 空列表会抛 ValueError.
+        if not cand:
+            return
+
         if not pickable:
             self._info_throttle(
                 '无可抓目标: %d 个候选全高于 pick_z_max %.3fm (疑为已放进托盘的盒子)'
@@ -722,11 +743,13 @@ class YoloBoxDetector(Node):
             # 通道反过来绑到 FK 上.
             self._publish_cam_point_tracked(cand, stamp)
             return
-        target = max(pickable, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]))
+        target, note = self._select_target(pickable)
+        if target is None:
+            return          # 跟丢: 本帧什么都不发, 宁缺勿错 (理由见 _select_target)
         if len(pickable) < len(cand):
             self._info_throttle(
-                '单目标选择: %d 候选中滤掉 %d 个 z>%.3fm 的(托盘已放盒)'
-                % (len(cand), len(cand) - len(pickable), self.pick_z_max))
+                '单目标选择: %d 候选中滤掉 %d 个 z>%.3fm 的(托盘已放盒), 锁定=%s'
+                % (len(cand), len(cand) - len(pickable), self.pick_z_max, note))
         if self.diag_yaw:
             self.get_logger().warn(
                 '[诊断选中] 候选=%d 选中 %s 中心像素(%d,%d) 轴对齐面积=%.0f yaw=%s'
@@ -767,14 +790,39 @@ class YoloBoxDetector(Node):
 
         self._publish_cam_point(target, stamp)
 
-        # 多目标数组: 所有有 base_link 坐标的盒子 (面积降序)
-        if self._poses_pub is not None:
-            arr = PoseArray()
-            arr.header.stamp = stamp
-            arr.header.frame_id = self.base_frame
-            arr.poses = [to_pose(r) for r in sorted(
-                cand, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]), reverse=True)]
-            self._poses_pub.publish(arr)
+    def _select_target(self, pickable):
+        """从可抓候选里选"当前抓取目标": 有锚点就跟锚点, 没锚点才按面积最大新起一轮.
+
+        返回 (target, 说明串); 跟丢时返回 (None, 原因) 让调用方本帧什么都不发.
+
+        为什么不能每帧按面积最大重选 (2026-07-30 实跑): 地面三个盒都在 pick_z_max 以下,
+        臂一悬到目标上方, 吸盘就把它遮掉一部分, 框面积缩小, 于是"最大框"换成了旁边那个盒
+        —— 目标在 ② 精修中途被静默换掉. 实测第三个盒两次失败: 雅可比健康(det -1.004/-0.977)、
+        第 1 步位移 22mm 且方向正确, 误差却从 28.7mm 跳到 82.6mm / 29.5mm 跳到 121.8mm.
+        同一个盒子走 22mm 不可能产生 90mm 的误差变化, 换目标是唯一解释.
+
+        锚点用 p_cam (相机系) 而不是 base_link: 后者过 FK 与手眼外参, 臂一动就漂 2~3cm,
+        拿它做帧间最近邻会把"自己动了"误判成"目标跳了". p_cam 只过深度与内参, 臂动它不跳
+        —— 这与 ② 精修改用相机系闭环是同一个理由.
+        锚点就是 _publish_cam_point 记下的上一帧发出值, 与 p_cam 通道共用一个, 于是
+        object_pose / object_class / object_thickness / p_cam 四路必然指向同一个盒.
+        """
+        now = self.get_clock().now().nanoseconds
+        has_anchor = (self._last_cam_pt is not None
+                      and now - self._last_cam_ns <= self.cam_track_timeout * 1e9)
+        if not has_anchor:
+            t = max(pickable, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]))
+            return t, '新锁定(面积最大)'
+        best = min(pickable, key=lambda r: float(
+            np.linalg.norm(np.asarray(r[6][5], float) - self._last_cam_pt)))
+        d = float(np.linalg.norm(np.asarray(best[6][5], float) - self._last_cam_pt))
+        if d > self.cam_track_max_jump:
+            self._info_throttle(
+                '目标跟丢: %d 个可抓候选里最近的也跳了 %.0fmm (>%.0fmm), 本帧不发 —— '
+                '宁缺勿错(发错目标会把 ② 引到别的盒上)'
+                % (len(pickable), d * 1000, self.cam_track_max_jump * 1000))
+            return None, '跟丢'
+        return best, '跟踪(跳 %.0fmm)' % (d * 1000)
 
     def _publish_cam_point_tracked(self, cand, stamp):
         """pick_z_max 全滤掉时选一个候选发 p_cam: 与上一帧发出的 p_cam 最近的那个.

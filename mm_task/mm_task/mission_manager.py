@@ -3,14 +3,18 @@
 mm_task / mission_manager — 顶层任务状态机 S0–S5 (架构 §7.2)
 
 只做"编排", 不重算几何: 导航交 lane_navigator, 抓取/卸货整段交 grasp_node 的
-/grasp/execute /grasp/unload (三段抓取 + 末段相对直插纪律都在 grasp_node 内).
+/grasp/execute /grasp/unload_tray (三段抓取 + 末段相对直插纪律都在 grasp_node 内).
 
 状态流 (worker 线程 run_mission):
-  S0 INIT    发 /initialpose (可配已知位姿) 给 AMCL 初值
+  S0 INIT    发 /initialpose 给 AMCL 初值 -> 等收敛 -> /grasp/reset_stack -> /grasp/ready
   S1 NAV     发 /go_to=<nav_target>, 等 /lane_navigator/status "<target>:SUCCEEDED"
   S2 ALIGN   ArUco 精对位 (本轮 no-op, 直接放行)
-  S3 DETECT  仅 action==grasp 时: 等 /perception/object_pose 新鲜 (age<1s)
-  S4 GRASP/UNLOAD  action 分派: grasp→/grasp/execute; unload→/grasp/unload; none→跳过
+  S3 DETECT  仅 action==grasp 时: 等 /perception/object_pose 新鲜且够得着
+  S4 GRASP/UNLOAD  action 分派:
+               grasp  -> S3a /grasp/look 读可抓数 -> 循环 detect+/grasp/execute 连抓
+                         (抓空或托盘满即收工) -> /grasp/ready 收身
+               unload -> 设参数 unload_tray=<tray> -> /grasp/unload_tray 整盘卸到地面
+               none   -> 仅导航
   S5 LOOP    取任务列表下一项回 S1; 跑完→DONE
 
 执行结构: MultiThreadedExecutor 主线程 spin; 订阅/服务客户端在 ReentrantCallbackGroup;
@@ -28,6 +32,8 @@ from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoS
 
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
+from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from tf2_ros import Buffer, TransformListener
 
@@ -67,13 +73,24 @@ class MissionManager(Node):
             String, '/lane_navigator/status', self.on_nav_status, 10,
             callback_group=cbg)
 
+        self._last_trigger_msg = ''  # 最近一次 call_trigger 的 resp.message
         self._last_obj = None        # (stamp_sec, PoseStamped)
         self.create_subscription(
             PoseStamped, '/perception/object_pose', self.on_object, 10,
             callback_group=cbg)
 
         self.grasp_cli = self.create_client(Trigger, '/grasp/execute', callback_group=cbg)
-        self.unload_cli = self.create_client(Trigger, '/grasp/unload', callback_group=cbg)
+        # 卸货走 /grasp/unload_tray 而不是老的 /grasp/unload: 后者靠视觉从托盘上重新识别盒,
+        # 而托盘上的盒高于感知端 pick_z_max 会被整批滤掉, 真机根本拿不到目标.
+        # unload_tray 不用视觉 —— 取盒目标就是当初放它时的吸盘位姿(grasp_node 的 placed_release_),
+        # 取放对称, 一次调用把该托盘上的盒全卸到地面两个卸货点.
+        self.unload_cli = self.create_client(Trigger, '/grasp/unload_tray', callback_group=cbg)
+        # 卸哪个托盘: Trigger 带不了数值, 由参数传 (grasp_node 用普通 declare_parameter, 可热设)
+        self.set_param_cli = self.create_client(
+            SetParameters, '/grasp_node/set_parameters', callback_group=cbg)
+        # S0 开工前清一次堆叠状态 + 残留碰撞体: 上一轮跑完 grasp_node 里还记着盒在托盘上,
+        # 不清则这一轮 TRAY_FULL 立刻触发, 且场景里的 placed_* 会挡住直下段.
+        self.reset_cli = self.create_client(Trigger, '/grasp/reset_stack', callback_group=cbg)
         # S0 底盘行进前摆臂 ready; grasp 任务识别前摆看货姿势 (ready+J1+90°, 供视觉看见)
         self.ready_cli = self.create_client(Trigger, '/grasp/ready', callback_group=cbg)
         self.look_cli = self.create_client(Trigger, '/grasp/look', callback_group=cbg)
@@ -102,6 +119,9 @@ class MissionManager(Node):
         self.t_detect = float(to.get('detect', 10.0))
         self.t_grasp = float(to.get('grasp', 150.0))
         self.t_localize = float(to.get('localize', 20.0))
+        # 单货架连抓上限: 只是防死循环的兜底, 正常终止靠 pickable=0 或 TRAY_FULL.
+        # 默认 4 = 一个货架最多放 4 个盒 (托盘总容量也是 4).
+        self.max_picks_per_shelf = int(cfg.get('max_picks_per_shelf', 4))
         self.tasks = cfg.get('tasks', [])
 
     # ---- 订阅回调 ----
@@ -121,30 +141,140 @@ class MissionManager(Node):
         for i, task in enumerate(self.tasks):
             target = task.get('nav_target')
             action = task.get('action', 'none')
+            tray = int(task.get('tray', 0))
             self.get_logger().info(
-                f'==== 任务 {i + 1}/{len(self.tasks)}: nav={target} action={action} ====')
-            if not self.run_task(target, action):
+                f'==== 任务 {i + 1}/{len(self.tasks)}: nav={target} action={action}'
+                f'{f" tray={tray}" if action == "unload" else ""} ====')
+            if not self.run_task(target, action, tray):
                 self.get_logger().error(f'任务 {i + 1} 失败, 任务序列中止')
                 return
         self.get_logger().info('==== 全部任务完成 DONE ====')
 
-    def run_task(self, target, action):
+    def run_task(self, target, action, tray):
         if not self.stage_nav(target):
             return False
         self.stage_align(target)
         if action == 'grasp':
-            if not self.stage_look():
-                return False
-            if not self.stage_detect():
-                return False
-            return self.stage_grasp(self.grasp_cli, '/grasp/execute')
+            return self.stage_grasp_shelf()
         if action == 'unload':
-            return self.stage_grasp(self.unload_cli, '/grasp/unload')
+            return self.stage_unload_tray(tray)
         if action == 'none':
             self.get_logger().info('action=none: 仅导航, 跳过抓取')
             return True
         self.get_logger().error(f'未知 action="{action}"')
         return False
+
+    # ---- S4 卸货: 把一个托盘整盘卸到地面 ----
+    # 空盘不算失败: 一条 mission 里两个盘各一条卸货任务, 而这一轮装了几个盘取决于货架上
+    # 有几个盒 —— 只装了右盘时左盘那条任务照样会跑到, 它该跳过而不是把整条序列判失败.
+    def stage_unload_tray(self, tray):
+        self.get_logger().info(f'==== S4 卸 {tray} 号托盘 ====')
+        if not self.set_unload_tray(tray):
+            return False
+        ok, msg = self.stage_grasp_msg(self.unload_cli, '/grasp/unload_tray')
+        if not ok and '空的' in msg:
+            self.get_logger().info(f'{tray} 号托盘本轮没装货, 跳过卸货')
+            return True
+        return ok
+
+    def set_unload_tray(self, tray):
+        if not self.set_param_cli.wait_for_service(timeout_sec=5.0):
+            self.get_logger().error('/grasp_node/set_parameters 不可用')
+            return False
+        req = SetParameters.Request()
+        req.parameters = [Parameter(
+            name='unload_tray',
+            value=ParameterValue(type=ParameterType.PARAMETER_INTEGER, integer_value=int(tray)))]
+        future = self.set_param_cli.call_async(req)
+        deadline = self.now() + 10.0
+        while rclpy.ok() and self.now() < deadline:
+            if future.done():
+                results = future.result().results
+                if results and results[0].successful:
+                    return True
+                reason = results[0].reason if results else 'no result'
+                self.get_logger().error(f'设 unload_tray={tray} 失败: {reason}')
+                return False
+            self.sleep(0.1)
+        self.get_logger().error(f'设 unload_tray={tray} 超时')
+        return False
+
+    # ---- S3/S4 同一货架连抓 (2026-07-31 加) ----
+    # 一个货架上有 1~4 个盒, 具体几个只有识别了才知道, 故不能在 mission.yaml 里按盒数写死
+    # 几条 grasp 任务. 循环 detect->execute 直到两个终止条件之一:
+    #   ① pickable 归 0 —— 这个货架抓空了;
+    #   ② 托盘装满 (execute 返回 TRAY_FULL) —— 该去卸货了, 不是故障.
+    # 两者都算本任务成功, 后续的卸货任务照常跑; 只有真故障(规划/执行失败)才中止整条序列.
+    #
+    # 循环体只有 detect+execute, 不重跑 S1 导航与 S3a look: 车没动, 且 grasp_node 的
+    # /grasp/execute 收尾已经把臂停在 look 位 (2026-07-31 改), 下一轮直接就能识别.
+    # 离开货架前才显式调 /grasp/ready —— 臂收回身前底盘才好走, 而这是"要不要走"这件事,
+    # 只有状态机知道.
+    def stage_grasp_shelf(self):
+        if not self.stage_look():
+            return False
+        n = self._pickable_from(self._last_trigger_msg)
+        if n == 0:
+            self.get_logger().warn('S3a look 报可抓 0 个: 这个货架没有可抓的盒, 跳过抓取')
+            return self.leave_shelf()
+        self.get_logger().info(f'==== 本货架识别到 {n} 个可抓盒, 开始连抓 ====')
+
+        picked = 0
+        for _ in range(self.max_picks_per_shelf):
+            if not self.stage_detect():
+                # 识别不到新鲜可达帧: 上一轮已抓空是最常见的原因 (execute 报的 pickable 已归 0
+                # 时压根不会走到这里, 但感知侧偶发丢帧也会落到这条). 抓过至少一个就算这个货架
+                # 做完了, 一个都没抓到才是真失败.
+                if picked > 0:
+                    self.get_logger().info(f'S3 没有更多可抓盒, 本货架收工 (已抓 {picked} 个)')
+                    break
+                return False
+            ok, msg = self.stage_grasp_msg(self.grasp_cli, '/grasp/execute')
+            if not ok:
+                if 'TRAY_FULL' in msg:
+                    self.get_logger().warn(
+                        f'S4 托盘已满, 停止本货架抓取 (已抓 {picked} 个), 去卸货: {msg}')
+                    break
+                return False
+            picked += 1
+            left = self._pickable_from(msg)
+            free_slots = self._tray_free_from(msg)
+            self.get_logger().info(
+                f'S4 本货架已抓 {picked} 个, 还剩 {left} 个可抓, 托盘余位 {free_slots}')
+            if left == 0:
+                self.get_logger().info(f'本货架抓空 (共 {picked} 个)')
+                break
+            if free_slots == 0:
+                self.get_logger().warn(f'托盘已无余位 (已抓 {picked} 个), 去卸货')
+                break
+        else:
+            self.get_logger().warn(
+                f'达到单货架抓取上限 {self.max_picks_per_shelf}, 停止本货架')
+        return self.leave_shelf()
+
+    # 离开货架前把臂摆回 ready: 底盘不拖着伸出的臂走. grasp_node 的 execute 收尾停在 look,
+    # 那是为了下一轮少走一趟空行程, 收身这件事由状态机在真要走时才做.
+    def leave_shelf(self):
+        self.get_logger().info('==== 离开货架前摆臂回 ready ====')
+        if not self.call_trigger(self.ready_cli, '/grasp/ready', 30.0):
+            self.get_logger().error('离开货架前回 ready 失败, 任务中止 (底盘不能拖着伸出的臂走)')
+            return False
+        return True
+
+    # grasp_node 在 /grasp/look 与 /grasp/execute 的 message 里带 "pickable=N, tray_free=M".
+    # 解析不出(老版本 grasp_node / 消息格式变了)返回 -1: 调用方按"未知"处理而不是按 0 ——
+    # 报 0 会让循环立刻收工, 明明还有盒没抓.
+    @staticmethod
+    def _parse_kv_int(msg, key):
+        import re
+        m = re.search(rf'{key}=(-?\d+)', msg or '')
+        return int(m.group(1)) if m else -1
+
+    def _pickable_from(self, msg):
+        return self._parse_kv_int(msg, 'pickable')
+
+    def _tray_free_from(self, msg):
+        return self._parse_kv_int(msg, 'tray_free')
 
     # ---- S0 INIT ----
     def stage_init(self):
@@ -167,6 +297,12 @@ class MissionManager(Node):
         self.get_logger().info('S0 循环补发 /initialpose 并等 AMCL 收敛 ...')
         if not self.wait_for_localization(msg):
             return False
+        # 清 grasp_node 的堆叠状态与残留 placed_* 碰撞体: 不清则上一轮记的"盒还在托盘上"
+        # 会让本轮一开抓就 TRAY_FULL, 场景里的残留碰撞体还会挡住放置直下段.
+        # 失败不中止: 首次启动本来就是干净的, reset 只是保险 (服务没起也不该拦住整条任务).
+        self.get_logger().info('S0 清抓取堆叠状态 (/grasp/reset_stack)')
+        if not self.call_trigger(self.reset_cli, '/grasp/reset_stack', 15.0):
+            self.get_logger().warn('S0 reset_stack 失败, 继续 (若上一轮有残留可能影响放置)')
         # 底盘行进前先把机械臂摆回 ready 位 (臂收身前, 底盘不拖着伸出的臂走)
         self.get_logger().info('S0 定位就绪, 底盘行进前摆臂回 ready')
         if not self.call_trigger(self.ready_cli, '/grasp/ready', 30.0):
@@ -247,11 +383,13 @@ class MissionManager(Node):
         return False
 
     # ---- S4 GRASP / UNLOAD ----
-    def stage_grasp(self, cli, name):
+    # 返回 (success, message): 同货架连抓要从 message 里读 "pickable=N, tray_free=M" 和
+    # TRAY_FULL 标记, 光一个 bool 分不出"托盘满了该去卸货"和"规划失败"这两种 success=false.
+    def stage_grasp_msg(self, cli, name):
         self.get_logger().info(f'==== S4 调 {name} ====')
         if not cli.wait_for_service(timeout_sec=5.0):
             self.get_logger().error(f'S4 服务不可用: {name}')
-            return False
+            return False, ''
         future = cli.call_async(Trigger.Request())
         deadline = self.now() + self.t_grasp
         while rclpy.ok() and self.now() < deadline:
@@ -259,16 +397,17 @@ class MissionManager(Node):
                 resp = future.result()
                 if resp.success:
                     self.get_logger().info(f'S4 {name} 成功: {resp.message}')
-                    return True
-                self.get_logger().error(f'S4 {name} 失败: {resp.message}')
-                return False
+                else:
+                    self.get_logger().error(f'S4 {name} 失败: {resp.message}')
+                return resp.success, resp.message
             self.sleep(0.1)
         self.get_logger().error(f'S4 {name} 超时 ({self.t_grasp:.0f}s)')
-        return False
+        return False, ''
 
     # 通用 Trigger 服务调用 (worker 线程阻塞轮询 future, 响应由主线程 executor 处理).
     # 用于 /grasp/ready 与 /grasp/look 这类"发一次等一次"的臂姿服务.
     def call_trigger(self, cli, name, timeout):
+        self._last_trigger_msg = ''
         if not cli.wait_for_service(timeout_sec=5.0):
             self.get_logger().error(f'{name} 服务不可用')
             return False
@@ -277,6 +416,8 @@ class MissionManager(Node):
         while rclpy.ok() and self.now() < deadline:
             if future.done():
                 resp = future.result()
+                # /grasp/look 的 message 里带 "pickable=N, tray_free=M", stage_grasp_shelf 要读
+                self._last_trigger_msg = resp.message
                 if resp.success:
                     self.get_logger().info(f'{name} 成功: {resp.message}')
                 else:

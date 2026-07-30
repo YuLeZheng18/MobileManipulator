@@ -7,17 +7,15 @@
   <maintainer email="a2715187136@qq.com">fishros</maintainer>
   <license>MIT</license>
 
+  <!-- mission_manager 只做编排: 发话题 / 调 Trigger 服务 / 设参数 / 查 TF.
+       几何与运动规划全在 mm_grasp 的 C++ grasp_node 里, 故不依赖 moveit/pymoveit2;
+       导航也只发 /go_to 给 lane_navigator, 不直接调 Nav2 action. -->
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>std_srvs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
-  <exec_depend>nav2_msgs</exec_depend>
-  <exec_depend>nav2_simple_commander</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
-  <exec_depend>moveit_msgs</exec_depend>
-  <exec_depend>std_msgs</exec_depend>
-  <exec_depend>std_srvs</exec_depend>
-  <exec_depend>pymoveit2</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

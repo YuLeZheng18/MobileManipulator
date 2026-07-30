@@ -1,0 +1,24 @@
+# ===== mm_task 真机任务列表 (仿真用 mission.yaml) =====
+# 用法: ros2 launch mm_task mission.launch.py use_sim_time:=false \
+#         mission_file:=$(ros2 pkg prefix mm_task)/share/mm_task/config/mission_real.yaml
+# (real_bringup/dev_bringup 的 run_mission:=true 走默认 mission.yaml, 真机需显式传本文件.)
+#
+# 字段含义与 mission.yaml 相同, 这里只记与仿真不同的取值理由.
+#
+# initial_pose: 真机在场地里的开机位姿, **必须按现场重标** —— 下面是占位的原点值.
+#   标法: 手推车到起点, RViz 里 2D Pose Estimate 拖到位, 读 /amcl_pose 填进来.
+# timeouts: grasp 从 150 抬到 240 —— 真机一条 grasp 任务内部要连抓多个盒 (每盒 ①粗定位
+#   ②相机系精修闭环 ③下插 + 放托盘, 单盒几十秒), 而 unload_tray 一次调用要卸完整盘 2 个盒.
+#   超时是按"一次服务调用"算的, 不是整条任务.
+# nav 从 120 抬到 180: 真机 MPPI 遇障要绕, 比仿真慢.
+
+initial_pose: { x: 0.0, y: 0.0, yaw: 0.0 }   # TODO 现场重标 (读 /amcl_pose)
+
+timeouts: { localize: 30.0, nav: 180.0, detect: 15.0, grasp: 240.0 }
+
+max_picks_per_shelf: 4
+
+tasks:
+  - { nav_target: p2, action: grasp }               # 货架前连抓, 抓空或两盘装满即走
+  - { nav_target: p4, action: unload, tray: 0 }     # 卸 0 号(右)托盘: 类别 3/4 的盒
+  - { nav_target: p4, action: unload, tray: 1 }     # 卸 1 号(左)托盘: 类别 1/2 的盒
