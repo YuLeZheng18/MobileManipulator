@@ -40,6 +40,9 @@
 """
 import numpy as np
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.duration import Duration
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
@@ -147,6 +150,17 @@ class YoloBoxDetector(Node):
         # 帧间隔约 0.09s, ② 精修期间盒在相机系每帧移动 < 5mm, 故 0.10m 门限很宽松.
         self.declare_parameter('cam_track_timeout', 2.0)
         self.declare_parameter('cam_track_max_jump', 0.10)
+        # 查 TF 时按**图像时间戳**取变换, 而不是取"最新可用". 等这么多秒让 /tf 补齐到该
+        # 时刻; 等不到则本帧不发 base_link 位姿 (p_cam 照发, 它不过 TF).
+        # 2026-07-30 加. 症状: 臂在动时同一个静止盒子的 base_link 坐标阶梯式滑动 —— 实测
+        # 像素(371,196)/深度 0.373m/相机系[0.373,0.034,-0.050] 帧帧不动, 而 base_link 从
+        # (-0.326,-0.069) 滑到 (-0.116,-0.292), yaw -88.5°->-28.5°, 共 21cm.
+        # 根因: 图像有相机曝光->NCNN 推理的整段延迟, 而 TF 取的是**当前**时刻 —— 图像姿态
+        # 与 TF 姿态错配. 滑动呈阶梯状(每个 /tf 消息一个台阶, 单台阶稳定 3~20 帧), 于是
+        # grasp_node 的 3 帧一致性门被逐台阶骗过: 实测取到 (-0.140,-0.283) 散布 0.2mm 判"稳定",
+        # ① 据此开到空处 (真值 (0.041,-0.296), 差 18cm).
+        # 时间对齐后, 静止盒子在臂运动中也给出恒定 base_link 坐标, 错配帧根本不会被发布.
+        self.declare_parameter('tf_wait_sec', 0.15)
 
         # 逐帧打印 OBB 原始参数与选中目标, 用于定位 yaw 跳变来源 (只打印不改行为).
         self.declare_parameter('diag_yaw', False)
@@ -183,6 +197,7 @@ class YoloBoxDetector(Node):
         self.save_frame_path = str(gp('save_frame_path').value)
         self.cam_track_timeout = float(gp('cam_track_timeout').value)
         self.cam_track_max_jump = float(gp('cam_track_max_jump').value)
+        self.tf_wait_sec = float(gp('tf_wait_sec').value)
         self._last_cam_pt = None        # 上一帧发出的 p_cam (numpy 3,), 多候选跟踪锚点
         self._last_cam_ns = 0
 
@@ -224,17 +239,35 @@ class YoloBoxDetector(Node):
                               durability=DurabilityPolicy.VOLATILE,
                               history=HistoryPolicy.KEEP_LAST, depth=1)
 
+        # 图像回调单独一个互斥组: 与 TF listener 的 Reentrant 组分处不同线程, 推理那 0.25s
+        # 里 /tf 照常被处理 (见下方 TF 段注释). 互斥而非 Reentrant: 彩色/深度回调共享
+        # self._latest_depth, 且不需要一帧未跑完就进下一帧.
+        img_group = MutuallyExclusiveCallbackGroup()
         self._info_sub = self.create_subscription(
-            CameraInfo, gp('camera_info_topic').value, self._on_info, info_qos)
-        self.create_subscription(Image, gp('depth_topic').value, self._on_depth, depth_qos)
-        self.create_subscription(Image, gp('color_topic').value, self._on_color, depth_qos)
+            CameraInfo, gp('camera_info_topic').value, self._on_info, info_qos,
+            callback_group=img_group)
+        self.create_subscription(Image, gp('depth_topic').value, self._on_depth, depth_qos,
+                                 callback_group=img_group)
+        self.create_subscription(Image, gp('color_topic').value, self._on_color, depth_qos,
+                                 callback_group=img_group)
         # raw 模式: 额外订阅深度内参 (反投影/yaw 用有效 K, 不用坏掉的彩色 K)
         self._depth_info_sub = None
         if self.use_raw_depth:
             self._depth_info_sub = self.create_subscription(
-                CameraInfo, gp('depth_info_topic').value, self._on_depth_info, info_qos)
+                CameraInfo, gp('depth_info_topic').value, self._on_depth_info, info_qos,
+                callback_group=img_group)
 
         # ---- TF ----
+        # TransformListener 内部把 /tf /tf_static 订阅放进自己的 ReentrantCallbackGroup,
+        # 配合 main() 的 MultiThreadedExecutor, /tf 就能与彩色回调并发处理 —— 这是时刻对齐
+        # 能成立的前提, 不是优化: 一次 NCNN 推理约 0.25s, 单线程执行器下 /tf 全积压,
+        # 实测 buffer 最新数据恒落后图像时刻 5.46s, 按图像 stamp 查 100% 报
+        # "extrapolation into the future" (同期独立进程读同一 /tf 只滞后 0.005s, 证明是本
+        # 节点饿死而非 /tf 发得晚). 这个饿死也正是"静止盒子 base_link 阶梯式滑动"的真身:
+        # 每个台阶就是积压的一条 /tf 终于被处理.
+        # ⚠️ 不要改用 TransformListener(spin_thread=True): 它把**同一个 node** 加进第二个
+        # SingleThreadedExecutor, 而 main 里 rclpy.spin(node) 已经占了 node, 二者只有一个
+        # 生效, 仍是单线程 (2026-07-30 实测这么改后失败率仍 100%).
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
@@ -358,7 +391,8 @@ class YoloBoxDetector(Node):
         if self.only_largest and dets:
             dets = [max(dets, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))]
 
-        R, t = self._lookup_base_tf()            # 一帧查一次 TF, 复用给各框
+        # 一帧查一次 TF, 复用给各框. 按**本帧图像时间戳**取, 保证 TF 与图像同时刻.
+        R, t = self._lookup_base_tf(msg.header.stamp)
         self._R_bc, self._t_bc = R, t            # 存给可视化画坐标系 (base<-cam)
         results = []
         for (x1, y1, x2, y2, name, cf, axis, corners, center) in dets:
@@ -556,11 +590,21 @@ class YoloBoxDetector(Node):
             return None
         return t + s * dir_base
 
-    def _lookup_base_tf(self):
-        """查 TF camera_frame -> base_frame, 返回 (R, t). 查不到返回 (None, None)."""
+    def _lookup_base_tf(self, stamp=None):
+        """查 TF camera_frame -> base_frame, 返回 (R, t). 查不到返回 (None, None).
+
+        stamp: 本帧图像的时间戳. 给了就按该时刻取变换 (等 tf_wait_sec 让 /tf 补齐),
+        使 TF 与图像同时刻 —— 否则臂运动时"当前 TF × 旧图像"会把静止盒子算成在滑
+        (见 tf_wait_sec 声明处实测). 取不到宁可本帧不发, 不发错坐标.
+        """
         try:
-            tf = self._tf_buffer.lookup_transform(
-                self.base_frame, self.camera_frame, rclpy.time.Time())
+            if stamp is not None:
+                tf = self._tf_buffer.lookup_transform(
+                    self.base_frame, self.camera_frame, stamp,
+                    timeout=Duration(seconds=self.tf_wait_sec))
+            else:
+                tf = self._tf_buffer.lookup_transform(
+                    self.base_frame, self.camera_frame, rclpy.time.Time())
         except Exception as e:  # noqa: BLE001
             self._warn_throttle('查 TF %s->%s 失败: %s'
                                 % (self.base_frame, self.camera_frame, e))
@@ -887,8 +931,12 @@ class YoloBoxDetector(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = YoloBoxDetector()
+    # 多线程: /tf 与图像回调分处不同回调组, 推理那 0.25s 里 /tf 照常被处理.
+    # 单线程下 tf buffer 恒落后图像 5.46s, 按图像 stamp 查 TF 必失败 (见构造函数 TF 段).
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

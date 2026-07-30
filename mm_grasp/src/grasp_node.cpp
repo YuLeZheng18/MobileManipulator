@@ -118,7 +118,9 @@ public:
     release_duration_ = getOrDeclare<double>("release_duration", 3.0);
     // 末段下插降速倍率: 实测下降段抖动. 降速让每个轨迹点的关节增量变小, 抖动幅度随之变小.
     // 这是压制不是根治(根因待查: 疑在笛卡尔路径的时间参数化/该构型雅可比条件数).
-    insert_velocity_scaling_ = node_->declare_parameter<double>("insert_velocity_scaling", 0.3);
+    // 2026-07-30: 0.3 -> 0.4 (用户要求各段一律全速 0.4, 去掉这段单独的慢档).
+    // ⚠️ 抖动若复现就退回 0.3: 这一段正是吸取瞬间, 抖动直接决定吸不吸得上.
+    insert_velocity_scaling_ = node_->declare_parameter<double>("insert_velocity_scaling", 0.4);
     // 全局规划降速倍率 (原来写死 0.2). 抬到 0.4: 前面几轮 0.2 下各段都稳, 抓取/放置路径
     // 也已实跑验证过, 没必要一直按最初的试探速度爬.
     plan_velocity_scaling_ = node_->declare_parameter<double>("plan_velocity_scaling", 0.4);
@@ -145,10 +147,10 @@ public:
     // 选 0.30: 远高于托盘已放盒顶 (~0.10), 且在臂可达包络内. 直下段变长但纯垂直, 不慢.
     // getOrDeclare: yaml 写了 transit_z 会触发 auto-declare, 裸 declare_parameter 撞崩.
     transit_z_ = getOrDeclare<double>("transit_z", 0.30);
-    // 笛卡尔"斜切进位"的低空航点 z: 走纯笛卡尔时抬到这个高度就横切过去, 不上 transit_z_.
-    // 为什么单独一个参数而不是直接调小 transit_z_: transit_z_ 那条 plan() 路径在 0.20 已
-    // 实测跑通四轮, 留作笛卡尔覆盖不足时的回落路, 值不动.
-    transit_cart_z_ = getOrDeclare<double>("transit_cart_z", 0.14);
+    // (原 transit_cart_z 已删: 那条"抬到低空 0.14 再纯笛卡尔横切入位"的抄近道 8/8 轮覆盖
+    //  只有 9~13%, 即离开起点就断 —— 保持工具朝向横切那条直线上大半没有 IK 解, 是可达性
+    //  问题, 不是被碰撞体挡的. 且盒 attach 时 touch_links 含托盘, 低空蹭围栏侧壁规划器不报
+    //  执行不停, 只能靠人看. 收益为零而有无声风险, 整条删掉, 放置统一走高空 transit_z_.)
 
     // ---- 手动 jog (标定用): /grasp/jog 每次相对当前 TCP 走 (jog_dx,dy,dz) 一步 ----
     // 标定 cam_target 的操作手段: coarse_only 开到 12cm 后, 设这三个参数再 call /grasp/jog
@@ -1624,6 +1626,15 @@ private:
       RCLCPP_ERROR(logger_, "看货姿势规划失败"); return false;
     }
     if (move_group_->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) return false;
+    // 必须等停稳才返回: 感知端每帧用**当前** TF 把相机系点转到 base_link, 臂没停稳时
+    // 同一个静止盒子的 base_link 坐标会随 FK 一起滑. 2026-07-30 实测 (run_cycle.sh 背靠背
+    // 调 look->execute): 类别1 盒的像素(523,193)/深度 0.368m/相机系[0.368,0.036,0.081] 三者
+    // 帧帧不动, 而 base_link 在 0.8s 内从 (-0.333,-0.021) 滑到 (-0.285,-0.165), 共 145mm,
+    // yaw -72°->-43°. waitObject 的排空+4 次重采(~1.4s)全落在这个窗口里, 一致性门 4 次
+    // 全拦, execute 报 "无 object_pose" 中止.
+    // 其它每一段(①/笛卡尔步进/转腕/放置各段)执行后都调 settle(), look 原先是唯一漏的.
+    // 手动一步步调时中间有人为间隔, 所以一直没暴露.
+    settle();
     RCLCPP_INFO(logger_, "已到看货姿势 (ready %s%+.0f°)", j1_name_.c_str(),
                 look_j1_offset_ * 180.0 / M_PI);
     return true;
@@ -1690,35 +1701,13 @@ private:
   //
   // tray: 本次落盘的托盘号. 直下段前临时移出该托盘已落盒 (它们正是本层落点, 当障碍会挡住
   // 直下), 段后加回; 别的托盘已落盒全程留在场景当障碍, 防规划器横扫 (2026-07-28 蹭飞事故).
-  // 斜切进位: 一条纯笛卡尔路径从当前(已抬起)位姿走到释放位姿, 中间只过一个低空航点.
-  // 相对 plan() 到 transit_z_ 高空那条路的差别: 笛卡尔路径几何上确定(直线+slerp), 不会像
-  // OMPL 那样在关节空间随机采样绕出一个高包 —— 实测同样 transit_z_=0.20, 一轮 39 点另一轮
-  // 70 点, 中间抬多高全凭采样运气.
-  // 返回: 1=已执行成功, 0=覆盖不足(调用方回落到 plan() 那条路), -1=执行失败.
   //
-  // ⚠️ 盒 attach 时 touch_links 含 tray_frame_, 即盒与托盘的碰撞检测全程豁免. 低空横切
-  // 蹭到围栏侧壁, 规划器不报、执行不停, 只能靠人看. 余量由 transit_cart_z_ 兜.
-  int placeCartesian(const geometry_msgs::msg::Pose & target, const char * what)
-  {
-    geometry_msgs::msg::Pose over = target;
-    over.position.z = transit_cart_z_;
-    std::vector<geometry_msgs::msg::Pose> wps{over, target};
-    moveit_msgs::msg::RobotTrajectory traj;
-    move_group_->setStartStateToCurrentState();
-    const double frac = move_group_->computeCartesianPath(wps, 0.005, 0.0, traj);
-    if (frac < 0.9) {
-      RCLCPP_WARN(logger_, "放置(%s): 斜切笛卡尔覆盖 %.0f%% (低空 z=%.3f), 回落到高空 plan()",
-                  what, frac * 100, transit_cart_z_);
-      return 0;
-    }
-    RCLCPP_INFO(logger_, "放置(%s): 斜切笛卡尔覆盖 %.0f%%, 经低空 z=%.3f 直接入位, 轨迹 %zu 点",
-                what, frac * 100, transit_cart_z_,
-                traj.joint_trajectory.points.size());
-    if (move_group_->execute(traj) != moveit::core::MoveItErrorCode::SUCCESS) return -1;
-    settle();
-    return 1;
-  }
-
+  // (原先这里还有一条 placeCartesian "斜切进位" 抄近道: 抬到低空 0.14 再一条纯笛卡尔直线
+  //  横切入位, 想治 OMPL 随机采样绕高包. 2026-07-30 删: 8/8 轮笛卡尔覆盖只有 9~13%, 即
+  //  刚离开起点就断 —— 保持工具朝向横切那条直线上大半位姿没有 IK 解, 是可达性问题, 不是
+  //  被碰撞体挡的, 抬高到 0.20 也已逼近 transit_z_ 没有意义. 且盒 attach 时 touch_links
+  //  含 tray_frame_, 盒与托盘碰撞全程豁免, 低空横切蹭围栏侧壁规划器不报、执行不停, 只能
+  //  靠人看. 零收益 + 无声风险, 故放置统一走下面的高空 transit_z_ 一条路.)
   bool placeAtPose(const geometry_msgs::msg::Pose & target, const char * what, int tray)
   {
     // 四步渐进安全测试: 放置段整体降速(默认 0.2, place_velocity_scaling 再乘一档),
@@ -1753,23 +1742,6 @@ private:
     // (2026-07-29 实测 0号托盘第2层 plan() failed). 本盘已放盒是落点不是障碍, 整个放置段
     // 都不该当障碍; 别盘的留着当障碍. 中途任何失败返回前必须 showTrayBoxes 加回.
     hideTrayBoxes(tray);
-
-    // 先试斜切笛卡尔进位 (低空 transit_cart_z_ 横切 -> 直接入位): 几何确定, 不会像 OMPL
-    // 那样随机采样绕出高包. 覆盖不足则回落到下面的高空 plan() 路 (那条已实跑四轮).
-    // dry_run 不走这条: 前面抬起段没真执行, 起点仍在原处, 覆盖必然 0%, 徒增噪声.
-    if (!dry_run_) {
-      const int cart = placeCartesian(target, what);
-      if (cart < 0) { showTrayBoxes(tray); restorePlanScaling(); return false; }
-      if (cart > 0) {
-        releasePulse();
-        detachBox();
-        showTrayBoxes(tray);
-        restorePlanScaling();
-        RCLCPP_INFO(logger_, "放置(%s): 斜切入位到 (%.3f,%.3f,%.3f), 已释放并关阀", what,
-                    target.position.x, target.position.y, target.position.z);
-        return true;
-      }
-    }
 
     // 规划到高空 transit 航点 (xy+朝向用标定值, z = transit_z_ 绝对高度): 两端都在
     // 自由空间, 规划器不用钻障碍缝, 失败率≈0. 之后纯垂直直下到 target.
@@ -1887,9 +1859,12 @@ private:
   }
 
   // ---- 工具 ----
-  // 等一个**可信**的 object_pose: 先排空视觉管线, 再要求连采几帧彼此一致才采信.
-  // 不能只抓"第一帧新鲜的": 摆臂刚停那刻管线里积压的是运动中拍的画面, 感知端却用当前 TF
-  // 转到 base_link, 于是坐标整体偏掉 (见 object_flush_sec_ 声明处实测数据).
+  // 等一个**可信**的 object_pose: 要求连采几帧彼此一致才采信 (可选先排空视觉管线).
+  // 原先必须排空: 摆臂刚停那刻管线里积压的是运动中拍的画面, 而感知端用**当前** TF 把它转到
+  // base_link -> 图像姿态与 TF 姿态错配, 坐标整体偏掉.
+  // 2026-07-30 起感知端按**图像自己的 stamp** 查 TF, 陈旧帧配同时刻 TF, 坐标照样正确 ->
+  // 错配从根上没了, object_flush_sec 已置 0 (仍留参数, 需要时可再打开).
+  // 帧间一致性门保留: 它是真判据, 不依赖排空.
   // 全败则返回 false 让上层中止 —— 此刻还没吸盒子, 臂停在 look 位, 中止是安全的.
   bool waitObject(geometry_msgs::msg::PoseStamped & out, double timeout_s)
   {
@@ -2089,7 +2064,7 @@ private:
   rclcpp::Node::SharedPtr node_;
   rclcpp::Logger logger_;
   std::string planning_group_, ee_link_, base_frame_, tray_frame_, object_topic_, pump_topic_;
-  double pregrasp_height_, lift_height_, tray_clearance_, transit_z_, transit_cart_z_;
+  double pregrasp_height_, lift_height_, tray_clearance_, transit_z_;
   double jog_dx_, jog_dy_, jog_dz_, jog_dyaw_deg_;
   double insert_stroke_min_, insert_stroke_max_, ground_z_, insert_shortfall_;
   double suck_duration_, release_duration_, insert_velocity_scaling_;
