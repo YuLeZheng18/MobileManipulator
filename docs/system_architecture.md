@@ -227,10 +227,16 @@ mm_task: goToPose(目标货架) → 放下 → 循环
 
 **阶段 B — 传感器驱动**
 ```
-3. rplidar_ros        → /scan
-4. RGB 相机驱动        → /camera/color/image_raw + /camera/color/camera_info
-5. 深度相机驱动        → /camera/depth/...(点云,eye-in-hand 抓取用)
-   (车体 ArUco 相机 Link_13 若独立,在此一并启动)
+3. rplidar_ros        → /scan (frame Link_12)
+4. 车体两路 USB 相机 (mm_perception/cameras.launch.py):
+     cam_a (Link_13, ArUco) / cam_b (Link_14, 监视), 均装反 -> image_rotator 转正
+     -> /cam_x/image_rot(+ compressed 供本机跨网监视)
+5. 手眼深度相机 D435i (Link_30, 同上 launch): realsense2_camera
+     ⚠️ align_depth.enable:=true 必须启动时开 —— yolo_box_detector 吃
+        /camera/camera/aligned_depth_to_color/image_raw, 靠它把彩色框像素直接查深度;
+        不开则只有未对齐的 depth/image_rect_raw, 彩色框落不到深度上, 检测拿不到 z.
+        (驱动按启动配置建 pipeline, 事后 ros2 param set 改不了.)
+     pointcloud.enable:=false —— 点云既不过网也不在机上白算.
 ```
 
 **阶段 C — 状态估计 + 机器人描述**
@@ -259,42 +265,103 @@ mm_task: goToPose(目标货架) → 放下 → 循环
 **阶段 F — 感知 + 任务**
 ```
 15. mm_perception:
-      object_detector    → /perception/object_pose(盒子顶面中心 xyz+yaw)
+      yolo_box_detector  → /perception/object_pose(盒顶中心 xyz+yaw)
+                         + /object_poses(可抓盒数组, 长度=剩余可抓数)
+                         + /object_point_cam(相机系, ②精修闭环追它)
+                         + /object_axis_angle(长轴图像角, 朝向对齐判据)
+                         + /object_class + /object_thickness
+        必须走它自己的 launch (要把 yaml 里的相对模型名拼成 share 绝对路径), 别裸 ros2 run
       aruco_localizer    → 广播 aruco_<id> TF
 15b. mm_grasp:
-      servo_node (moveit_servo) + grasp_node
-      → 服务 /grasp/execute 触发三段抓取(粗定位/精修伺服/末段直插)
-16. mm_task 状态机         最后启动,调度以上全部(调 /grasp/execute)
+      servo_node + grasp_node
+      → /grasp/execute 一轮抓放, /grasp/look 摆看货姿势并回报可抓数,
+        /grasp/ready 收身, /grasp/unload_tray 整盘卸货, /grasp/reset_stack 清堆叠状态
+      (servo_node 仍起着但抓取主链路已不用它, 见 interface_contract §5 实机修正①)
+16. mm_task 状态机         最后启动,调度以上全部
 ```
+
+一条命令起完(整机自主):
+```
+ros2 launch mm_bringup real_bringup.launch.py use_cameras:=true use_perception:=true \
+    run_mission:=true mission_file:=<mm_task share>/config/mission_real.yaml
+```
+三个开关连带: `use_cameras` 出图 → `use_perception` 出位姿 → `run_mission` 串流程,少一个抓取跑不了。
 
 ### 7.2 状态机运行流程
 
 ```
 [S0 初始化定位]
-  aruco_localizer 识别车体相机看到的 ArUco
-  → 沿 TF 树 aruco→base_footprint + 预写死 map→aruco → 反推 map→base_footprint
-  → 发 /initialpose 给 AMCL → 收敛,此后 map→odom 由 AMCL 持续维护
+  发 /initialpose (mission.yaml 里配的已知位姿) 给 AMCL
+  → 循环补发并等 map->base_link 出现才放行 (AMCL 的 /initialpose 订阅是 VOLATILE,
+    建 publisher 后立即连发会赶在发现完成前被丢; 且没等收敛就进 S1 会被 lane_navigator
+    判 None -> 整轮误判 FAILED)
+  → 调 /grasp/reset_stack 清抓取堆叠状态与残留碰撞体 (上一轮记的"盒还在托盘上"会让
+    本轮一开抓就 TRAY_FULL; 残留 placed_* 还会挡住放置直下段)
+  → 调 /grasp/ready: 底盘行进前先收身, 不拖着伸出的臂走
+  (原设计走 ArUco 反推初值: aruco→base_footprint + 预写死 map→aruco → 反推 map→base_footprint.
+   当前是配置已知位姿的简化版, ArUco 那条路留待 S2 精对位一起做.)
 
 [S1 导航到货架]
   mm_task 调 lane_navigator → Dijkstra 出路网路径 → 拆成 spin + follow_path 逐段执行
   → MPPI 读 /odom + /scan 发 /cmd_vel → ESP32 → 底盘运动,中途 MPPI 实时避障(vy 横移)
 
-[S2 到点精对位]
-  车体 ArUco 相机看货架标记 → 算相对位姿 → 底盘伺服微调 /cmd_vel 对准(替代开环,防漂移)
+[S2 到点精对位]  ⚠️ 当前是 no-op 直接放行, 待做
+  设计: 车体 ArUco 相机看货架标记 → 算相对位姿 → 底盘伺服微调 /cmd_vel 对准(替代开环,防漂移)
 
 [S3 识别货物]
-  mm_task 按预设搬运顺序触发 object_detector → 发 /perception/object_pose(base_link 系)
+  等 /perception/object_pose 出"新鲜且够得着"的帧 (age<1s 且 |x|<0.5 |y|<0.6, base_link 系)
+  —— 不是抓第一帧: 太远的帧意味着盒还没进可达范围, 粗定位残差大到精修收不回
 
-[S4 抓取] —— 三段混合,对机械臂零位偏差脱敏(详见 interface_contract.md §5)
-  ① 粗定位(闭环,MoveIt 规划):grasp_node 取 object_pose → TCP 规划到盒子上方预抓取位(约 10–15cm)
-  ② 精修(闭环,moveit_servo 视觉伺服):持续读新鲜 object_pose → Cartesian jog 对准顶面中心 xy+yaw → 逼近到约 5–8cm
-  ③ 末段(开环,相对当前姿态短距离直插):沿吸盘接近轴(suction_tip, Link_29 -Z)相对下插固定行程
-  → 气泵 I/O 吸取 → 规划到 tray(Link_11)上方 → 释放 → 放下
+[S4 抓取] —— 分段混合,对机械臂零位偏差脱敏(详见 interface_contract.md §5)
+  S3a 先调 /grasp/look 摆看货姿势 (ready + J1+90°, 让相机转向货物),
+      服务 message 回报 "pickable=N, tray_free=M" —— 状态机据此决定这个货架抓几次
+  然后对每个盒调一次 /grasp/execute, grasp_node 内部:
+  ① 粗定位(闭环,MoveIt 规划):取 object_pose → TCP 规划到盒上方 12cm
+  ② 精修(闭环,相机系笛卡尔步进):追 /object_point_cam 的横向 (y,z) 到标定目标值, 容差 3mm
+     (原设计的 moveit_servo + base_link 坐标已放弃, 理由见契约 §5 实机修正①)
+  ②b 朝向对齐(闭环,转腕):追 /object_axis_angle 的图像角到标定常数, 容差 1°
+  ③ 末段(开环,相对当前姿态短距离直插):沿吸盘接近轴(suction_tip, Link_29 -Z)相对下插
+  → 气泵吸取(/pump_cmd=1, 吸住后发 0 关泵靠密封保负压)
+  → 按类别映射到对应托盘 → 爬到 transit 高度 → 垂直直下到该层释放高度 → 脉冲式开阀释放
+  → **收尾停在 look 位**(不回 ready): 下一轮直接就能识别, 省一趟空行程
   ⚠️ 纪律:末段严禁用 FK 重算盒子 base_link 绝对坐标再 setPoseTarget,否则零位偏差加回末端
+
+[S4' 同一货架连抓] —— 一个货架有 1~4 个盒, 几个只有识别了才知道
+  故不在 mission.yaml 里按盒数写死多条任务, 而是一条 grasp 任务内部循环 detect+execute.
+  三个出口, 前两个都算**成功**(后续卸货任务照常跑, 不中止序列):
+    ① pickable 归 0 —— 这个货架抓空了
+    ② 托盘装满 —— execute 返回 "TRAY_FULL:..." 或 tray_free=0, 该去卸货了, **不是故障**
+       判据是本类别映射到的那个盘满没满, 不是总余量: 4 个同类盒只进一个盘(容量 2),
+       装 2 个就得走, 另一个盘空着也没用
+    ③ 达到 max_picks_per_shelf 上限 —— 纯防死循环兜底
+  离开货架前才调 /grasp/ready 收身(底盘不拖着伸出的臂走)—— "要不要走"只有状态机知道
+
+[S4'' 卸货 /grasp/unload_tray] —— 整盘卸到地面两个卸货点, 平铺不堆叠, 全程不用视觉
+  为什么不用视觉: 托盘上的盒高于感知端 pick_z_max 会被整批滤掉, 走视觉根本拿不到目标.
+  而取盒目标其实已经知道 —— 就是当初放它时的吸盘释放位姿(grasp_node 运行时存着),
+  取放走完全对称的同一套几何, "放得进去就取得出来". 顺序后进先出(先取栈顶).
+  卸哪个盘由参数传 (Trigger 带不了数值): 状态机先 SetParameters 设 unload_tray, 再调服务.
+  空盘返回"空的"按跳过处理不算失败 —— 这一轮装了几个盘取决于货架上有几个盒.
 
 [S5 循环]
   回 S1 导航到下一货架 → 直到搬运序列完成
 ```
+
+### 7.2b 状态机与 grasp_node 的职责切分(实机调试后定型)
+
+| 谁做 | 做什么 |
+|---|---|
+| `mission_manager`(状态机) | **只编排**: 何时导航、何时看货、抓几次、何时收身、何时去卸货 |
+| `grasp_node`(C++) | **只执行**: 一次调用完成一个完整动作, 无状态机语义, 不知道任务序列 |
+
+两条纪律:
+- **臂姿收尾归状态机管**。`/grasp/execute` 收尾停在 look 位而不是 ready —— 因为连抓时下一轮
+  还要在 look 位识别。收身(`/grasp/ready`)由状态机在**真要走**时才调。
+  ⚠️ 别为"图省事"把 execute 收尾改回 ready: 状态机侧的同货架循环依赖它停在 look。
+- **grasp_node 通过 message 回报机器可读状态**(`pickable=N`/`tray_free=M`/`TRAY_FULL:` 前缀),
+  而不是靠 success 布尔。状态机要分得出"托盘满了该去卸货"(正常转移)和"规划失败"(真故障),
+  这两种在 `Trigger` 里都是 `success=false`。
+  解析不出这些键时状态机按 **-1(未知)** 处理而不是 0 —— 报 0 会让连抓循环立刻收工。
 
 ### 7.3 分层:任务列表 vs 调度系统
 - **第一版**:状态机吃一个**写死的任务列表**(货架序列),把 S1~S5 跑通。
@@ -329,12 +396,14 @@ mm_task: goToPose(目标货架) → 放下 → 循环
 本机 → Nano (小消息, 粗指令):
   /go_to(String)              本机 mm_task → Nano lane_navigator
   /initialpose(latched)       本机 mm_task → Nano AMCL
-  /grasp/execute|unload|ready|look(Trigger 服务)  本机 mm_task → Nano grasp_node
+  Trigger 服务: /grasp/look /grasp/execute /grasp/ready /grasp/unload_tray /grasp/reset_stack
+  /grasp_node/set_parameters  设 unload_tray=<N> (Trigger 带不了数值)
 Nano → 本机 (只读可视化 + 状态回报):
   /tf /tf_static /robot_description            → 本机 RViz
   /scan /map /global_costmap /local_costmap /odom /plan /arm_joint_states  → 本机 RViz
   /lane_navigator/status(String)   → 本机 mm_task(S1 完成回报)
   /perception/object_pose(PoseStamped, 小)  → 本机 mm_task(S3 判新鲜可达)
+  各相机的 <topic>/compressed  → 本机 republish 解码后 rqt 看 (raw 直传会打满 WiFi)
 ```
 **在 Nano 本地闭环(绝不过 WiFi,这就是分割的意义):**
 ```
@@ -362,9 +431,11 @@ object_pose + servo TwistStamped → servo_node → 稠密关节指令 → JTC �
 ```
 # 两机都装(相机压缩图, 缺则看不了画面)
 sudo apt install ros-humble-compressed-image-transport ros-humble-compressed-depth-image-transport
-# 仅 Nano(贴硬件运行时依赖, 不在本 colcon ws)
-sudo apt install ros-humble-robot-localization ros-humble-rplidar-ros
-#   micro-ROS 代理: 独立 ws ~/microros_ws(用时 source); 相机驱动: 型号定后装
+# 仅 Nano(贴硬件运行时依赖, 刻意不写进 mm_bringup 的 exec_depend ——
+#   写了会让本机没装这些驱动时整个 mm_bringup 编不过, 而本机压根不需要它们)
+sudo apt install ros-humble-robot-localization ros-humble-rplidar-ros \
+                 ros-humble-realsense2-camera ros-humble-usb-cam
+#   micro-ROS 代理: 独立 ws ~/microros_ws(用时 source)
 # 仅本机: rqt_image_view(桌面版通常自带)
 ```
 
@@ -383,10 +454,10 @@ sudo ip link set can0 up type can bitrate 1000000
 
 **④ 启动(Nano 先,本机后)**
 ```
-# Nano(硬件+自主全栈, 无头)
+# Nano(硬件+自主全栈, 无头). 抓取要跑就得开这两个开关
 source ~/microros_ws/install/setup.bash && source install/setup.bash
-ros2 launch mm_bringup nano_bringup.launch.py       # 相机就绪加 use_cameras:=true use_perception:=true
-# 本机(可视化+调度)
+ros2 launch mm_bringup nano_bringup.launch.py use_cameras:=true use_perception:=true
+# 本机(可视化+调度). run_mission 默认关, 先手动派命令验; 开则默认吃 mission_real.yaml
 source install/setup.bash
 ros2 launch mm_bringup dev_bringup.launch.py view_cameras:=true
 ```
@@ -467,6 +538,12 @@ Gazebo 不建模真空吸力。用**假吸附插件**(`gazebo_grasp_fix` 类):�
 | 真实吸力/保压 | | ✅(假吸附只验动作) |
 | ArUco 真实精度/光学系 90°/内参 | | ✅ |
 | 手眼标定外参 | | ✅ |
+
+**真机侧已跑通(2026-07-26~07-31,详见 `real_machine_test_log.md`):** 双托盘按类别堆叠放置、
+相机系精修闭环收敛、图像角朝向对齐、整盘卸货到地面两点、已放盒碰撞体避让。
+这批把仿真里"假吸附只验动作"的部分补成了真的 —— 也暴露出仿真验不到的一整类问题:
+**手眼/零位误差随构型变**(逼着精修改用相机系)、**视觉管线延迟**(摆臂刚停时缓存里还是运动中的画面)、
+**近正方形盒长短边互换**(θ_img 在 2θ 空间抵消出一个任何单帧都不存在的假值)。
 
 ### 8.6 分工(本轮更新)
 - **本人**:逻辑级全流程仿真(nav+臂整合)、mock 感知节点(`mm_bringup`)、假吸附、grasp_node 三段抓取。

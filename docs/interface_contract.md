@@ -27,10 +27,15 @@ URDF 沿用 CAD 原始命名(`Link_xx`),与角色对照如下:
 
 队友所有视觉代码写在 **`mm_perception/mm_perception/`** 包内,每个节点在 `mm_perception/setup.py` 的 `entry_points` 里注册 `console_scripts`:
 
-| 工作 | 建议文件 | 输出 |
+| 工作 | 实际文件 | 输出 |
 |---|---|---|
-| 盒子识别(§1) | `object_detector.py` | 发布 `/perception/object_pose` |
+| 盒子识别(§1) | `yolo_box_detector.py` | 发布 `/perception/object_pose` + §1.1 四路 |
 | ArUco 识别(§2) | `aruco_localizer.py` | 向 `/tf` 广播 `aruco_<id>` |
+
+> 盒子识别最终落在 `yolo_box_detector.py`(自训练 YOLO + NCNN 后端,ARM CPU 上约 4.8x 加速),
+> 不是原计划的 `object_detector.py`。参数在 `mm_perception/config/yolo_box_detector.yaml`,
+> 起法 `ros2 launch mm_perception yolo_box_detector.launch.py`(该 launch 负责把 yaml 里的
+> 相对模型名拼成 share 下绝对路径,别裸 `ros2 run`)。
 
 手眼标定(§3)交付的是 URDF 数值(改 `Joint_17` origin),不在此包,直接给本人回填。
 
@@ -60,7 +65,23 @@ URDF 沿用 CAD 原始命名(`Link_xx`),与角色对照如下:
 
 说明:
 - 选 `PoseStamped` 是因为 MoveIt `MoveGroupInterface.setPoseTarget()` 直接吃这个类型,零转换。
-- 多目标场景后续再扩展为自定义数组消息;第一版单目标 `PoseStamped` 足够。
+
+### 1.1 实机新增话题(2026-07 抓取调试期陆续加,均由 `yolo_box_detector` 发)
+
+单目标 `/perception/object_pose` 不够用,实机上又长出四路。**语义口径统一**:凡是"可抓盒",
+都指过完 `pick_z_max` 高度滤除之后的候选(托盘上已放的盒比地面盒离相机更近、成像更大,
+不滤会被当成抓取目标)。
+
+| 话题 | 类型 | 用途 |
+|---|---|---|
+| `/perception/object_poses` | `PoseArray` | **所有可抓盒**的位姿数组。**数组长度 = 还剩几个盒可抓** —— 状态机据此决定同一货架连抓几次(见 §7.2 S4),空数组也照发(否则计数永远归不了零,循环停不下来) |
+| `/perception/object_point_cam` | `PointStamped` | 目标盒心在**相机机械系 `Link_30`** 的坐标。②精修闭环追的是这个,不是 `base_link` 坐标 —— 后者要过 FK+手眼外参,零位偏差让它偏 2~3cm 且随构型变,闭环追它会变成"臂动→偏差变→目标跑"的追逐 |
+| `/perception/object_axis_angle` | `Float32` | 目标盒长轴的**图像角** θ_img(度,折到 (-90,90])。吸盘朝向对齐闭环的判据 —— 相机固连腕部,故"吸盘长轴在图像里占多少度"是与构型无关的常数,对齐 ⇔ θ_img 落进容差 |
+| `/perception/object_class` | `Int32` | 目标盒类别(1~4)。决定放哪个托盘 + 用哪个标定厚度 |
+| `/perception/object_thickness` | `Float32` | 视觉估的盒厚(米)。**当前仅打印对照不采信**,放置高度用 `place.yaml` 的 `fallback_thickness` 实测标定值 |
+
+> 目标选择:单目标那几路(`object_pose`/`point_cam`/`axis_angle`/`class`)靠 p_cam 最近邻锚定跟踪同一个盒,
+> 避免抓取过程中吸盘遮挡导致"最大框"静默换目标(2026-07-30 实证过这个坑)。
 
 ---
 
@@ -108,8 +129,13 @@ eye-in-hand:深度相机已建模为 `Link_30`,经 `Joint_17`(fixed)固连机械
 | 项 | 约定 |
 |---|---|
 | 规划 | MoveIt2 `MoveGroupInterface`,输入 `PoseStamped`(见 §1) |
-| 执行 | `FollowJointTrajectory`(ros2_control,仿真与真机一致) |
-| 末端执行器 | 气泵吸取,I/O 接口 `待定` |
+| 执行 | `FollowJointTrajectory`(ros2_control → `arm_control/can_bridge` → 0xFD CAN) |
+| 末端执行器 | 气泵吸取,`/pump_cmd`(`std_msgs/Int8`):**0=STOP(关泵关阀) 1=SUCK 2=RELEASE(开阀)** |
+
+**气泵纪律**(实机踩出来的):
+- `RELEASE` 是**持续通电开阀**,发完必须补 `STOP`。实测放置后阀一直开着十几分钟烫手,
+  故释放实现为脉冲:开阀 `release_duration`(1.0s,破负压几百 ms 够)→ 立刻 `STOP`。
+- 吸住后也发 `STOP` 而非一直 `SUCK`:气路封住靠密封维持负压,盒子照样吸着;持续 `SUCK` 泵空转发热且无收益。
 
 ---
 
@@ -117,15 +143,37 @@ eye-in-hand:深度相机已建模为 `Link_30`,经 `Joint_17`(fixed)固连机械
 
 **动机**:机械臂增量式,上电即当前位置为零,靠手动摆到 URDF 零位,重复性约 1cm(无绝对编码器/自动 homing)。盒子由腕部 eye-in-hand 深度相机 `Link_30` 识别,`base_link←Link_30` 要过机械臂正运动学(FK),零位偏差从这里进入绝对定位。为对该偏差**脱敏**,抓取分三段:
 
-1. **粗定位(闭环,MoveIt 规划)**:取 `/perception/object_pose`,把 TCP 规划到盒子上方预抓取位(约 10–15cm)。
-2. **精修(闭环,`moveit_servo` 视觉伺服)**:持续读新鲜 `object_pose`,用 Cartesian jog 把 TCP 对准盒子顶面中心 `xy + yaw`,逼近到约 5–8cm,直至观测对准误差 < 阈值。
+1. **粗定位(闭环,MoveIt 规划)**:取 `/perception/object_pose`,把 TCP 规划到盒子上方预抓取位(12cm)。
+2. **精修(闭环,相机系笛卡尔步进)**:持续读新鲜 `/perception/object_point_cam`,在**相机系**里
+   把横向误差 (y,z) 追到标定目标值 `cam_target_y/z`,每步用 `computeCartesianPath` 走一小段,
+   收敛容差 3mm。**不用 `moveit_servo`**(见下方"实机修正")。
+2b. **吸盘朝向对齐(闭环,转腕)**:追 `/perception/object_axis_angle` 的图像角 θ_img 到标定常数
+   `yaw_target_theta_img`,容差 1°。要的是"吸盘长轴与盒长轴共线",否则盒斜贴吸盘、放进带围栏的托盘会蹭卡。
 3. **末段(开环,相对当前姿态短距离直插)**:从精修收敛姿态,沿吸盘接近轴(`suction_tip`,`Link_29` -Z)**相对**下插固定行程 + 气泵吸取。
 
 **纪律(写死)**:末段必须是"相对当前实测姿态的短距离运动";**严禁在末段用 FK 重新计算盒子在 `base_link` 的绝对坐标再 `setPoseTarget`**——否则零位偏差原样加回末端。前两段靠新鲜相机反馈把绝对定位误差磨到物理正确位置,末段只承受短行程差分残余(亚毫米~mm 级)。
 
 **残余兜底**:姿态微偏 × 行程会产生横向漂移,故 (a) 精修尽量逼近再插以缩短行程,(b) 靠吸盘/夹爪机械容差(倒角/柔性)吃 mm 级残差。
 
-**对队友无影响**:三段全在 `mm_grasp`/MoveIt 本人侧;对队友唯一新增 = §1 的连续发布要求。`moveit_servo` 已集成(精修段视觉伺服),细节见 `mm_grasp/config/servo.yaml`。
+**对队友无影响**:各段全在 `mm_grasp`/MoveIt 本人侧;对队友唯一新增 = §1 的连续发布要求。
+
+### 实机修正(2026-07 调试后,推翻上面两处原设计)
+
+**① 精修不用 `moveit_servo`,改相机系笛卡尔步进。** 原设计是"读 `object_pose`(base_link 系)
+→ servo jog 对准"。实机上这条路走不通:`base_link` 坐标 = FK(6关节) ∘ 手眼外参,而机械臂是
+增量式编码器、上电即零位、零位靠手摆(重复性约 1cm),旋转误差经 FK 进来且**随臂构型变**——
+闭环追它就成了"臂动→偏差变→目标跑"的追逐(实测 20s 不收敛)。改追相机系的 `p_cam`:它只过
+深度与相机内参,臂动它不跳。目标值 `cam_target_y/z` 由人工对准后读回标定,于是手眼偏差**压根不进闭环**。
+`servo_node` 仍在 launch 里起着(`mm_grasp/config/servo.yaml`),但抓取主链路没用它。
+
+**② 朝向对齐不用 `object_pose` 里的 base_link 系盒 yaw,改追图像角。** 同一个根因:那个 yaw
+也要过 FK+外参。2026-07-27 实测检测报盒 +36.2°,按它转腕后人工还得再补 6° 才与盒边贴合。
+现改为闭环追图像角 θ_img —— 相机固连腕部,故"吸盘长轴在图像里占多少度"与构型无关,
+是个能在机上直接看到的**终点判据**,腕该转多少不需要事先知道。
+
+**③ 关键标定值全部入库**,在 `mm_grasp/config/place.yaml`(每个值都带实测由来与调整历史):
+双托盘位姿/容量、类别→托盘映射、各类别标定厚度、`cam_target_y/z`、`yaw_target_theta_img`、
+横移高度候选、卸货点几何。改这些多数要**重启 `grasp_node`**(启动时读进 C++ 成员,`ros2 param set` 不热更)。
 
 ---
 
@@ -137,6 +185,8 @@ eye-in-hand:深度相机已建模为 `Link_30`,经 `Joint_17`(fixed)固连机械
 - [x] 吸盘工具 link / `suction_tip` TCP(§1)→ URDF 已建 `suction_link`(Link_29 -Z 圆柱)+ `suction_tip` TCP(Link_29 -Z 9.5cm)
 - [x] ArUco 输出坐标系(§2)→ 统一 `base_link`,队友节点内做 TF 换算(与 §1 一致),无需 URDF 建 `Link_13_optical`
 - [ ] ArUco 各标记 id 分配(§2)— 队友按现场登记到节点参数
-- [ ] 气泵 I/O 接口(§4)— 实机阶段定
-- [x] 抓取执行策略(§5)→ 闭环粗定位 + 闭环精修 + 开环相对直插,对零位偏差脱敏
-- [ ] `moveit_servo` 视觉伺服集成(§5)— **本人 TODO**,阈值/行程/伺服参数待验证
+- [x] 气泵 I/O 接口(§4)→ `/pump_cmd` `std_msgs/Int8`,0=STOP 1=SUCK 2=RELEASE(释放须脉冲式,见 §4)
+- [x] 抓取执行策略(§5)→ 闭环粗定位 + 相机系精修 + 图像角朝向对齐 + 开环相对直插,已真机跑通
+- [x] ~~`moveit_servo` 视觉伺服集成(§5)~~ → **已放弃**,改相机系笛卡尔步进(理由见 §5 实机修正①)
+- [x] 多目标输出(§1.1)→ `/perception/object_poses`(PoseArray),长度=剩余可抓盒数
+- [ ] S2 到点 ArUco 精对位(架构 §7.2)— 状态机里目前是 no-op 直接放行,**本人 TODO**
