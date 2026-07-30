@@ -252,3 +252,49 @@ grasp_node:
 
     # 长轴图像角话题, 须与 mm_perception/config/yolo_box_detector.yaml 的同名参数一致.
     axis_angle_topic: /perception/object_axis_angle
+
+    # ============================================================
+    #  按托盘卸货 /grasp/unload_tray (2026-07-30 新增, 全程不用视觉)
+    # ============================================================
+    # 卸哪个托盘由参数给 (Trigger 带不了数值):
+    #   ros2 param set /grasp_node unload_tray 1
+    #   ros2 service call /grasp/unload_tray std_srvs/srv/Trigger
+    # ⚠️ unload_tray 本身刻意**不在此声明**: 代码用普通 declare_parameter(与 seed_tray/
+    # seed_thickness 同), 写进这里会被 automatically_declare_parameters_from_overrides
+    # 先声明一遍, 二次声明冲突直接崩(release_duration 踩过, exit -6).
+    #
+    # 一个托盘的两个盒卸到同一地点的两个卸货点, **平铺不堆叠** (用户拍板).
+    #
+    # 为什么不用视觉: 托盘上的盒高于感知端 pick_z_max(0.06) 会被整批滤掉, 走视觉重新识别
+    # 根本拿不到目标. 而取盒目标其实已经知道 —— 就是当初放它时的吸盘释放位姿(运行时存在
+    # placed_release_ 里), 取盒/放盒走完全对称的同一套几何, "放得进去就取得出来", 不引入
+    # 新的可达性风险. 顺序后进先出(先取栈顶): 摞的时候后放的在上面, 从下面抽会带翻上层.
+    #
+    # 卸货点几何: 两点沿 base_link 的 x 轴对称分布, 中心 (unload_base_x, unload_base_y),
+    # 半间距 unload_x_offset. 第 k 个卸下的盒去第 k 个点 (k=0 -> x 负向, k=1 -> 正向).
+    #
+    # 2026-07-30 实标 (RViz 拖臂到吸盘接触地面, 读 TF base_link->suction_tip, 各读两秒稳定值):
+    #   点1 (-0.090, -0.275, -0.044)   点2 (+0.087, -0.275, -0.044)
+    #   两点 y/z/姿态完全一致 (yaw≈-90.02°, roll/pitch≈0 吸盘严格朝下), 只差 x 共 177mm.
+    # 基准写死实标值, 不用 look 位 FK 现算: look 只是"相机俯视货物"的姿态, 它的 TCP 位置
+    # (实测 y≈-0.201) 压根不是想要的落点, 绕一层 FK 只是引入不确定性. base_link 是底盘基系、
+    # 臂固连在底盘上, 故整车移动时这两点跟着一起走, **不需要重标** (只有臂在底盘上的安装
+    # 位置变了才要重标).
+    #
+    # ⚠️ dry_run 实测: 负 x 侧 (x=-0.107) 垂直直下覆盖 100%; 正 x 侧 (x=+0.073, 基准 y=-0.201)
+    # 只有 83% 失败. 两点实标后 y 外移到 -0.275, 可达性变了需重验 —— 改这几个值后必须重跑
+    # dry_run 看两点的"垂直直下路径覆盖":
+    #   ros2 launch mm_grasp grasp.launch.py dry_run:=true use_sim_time:=false
+    unload_base_x: -0.0015
+    unload_base_y: -0.275
+    unload_x_offset: 0.0885
+    # 卸货点**地面高度**(米, base_link 系) = 吸盘末端贴地时的 z, 实标 -0.044.
+    # 释放高度 = 这个值 + 该盒厚度, 由 popLayer 取到的厚度**逐盒现算**: 同一托盘两个盒厚度
+    # 可能不同(如 0 号盘装类别 3/4 = 12/15mm), 用固定释放高度必然有一个放偏.
+    # 厚度口径沿用 fallback_thickness 那套"实跑反推的等效盒顶离地高"(非卡尺物理盒高 ——
+    # 四盒实测物理高为 36/24/27/18mm, 与之不同是因为那套已把 ground_z 的误差吸收进去),
+    # 与取盒共用同一体系, 取放两头一起对.
+    unload_z: -0.044
+    # 取盒时的额外下压量(米, 负值=多压). 与抓取的 insert_shortfall 同理, 兜住"盒放下后被
+    # 压实/略有沉降"—— 释放位姿理论上直接回去即可, 先按对称几何走 0, 吸不上再调.
+    unload_pick_shortfall: 0.0

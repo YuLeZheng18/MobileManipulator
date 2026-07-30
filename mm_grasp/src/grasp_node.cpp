@@ -166,6 +166,8 @@ public:
     // /grasp/seed_placed 用: 补登重启前已物理存在的盒. Trigger 带不了数值, 走参数.
     node_->declare_parameter<int64_t>("seed_tray", 0);
     node_->declare_parameter<double>("seed_thickness", 0.022);
+    // /grasp/unload_tray 卸哪个托盘 (Trigger 带不了数值, 同上走参数).
+    node_->declare_parameter<int64_t>("unload_tray", 0);
 
     // ---- 双托盘放置 + 按类别堆叠 (标定值在 place.yaml, base_link 系) ----
     // 托盘"空载吸盘接触托盘中心"位姿: xyz=空载 suction_tip 贴托盘中心时的位置, quat=工具朝下
@@ -270,6 +272,8 @@ public:
     // 已放盒持久碰撞体按托盘分组, 与堆叠状态同生命周期 (reset_stack 一并清).
     placed_ids_.assign(num_trays_, {});
     placed_poses_.assign(num_trays_, {});
+    placed_release_.assign(num_trays_, {});
+    placed_th_.assign(num_trays_, {});
 
     // 卸货目的地 (base_link 系, top-down, 写死车右侧地面): 从托盘取盒后, 先到上方,
     // 再笛卡尔直下到吸盘末端 z=place_z_ (盒底离地 ~5mm) 才释放, 盒子落稳而非半空抛.
@@ -279,6 +283,25 @@ public:
     place_y_ = node_->declare_parameter<double>("place_y", -0.38);
     place_z_ = node_->declare_parameter<double>("place_z", 0.030);
     place_clearance_ = node_->declare_parameter<double>("place_clearance", 0.12);
+
+    // ---- 按托盘卸货 (/grasp/unload_tray): 两个卸货点沿 base x 轴对称分布 ----
+    // 2026-07-30 实标 (RViz 拖臂到吸盘接地, 读 base_link->suction_tip):
+    //   点1 (-0.090, -0.275, -0.044)   点2 (+0.087, -0.275, -0.044)   两点姿态一致 yaw≈-90°
+    // 中心 x=-0.0015, 半间距 88.5mm. 基准写死实标值而非用 look 位 FK 现算: look 只是
+    // "相机俯视货物"的姿态, 它的 TCP 位置 (y≈-0.201) 压根不是想要的落点, 绕一层 FK 只是
+    // 引入不确定性. base_link 是底盘基系、臂固连底盘, 故整车移动时这两点跟着走, 不用重标.
+    unload_base_x_ = getOrDeclare<double>("unload_base_x", -0.0015);
+    unload_base_y_ = getOrDeclare<double>("unload_base_y", -0.275);
+    unload_x_offset_ = getOrDeclare<double>("unload_x_offset", 0.0885);
+    // 卸货点地面高度 (吸盘末端贴地时的 z). 释放高度 = 这个值 + 该盒厚度, 逐盒现算 ——
+    // 一个托盘的两个盒厚度可能不同 (如 0 号盘装类别 3/4 = 12/15mm), 固定释放高度会有一个
+    // 放偏. 厚度口径沿用 fallback_thickness 那套实跑反推的等效值 (非卡尺物理盒高), 与取盒
+    // 共用同一体系, 取放两头一起对.
+    unload_z_ = getOrDeclare<double>("unload_z", -0.044);
+    // 取盒时吸盘要压到已落盒顶面: 释放位姿就是当初放它时吸盘所在处, 理论上直接回去即可.
+    // 留一个可调的下压量兜住"放下去后盒被压实/略有沉降"—— 与抓取的 insert_shortfall 同理,
+    // 负值=多压一点. 默认 0 (先按对称几何走, 吸不上再调).
+    unload_pick_shortfall_ = getOrDeclare<double>("unload_pick_shortfall", 0.0);
 
     // 被抓盒子尺寸 (world grasp_box: 0.09x0.055x0.025), 吸取后 attach 到吸盘作碰撞体,
     // 让放置规划知道吸盘下挂着盒 -> 绕开托盘边框, 不再侧向蹭入。
@@ -612,6 +635,8 @@ public:
           ids.clear();
         }
         for (auto & poses : placed_poses_) poses.clear();
+        for (auto & rel : placed_release_) rel.clear();   // 卸货取回用的吸盘位姿
+        for (auto & th : placed_th_) th.clear();
         // 兜底: 即便 placed_ids_ 空(计数漏追踪), 也按命名规则扫一遍清残留.
         for (int t = 0; t < num_trays_; ++t) {
           for (int L = 0; L < 64; ++L) {
@@ -661,10 +686,24 @@ public:
         res->success = true; res->message = buf;
       },
       rmw_qos_profile_services_default, srv_cb_group_);
+    // 按托盘卸货: 把 unload_tray 号托盘上的盒全卸到地面两个卸货点 (不用视觉, 见 unloadTray).
+    // 与 execute/unload 同一个互斥回调组: 三者都整轮阻塞几十秒且共用一条臂, 绝不能并发.
+    unload_tray_srv_ = node_->create_service<std_srvs::srv::Trigger>(
+      "/grasp/unload_tray",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        const int tray = static_cast<int>(node_->get_parameter("unload_tray").as_int());
+        std::string err;
+        res->success = unloadTray(tray, err);
+        res->message = res->success
+          ? std::to_string(tray) + " 号托盘已卸完"
+          : err;
+      },
+      rmw_qos_profile_services_default, srv_cb_group_);
 
     RCLCPP_INFO(logger_,
                 "grasp_node 就绪: group=%s ee=%s base=%s 订 %s 发 %s, "
-                "服务 /grasp/execute /grasp/unload /grasp/ready /grasp/look",
+                "服务 /grasp/execute /grasp/unload_tray /grasp/ready /grasp/look",
                 planning_group_.c_str(), ee_link_.c_str(), base_frame_.c_str(),
                 object_topic_.c_str(), pump_topic_.c_str());
   }
@@ -865,7 +904,40 @@ private:
                            std::to_string(tray_layers_[t]);
     placed_ids_[t].push_back(id);
     placed_poses_[t].push_back(box);
+    // 存吸盘释放位姿与本层厚度, 供卸货(popLayer)原路取回. placed_poses_ 存的是**盒心**
+    // (碰撞体要盒心), 而卸货要回到**吸盘**位姿, 二者差半个盒高, 故释放位姿单独存一份.
+    placed_release_[t].push_back(release_pose);
+    placed_th_[t].push_back(thickness);
     addPlacedBox(id, box);
+  }
+
+  // pushLayer 的逆操作 (卸货用): 摘掉栈顶那一层. 后进先出 —— 摞的时候后放的在上面,
+  // 取的时候必须先取上面那个, 否则从下面抽会带翻上层.
+  // 返回该层的释放位姿 (= 当初放它时吸盘的位姿, 卸货取盒就回到这个位姿去吸) 与厚度.
+  // 场景碰撞体一并删掉: 盒已经被取走, 留着会挡住后续规划 (幽灵碰撞体教训).
+  bool popLayer(int t, geometry_msgs::msg::Pose & release_pose, double & thickness)
+  {
+    std::lock_guard<std::mutex> lk(stack_mtx_);
+    if (t < 0 || t >= static_cast<int>(placed_ids_.size()) || placed_ids_[t].empty()) {
+      return false;
+    }
+    release_pose = placed_release_[t].back();   // 吸盘位姿 (非盒心), 原路取回
+    thickness = placed_th_[t].back();
+    const std::string id = placed_ids_[t].back();
+    placed_poses_[t].pop_back();
+    placed_release_[t].pop_back();
+    placed_th_[t].pop_back();
+    placed_ids_[t].pop_back();
+
+    tray_layers_[t] -= 1;
+    tray_stack_h_[t] -= thickness;
+    if (tray_layers_[t] < 0) tray_layers_[t] = 0;
+    if (tray_stack_h_[t] < 0.0) tray_stack_h_[t] = 0.0;
+
+    psi_->removeCollisionObjects({id});
+    RCLCPP_INFO(logger_, "取走 %s (厚 %.1fmm), %d 号托盘余 %d 层, 累计高 %.1fmm",
+                id.c_str(), thickness * 1000, t, tray_layers_[t], tray_stack_h_[t] * 1000);
+    return true;
   }
 
   // 把一个已落盒作为独立世界碰撞体加入规划场景 (base_link 系).
@@ -1002,6 +1074,173 @@ private:
 
     RCLCPP_INFO(logger_, "==== 卸货一轮完成 ====");
     res->success = true; res->message = "unload cycle done";
+  }
+
+  // /grasp/unload_tray: 把一个托盘上的盒全部卸到地面, 两个卸货点左右平铺.
+  //
+  // 全程不用视觉: 取盒目标就是当初放它时的吸盘位姿 (placed_release_ 里存着), 放盒是它的
+  // 逆操作. 放得进去就取得出来, 取放走完全对称的同一套几何, 不引入新的可达性风险.
+  // 这也绕开了感知侧 pick_z_max 的限制 —— 托盘上的盒高于该阈值会被检测端整批滤掉,
+  // 走视觉重新识别根本拿不到目标.
+  //
+  // 顺序: 后进先出, 先取栈顶. 摞的时候后放的在上面, 从下面抽会带翻上层.
+  // 卸货点分配: 第 k 个卸下的盒去第 k 个点 (k=0 -> base x 负向, k=1 -> 正向), 两点由
+  // unload_base_x/y ± unload_x_offset 定, 释放高度 = unload_z + 本盒厚度.
+  bool unloadTray(int tray, std::string & err)
+  {
+    if (tray < 0 || tray >= num_trays_) { err = "托盘号越界"; return false; }
+    const int n = trayLayers(tray);
+    if (n <= 0) { err = std::to_string(tray) + " 号托盘是空的, 无盒可卸"; return false; }
+
+    RCLCPP_INFO(logger_,
+                "==== /grasp/unload_tray: %d 号托盘 %d 个盒 -> 卸货基准 (%.4f,%.3f) 沿 base x ±%.1fmm, 地面 z=%.3f ====",
+                tray, n, unload_base_x_, unload_base_y_, unload_x_offset_ * 1000, unload_z_);
+
+    for (int k = 0; k < n; ++k) {
+      // ---- 取盒: 回到当初放它的吸盘位姿 ----
+      geometry_msgs::msg::Pose release;
+      double thickness = 0.0;
+      {   // 只读栈顶, 先不 pop —— 取失败时状态不能丢 (盒还在托盘上)
+        std::lock_guard<std::mutex> lk(stack_mtx_);
+        if (placed_release_[tray].empty()) { err = "堆叠状态与层数不一致"; return false; }
+        release = placed_release_[tray].back();
+        thickness = placed_th_[tray].back();
+      }
+      // 下压量: 与抓取的 insert_shortfall 同理, 负值多压一点, 兜住盒放下后的沉降.
+      release.position.z += unload_pick_shortfall_;
+
+      const std::string what = std::to_string(tray) + "号托盘第" +
+                               std::to_string(trayLayers(tray)) + "层";
+      if (!pickFromTray(release, thickness, what.c_str(), tray)) {
+        err = "取盒失败: " + what; return false;
+      }
+
+      // ---- 取成功才更新堆叠状态 (盒已在吸盘上, 不在托盘上了) ----
+      geometry_msgs::msg::Pose popped;
+      double popped_th = 0.0;
+      if (!popLayer(tray, popped, popped_th)) { err = "popLayer 失败"; return false; }
+
+      // ---- 放到卸货点: 第 k 个盒去第 k 个点, 沿 base x 轴左右分开 ----
+      const double sign = (k % 2 == 0) ? -1.0 : 1.0;
+      geometry_msgs::msg::Pose dest;
+      dest.position.x = unload_base_x_ + sign * unload_x_offset_;
+      dest.position.y = unload_base_y_;
+      // 释放高度按本盒厚度现算 (吸盘吸着盒顶面, 盒底落地): 同盘两盒厚度可能不同.
+      dest.position.z = unload_z_ + thickness;
+      // 朝向沿用取盒时的工具朝向: 取盒后吸盘已是朝下的托盘标定朝向, 与实标卸货点姿态
+      // (yaw≈-90°) 一致, 直接沿用不额外转腕.
+      dest.orientation = release.orientation;
+
+      RCLCPP_INFO(logger_, "卸货: 第 %d 个盒 -> 卸货点 %d (%.3f,%.3f,%.3f) 厚 %.0fmm",
+                  k + 1, k, dest.position.x, dest.position.y, dest.position.z,
+                  thickness * 1000);
+      if (!placeAtPose(dest, ("卸货点" + std::to_string(k)).c_str(), tray)) {
+        if (dry_run_) detachBox();   // 失败也要清掉虚拟盒, 否则残留在吸盘上
+        err = "放到卸货点失败(已吸取): 卸货点" + std::to_string(k);
+        return false;
+      }
+      // dry_run 下取盒段挂的虚拟盒到此清掉, 否则它会一直挂在吸盘上进下一轮.
+      if (dry_run_) detachBox();
+      // 卸到地面的盒不进堆叠 (那是托盘的账), 但要留个碰撞体防下一个盒放到它身上.
+      // id 必须带 placed_ 前缀: reset_stack 的同步 REMOVE 与其复查都只认这个前缀,
+      // 叫别的名字就成了连重启都清不掉的幽灵碰撞体 (2026-07-29 事故), 而卸货点就在
+      // look 位附近地面, 残留一个正好挡住下一轮直下段.
+      addPlacedBox("placed_unloaded_" + std::to_string(tray) + "_" + std::to_string(k),
+                   boxCenterFromRelease(dest, thickness));
+    }
+
+    if (!moveToReady()) { err = "卸货后回 ready 失败"; return false; }
+    RCLCPP_INFO(logger_, "==== %d 号托盘 %d 个盒已全部卸完 ====", tray, n);
+    return true;
+  }
+
+  // 从吸盘释放位姿推盒心位姿 (工具朝下, 盒心在吸盘末端下方半个盒高).
+  geometry_msgs::msg::Pose boxCenterFromRelease(const geometry_msgs::msg::Pose & release,
+                                                double thickness) const
+  {
+    geometry_msgs::msg::Pose box = release;
+    box.position.z -= thickness / 2.0;
+    return box;
+  }
+
+  // 从托盘取一个盒: 规划到该盒释放位姿正上方 transit_z_ -> 笛卡尔垂直直下到释放位姿 ->
+  // 吸 -> attach. 与 placeAtPose 严格对称 (它是: 抬起 -> transit -> 直下 -> 释放),
+  // 故放得进去就取得出来.
+  bool pickFromTray(const geometry_msgs::msg::Pose & release, double thickness,
+                    const char * what, int tray)
+  {
+    const double v = plan_velocity_scaling_ * place_velocity_scaling_;
+    move_group_->setMaxVelocityScalingFactor(v);
+    move_group_->setMaxAccelerationScalingFactor(v);
+
+    // 本盘已落盒全程移出: 它们正是要取的目标 (以及同盘下层), 当障碍会挡住 transit 与直下.
+    // 别盘的留着当障碍, 防规划器横扫 (2026-07-28 蹭飞事故).
+    hideTrayBoxes(tray);
+
+    // 规划到正上方高空 transit: 两端都在自由空间, 失败率≈0 (放置段实测四轮).
+    geometry_msgs::msg::Pose transit = release;
+    transit.position.z = transit_z_;
+    move_group_->setStartStateToCurrentState();
+    move_group_->setPoseTarget(transit);
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    if (move_group_->plan(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+      RCLCPP_ERROR(logger_, "取盒(%s): 规划到 transit (%.3f,%.3f,%.3f) 失败", what,
+                   transit.position.x, transit.position.y, transit.position.z);
+      showTrayBoxes(tray); restorePlanScaling(); return false;
+    }
+    if (dry_run_) {
+      RCLCPP_WARN(logger_, "取盒(%s): [dry_run] transit 规划通过 (%zu 点), 不执行", what,
+                  plan.trajectory_.joint_trajectory.points.size());
+    } else {
+      if (move_group_->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+        showTrayBoxes(tray); restorePlanScaling(); return false;
+      }
+      settle();
+    }
+
+    // 笛卡尔垂直直下到释放位姿 (吸盘回到当初放这个盒时所在处).
+    std::vector<geometry_msgs::msg::Pose> dwps{release};
+    moveit_msgs::msg::RobotTrajectory dtraj;
+    if (dry_run_) {
+      // dry_run 下上一段没真执行, 臂仍在原处; 直下起点接上一段规划的终点, 否则覆盖必然 0%.
+      const auto cur_state = move_group_->getCurrentState();
+      if (!cur_state) { showTrayBoxes(tray); restorePlanScaling(); return false; }
+      moveit::core::RobotState start(*cur_state);
+      const auto & jt = plan.trajectory_.joint_trajectory;
+      start.setVariablePositions(jt.joint_names, jt.points.back().positions);
+      move_group_->setStartState(start);
+    } else {
+      move_group_->setStartStateToCurrentState();
+    }
+    const double frac = move_group_->computeCartesianPath(dwps, 0.005, 0.0, dtraj);
+    if (frac < 0.9) {
+      RCLCPP_ERROR(logger_, "取盒(%s): 垂直直下覆盖不足 %.0f%%", what, frac * 100);
+      showTrayBoxes(tray); restorePlanScaling(); return false;
+    }
+    if (dry_run_) {
+      RCLCPP_WARN(logger_, "取盒(%s): [dry_run] 直下覆盖 %.0f%% (目标 z=%.3f), 到此为止",
+                  what, frac * 100, release.position.z);
+      // 挂虚拟盒 (同 onExecute/place_only 的 dry_run): 没有它后面放到卸货点那段是按
+      // "吸盘上空着"规划的, 验不到盒子几何在目的地会不会撞. 由 unloadTray 走完一轮 detach.
+      attachBox(true, thickness);
+      showTrayBoxes(tray); restorePlanScaling(); return true;
+    }
+    if (move_group_->execute(dtraj) != moveit::core::MoveItErrorCode::SUCCESS) {
+      showTrayBoxes(tray); restorePlanScaling(); return false;
+    }
+    settle();
+
+    // 吸取 + 转保压 (与 stageInsert 同一套: 抽真空建立负压, 再 STOP 关泵关阀维持).
+    publishPump(PUMP_SUCK);
+    RCLCPP_INFO(logger_, "取盒(%s): 已到位, 发 /pump_cmd 1 抽真空 %.1fs", what, suck_duration_);
+    rclcpp::sleep_for(std::chrono::milliseconds(static_cast<int>(suck_duration_ * 1000)));
+    publishPump(PUMP_STOP);
+    // 盒在托盘里与 Link_11 几何重叠, 必须豁免与托盘接触, 否则连抬起都规划不了.
+    attachBox(true, thickness);
+    showTrayBoxes(tray);   // 本盘其余盒加回当障碍 (这个盒已 popLayer 出栈, 不会重复)
+    restorePlanScaling();
+    RCLCPP_INFO(logger_, "取盒(%s): 已吸取并转保压", what);
+    return true;
   }
 
   // 抓取周期(三段): 取 object_pose -> ①粗定位 ②精修 ③末段直插吸取. 抓取与卸货共用.
@@ -2070,6 +2309,7 @@ private:
   double suck_duration_, release_duration_, insert_velocity_scaling_;
   double settle_sec_, settle_eps_, settle_poll_sec_;
   double place_x_, place_y_, place_z_, place_clearance_;
+  double unload_base_x_, unload_base_y_, unload_x_offset_, unload_z_, unload_pick_shortfall_;
   double plan_velocity_scaling_, rotate_velocity_scaling_;
 
   // 双托盘放置 + 按类别堆叠
@@ -2105,8 +2345,12 @@ private:
   // 放另一盘时 MoveIt 自动避让, 不再横扫已放盒 (2026-07-28 蹭飞事故). detach 的是携带盒
   // (carried_box), 这些是"已落盘"的独立世界碰撞体, 生命周期到 reset_stack 才清.
   std::vector<std::vector<std::string>> placed_ids_;
-  // 每个已放盒的 base_link 系落位姿 (与 id 一一对应), 供临时移出后原样加回.
+  // 每个已放盒的 base_link 系**盒心**位姿 (与 id 一一对应), 供临时移出后原样加回.
   std::vector<std::vector<geometry_msgs::msg::Pose>> placed_poses_;
+  // 每个已放盒放置时的**吸盘**释放位姿 + 厚度 (与 id 一一对应). 卸货(popLayer)原路取回用:
+  // 取盒要把吸盘开回当初放它的那个位姿, 而 placed_poses_ 存的是盒心, 差半个盒高.
+  std::vector<std::vector<geometry_msgs::msg::Pose>> placed_release_;
+  std::vector<std::vector<double>> placed_th_;
   // 类别/厚度 B 路线缓存 (cls_mtx_ 保护)
   std::mutex cls_mtx_;
   int last_category_{1};
@@ -2137,7 +2381,7 @@ private:
   rclcpp::Publisher<moveit_msgs::msg::CollisionObject>::SharedPtr co_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_, unload_srv_, ready_srv_, look_srv_,
     pick_srv_, place_srv_, coarse_srv_, cam_cal_srv_, yaw_cal_srv_, reset_srv_, jog_srv_,
-    seed_srv_;
+    seed_srv_, unload_tray_srv_;
   rclcpp::Client<moveit_msgs::srv::ApplyPlanningScene>::SharedPtr apply_scene_cli_;
   rclcpp::Client<moveit_msgs::srv::GetPlanningScene>::SharedPtr get_scene_cli_;
   rclcpp::CallbackGroup::SharedPtr srv_cb_group_, scene_cb_group_, perc_cb_group_;
