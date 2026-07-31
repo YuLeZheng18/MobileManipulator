@@ -1,0 +1,41 @@
+# 手柄遥控参数 (DragonRise 山寨 PS2 手柄, 2026-07-31 真机实测定稿)
+#
+# 链路: joy_node -> /joy -> teleop_twist_joy_node -> /cmd_vel -> 底盘固件
+# 不经 cmd_vel_smoother: 固件自带加速度斜坡 (config.h MAX_LIN_ACCEL 0.6 / MAX_ANG_ACCEL 3.0),
+# 再串一级限幅手感发黏, 且下面的 scale 值就是直发量到的实测值。
+
+joy_node:
+  ros__parameters:
+    # joy_node 只有 device_id(int) 与 device_name(string) 两个参数, 没有设备路径 ——
+    # 故 ESP32/雷达那套 udev 软链在手柄上用不上, 稳定绑定只能靠 HID 描述符里的名字。
+    device_name: "Controller"
+    deadzone: 0.05
+    # 手柄静止时不会自己发帧, 而 teleop 收不到帧就不发 /cmd_vel, 固件 500ms
+    # (CMD_TIMEOUT_MS) 收不到指令就失效保护刹停 —— 靠 autorepeat 把最后一帧续上。
+    autorepeat_rate: 20.0
+
+teleop_twist_joy_node:
+  ros__parameters:
+    # 全向底盘: 左摇杆前后=vx, 左右=vy, 右摇杆左右=wz
+    axis_linear:
+      x: 1
+      y: 0
+    axis_angular:
+      yaw: 2
+
+    scale_linear:
+      x: 0.20
+      y: 0.20
+    scale_angular:
+      yaw: 0.6
+
+    scale_linear_turbo:
+      x: 0.35
+      y: 0.35
+    scale_angular_turbo:
+      yaw: 1.0
+
+    # R1=死人开关, 必须按住才发速度; L1=turbo。实测 turbo 不绕过死人开关
+    # (只按 L1 时 /cmd_vel 计数冻住不动), 故 turbo 是安全的。
+    enable_button: 5
+    enable_turbo_button: 4

@@ -39,6 +39,10 @@
 
   <exec_depend>nav2_bringup</exec_depend>
 
+  <!-- 手柄遥控 (teleop.launch.py, 路线图 D2.2) -->
+  <exec_depend>joy</exec_depend>
+  <exec_depend>teleop_twist_joy</exec_depend>
+
   <!-- 分布式调试本机端: RViz(moveit_rviz, arm_moveit_config 已依赖) + 相机监视 -->
   <!-- 相机图走压缩传输, 两机都需装压缩插件 -->
   <exec_depend>rqt_image_view</exec_depend>
