@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <esp_system.h>
 #include "config.h"
 #include "Motor.h"
 #include "Encoder.h"
@@ -248,6 +249,11 @@ void loop() {
 void setup() {
   DBG.begin(115200);
   DBG.println("\n[chassis] booting...");
+  // 复位原因: 0=无法判定(esptool 经 RTS 硬复位后首启即此值, 实测) 1=上电 3=软复位
+  // 4=看门狗(panic) 5=中断看门狗 6=任务看门狗 7=其它看门狗 9=brownout(掉压)
+  // 具体见 esp_reset_reason_t. 同值也随 /chassis_diag 上报, 因为 UART0
+  // (GPIO43/44) 默认没接到上位机, 只有插了调试线才看得到这行.
+  DBG.printf("[chassis] reset_reason=%d\n", (int)esp_reset_reason());
 
   // 电机 + 公共刹车 (LEDC 通道 0-3 给四轮)
   for (int i = 0; i < 4; i++) motors[i].begin(DIR_PINS[i], PWM_PINS[i], i);

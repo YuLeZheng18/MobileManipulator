@@ -10,8 +10,10 @@
 #include <nav_msgs/msg/odometry.h>
 #include <sensor_msgs/msg/imu.h>
 #include <sensor_msgs/msg/battery_state.h>
+#include <std_msgs/msg/string.h>
 #include <micro_ros_utilities/string_utilities.h>
 #include <rmw_microros/rmw_microros.h>
+#include <esp_system.h>
 #include <math.h>
 
 static rclc_support_t support;
@@ -28,6 +30,17 @@ static nav_msgs__msg__Odometry msg_odom;
 static sensor_msgs__msg__Imu msg_imu;
 static sensor_msgs__msg__BatteryState msg_bat;
 static rcl_timer_t timer;
+
+// --- 诊断 (查"底盘话题静默停摆"用, 2026-07-31) ---
+// 症状: /wheel_odom /imu /battery 同时停发, agent 侧证实串口 0 字节、DTR 高、USB 未掉线,
+// 即 ESP32 侧 micro-ROS 静默停摆. 调试 log 走 UART0(GPIO43/44) 但没接到 Nano, panic/复位
+// 原因全打进空气, 故把关键状态搬到 ROS 话题上, 恢复后即可回溯.
+// uptime_s 是本组里最关键的一项: 下次再停, 若话题恢复后 uptime 从小数字重新计 -> 芯片重启过
+// (看 reset_reason 定性); 若 uptime 仍在原值上连续 -> 芯片没重启, 是任务/传输层死了. 两者修法不同.
+static rcl_publisher_t pub_diag;
+static std_msgs__msg__String msg_diag;
+static char diag_buf[192];
+static TaskHandle_t g_uros_task = NULL;   // 自身句柄, 用于查栈水位
 
 // --- 共享数据 + 临界区 ---
 static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
@@ -105,6 +118,30 @@ static void timer_callback(rcl_timer_t* t, int64_t) {
   msg_bat.voltage = bt.v;
   msg_bat.current = bt.i;
   rcl_publish(&pub_bat, &msg_bat, NULL);
+
+  // --- 诊断: 本 timer 20Hz, 每 40 拍 = 2s 发一次 (低频, 不占带宽) ---
+  // 用 static 计数而非 EXECUTE_EVERY_N_MS: 那个宏定义在本函数之后.
+  // 字符串直接指向静态缓冲区、不走 micro_ros_utilities_set: 后者每次会重新分配, 20Hz timer
+  // 里反复分配释放是堆碎片来源, 而本消息内容长度固定.
+  static uint32_t diag_tick = 0;
+  if (++diag_tick >= 40) {
+    diag_tick = 0;
+    const uint32_t up_s = (uint32_t)(millis() / 1000UL);
+    // 栈水位单位是"字", 乘 4 换成字节 (ESP32 32 位)
+    const uint32_t stack_free = g_uros_task
+      ? (uint32_t)uxTaskGetStackHighWaterMark(g_uros_task) * 4U : 0U;
+    const int n = snprintf(diag_buf, sizeof(diag_buf),
+      "rst=%d up=%lus heap=%lu minheap=%lu urosstack=%lu",
+      (int)esp_reset_reason(),
+      (unsigned long)up_s,
+      (unsigned long)esp_get_free_heap_size(),
+      (unsigned long)esp_get_minimum_free_heap_size(),
+      (unsigned long)stack_free);
+    msg_diag.data.data = diag_buf;
+    msg_diag.data.size = (n > 0) ? (size_t)n : 0;
+    msg_diag.data.capacity = sizeof(diag_buf);
+    rcl_publish(&pub_diag, &msg_diag, NULL);
+  }
 }
 
 // 节流宏: 每 MS 毫秒执行一次 X (micro-ROS 官方 reconnect 例程写法)
@@ -135,6 +172,10 @@ static bool create_entities() {
         ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu), "/imu") != RCL_RET_OK) return false;
   if (rclc_publisher_init_best_effort(&pub_bat, &node,
         ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, BatteryState), "/battery") != RCL_RET_OK) return false;
+  // 诊断话题也用 best_effort: 它是用来观测传输层的, 若自己走 reliable, 链路劣化时重传会
+  // 反过来加剧阻塞 —— 观测手段污染观测对象.
+  if (rclc_publisher_init_best_effort(&pub_diag, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String), "/chassis_diag") != RCL_RET_OK) return false;
 
   // 订阅者 /cmd_vel (best_effort)
   if (rclc_subscription_init_best_effort(&sub_cmd, &node,
@@ -162,6 +203,7 @@ static void destroy_entities() {
   rcl_publisher_fini(&pub_odom, &node);
   rcl_publisher_fini(&pub_imu, &node);
   rcl_publisher_fini(&pub_bat, &node);
+  rcl_publisher_fini(&pub_diag, &node);
   rcl_subscription_fini(&sub_cmd, &node);
   rcl_subscription_fini(&sub_pump, &node);
   rcl_timer_fini(&timer);
@@ -171,6 +213,8 @@ static void destroy_entities() {
 }
 
 void MicroRos::task(void* arg) {
+  g_uros_task = xTaskGetCurrentTaskHandle();   // 供诊断话题查本任务栈水位
+
   // 原生 USB 串口传输 (Serial = USB-OTG)
   Serial.begin(115200);
   set_microros_serial_transports(Serial);
