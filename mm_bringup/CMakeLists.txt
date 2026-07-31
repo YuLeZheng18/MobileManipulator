@@ -21,4 +21,10 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
 )
 
+# 真机诊断工具 (跑在 Nano 上, 与上面的 mock 无关)
+install(PROGRAMS
+  scripts/chassis_diag_logger.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()
