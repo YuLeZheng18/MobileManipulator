@@ -34,6 +34,11 @@ ament_target_dependencies(grasp_node
 install(TARGETS grasp_node
   DESTINATION lib/${PROJECT_NAME})
 
+# 手柄双模式遥控节点 (车模式转发底盘 / 臂模式经 servo 点动)
+install(PROGRAMS
+  scripts/joy_arm_teleop.py
+  DESTINATION lib/${PROJECT_NAME})
+
 install(DIRECTORY config launch
   DESTINATION share/${PROJECT_NAME})
 
