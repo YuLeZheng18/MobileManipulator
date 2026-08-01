@@ -2106,6 +2106,13 @@ private:
       RCLCPP_ERROR(logger_, "回 ready 规划失败"); return false;
     }
     if (move_group_->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) return false;
+    // 必须等停稳才返回, 同 moveToLook/moveToHome: 控制器报完成时关节尚未停到位, 调用方
+    // 若背靠背接下一段, setStartStateToCurrentState() 会抓到未停稳的中间态, 从这个假起点
+    // 规划出的轨迹起点与真实位置有偏差, 执行时先纠偏再走正路 —— 表现为某关节"卡一下又
+    // 突然跟上"。2026-08-01 实测: 遥控停机键连调 ready->home, ready 轨迹 8ms 报成功
+    // (本就在 ready 位, 近零长度), 80ms 后 home 即开始规划, J2 出现前后来回。
+    // 手动一步步调时中间有人为间隔, 所以这个缺陷一直被遮着。
+    settle();
     RCLCPP_INFO(logger_, "已回 ready 位");
     return true;
   }
