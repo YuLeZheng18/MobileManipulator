@@ -21,12 +21,13 @@
 
   <exec_depend>ros2launch</exec_depend>
 
-  <!-- 手柄双模式遥控节点 joy_arm_teleop.py.
+  <!-- 手柄三态遥控节点 joy_arm_teleop.py.
        ⚠️ 刻意**不**依赖 mm_bringup: 那边已 exec_depend mm_grasp, 反向加就成环,
        colcon 会拒绝解析构建顺序。故起它的 teleop_full.launch.py 放在 mm_bringup
        (聚合总包本就该单向依赖各功能包), 本包只出节点。 -->
   <exec_depend>rclpy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>  <!-- 卸货前设 grasp_node 的 unload_tray 参数 -->
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

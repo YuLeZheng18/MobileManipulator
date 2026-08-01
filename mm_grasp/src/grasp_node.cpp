@@ -298,6 +298,9 @@ public:
     place_y_ = node_->declare_parameter<double>("place_y", -0.38);
     place_z_ = node_->declare_parameter<double>("place_z", 0.030);
     place_clearance_ = node_->declare_parameter<double>("place_clearance", 0.12);
+    // /grasp/level (手柄 △ 回正) 抬到的离地高度. 与 pregrasp_height 无关: 那个是"盒子上方
+    // 12cm", 这个是"离地 20cm"的绝对高度, 点动待命位.
+    level_height_ = getOrDeclare<double>("level_height", 0.20);
 
     // ---- 按托盘卸货 (/grasp/unload_tray): 两个卸货点沿 base x 轴对称分布 ----
     // 2026-07-30 实标 (RViz 拖臂到吸盘接地, 读 base_link->suction_tip):
@@ -523,6 +526,43 @@ public:
              std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
         res->success = moveToReady();
         res->message = res->success ? "arm at ready" : "move to ready failed";
+      },
+      rmw_qos_profile_services_default, srv_cb_group_);
+    // 收拢姿势 (SRDF group_state "home"): 手柄遥控 HOME 态 / 断电前收臂用.
+    // 与 ready 的分工: ready 是"底盘可走"的行进姿态, home 是停机姿态, 二者都不伸出。
+    home_srv_ = node_->create_service<std_srvs::srv::Trigger>(
+      "/grasp/home",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        res->success = moveToHome();
+        res->message = res->success ? "arm at home" : "move to home failed";
+      },
+      rmw_qos_profile_services_default, srv_cb_group_);
+    // 姿态回正 + 抬到固定高度 (手柄 △ 键): 点动把腕转歪之后一键找回可用状态.
+    // 腕姿态回到 coarse_yaw_ —— 必须与①粗定位同一个朝向, 否则 cam_target 标定不成立
+    // (相机装在腕上, 换姿态就偏; 见 stageCoarse 注释里 -177° 偏 55mm 那次).
+    // x/y 保持不动: 只回姿态和高度, 不替人挪位置.
+    level_srv_ = node_->create_service<std_srvs::srv::Trigger>(
+      "/grasp/level",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        res->success = levelAndLift(res->message);
+      },
+      rmw_qos_profile_services_default, srv_cb_group_);
+    // 放回地面 (手柄 ○ 键): 落点取当前 TCP 正下方 —— 盒本来就是从那儿抓起来的, 原地放回
+    // 不引入新的可达性风险. 释放高度/离地间隙用既有标定 place_z_ / place_clearance_.
+    place_ground_srv_ = node_->create_service<std_srvs::srv::Trigger>(
+      "/grasp/place_ground",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        geometry_msgs::msg::PoseStamped cur;
+        if (!currentTcp(cur)) {
+          res->success = false; res->message = "取当前位姿失败"; return;
+        }
+        const double x = cur.pose.position.x, y = cur.pose.position.y;
+        RCLCPP_WARN(logger_, "==== /grasp/place_ground: 原地放回地面 (%.3f,%.3f) ====", x, y);
+        res->success = placeAt(x, y, place_z_, place_clearance_);
+        res->message = res->success ? "已放回地面并释放" : "放回地面失败(盒可能仍吸着)";
       },
       rmw_qos_profile_services_default, srv_cb_group_);
     // 看货姿势 (mm_task 抓取前 S3 调): ready + J1+90°, 相机转向货物再做闭环抓取.
@@ -2070,6 +2110,49 @@ private:
     return true;
   }
 
+  bool moveToHome()
+  {
+    move_group_->setStartStateToCurrentState();
+    move_group_->setNamedTarget("home");
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    if (move_group_->plan(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+      RCLCPP_ERROR(logger_, "回 home 规划失败"); return false;
+    }
+    if (move_group_->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) return false;
+    settle();
+    RCLCPP_INFO(logger_, "已回 home 收拢位");
+    return true;
+  }
+
+  // 腕姿态回正到 coarse_yaw_ (吸盘朝下) + TCP 抬到离地 level_height_, x/y 原地不动.
+  // 一次 plan 同时改姿态和 z: 分两步做的话中间态可能是"歪着还没抬起", 更容易撞.
+  bool levelAndLift(std::string & msg)
+  {
+    geometry_msgs::msg::PoseStamped cur;
+    if (!currentTcp(cur)) { msg = "取当前位姿失败"; return false; }
+    geometry_msgs::msg::Pose target;
+    target.position.x = cur.pose.position.x;
+    target.position.y = cur.pose.position.y;
+    target.position.z = ground_z_ + level_height_;
+    target.orientation = yawToQuat(coarse_yaw_);
+    move_group_->setStartStateToCurrentState();
+    move_group_->setPoseTarget(target);
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    if (move_group_->plan(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+      msg = "姿态回正规划失败"; return false;
+    }
+    if (move_group_->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+      msg = "姿态回正执行失败"; return false;
+    }
+    settle();
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "已回正 (吸盘朝下, TCP z=%.3f 离地%.0fcm)",
+                  target.position.z, level_height_ * 100);
+    msg = buf;
+    RCLCPP_INFO(logger_, "%s", buf);
+    return true;
+  }
+
   // 看货姿势: 取 ready 关节值, J1(Joint_11) 加 look_j1_offset_(默认 +90°), 手眼相机转向
   // 货物侧再做闭环抓取(为了让视觉看见). 纯关节目标, 不算笛卡尔.
   bool moveToLook()
@@ -2632,7 +2715,7 @@ private:
   double insert_stroke_min_, insert_stroke_max_, ground_z_, insert_shortfall_;
   double suck_duration_, release_duration_, insert_velocity_scaling_;
   double settle_sec_, settle_eps_, settle_poll_sec_;
-  double place_x_, place_y_, place_z_, place_clearance_;
+  double place_x_, place_y_, place_z_, place_clearance_, level_height_;
   double unload_base_x_, unload_base_y_, unload_x_offset_, unload_z_;
   std::vector<double> unload_transit_candidates_;  // 卸货 transit 高度候选, 从低到高试
   std::vector<double> transit_candidates_;         // 装货(放托盘) transit 高度候选, 同上
@@ -2716,7 +2799,7 @@ private:
   rclcpp::Publisher<moveit_msgs::msg::CollisionObject>::SharedPtr co_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_, unload_srv_, ready_srv_, look_srv_,
     pick_srv_, place_srv_, coarse_srv_, cam_cal_srv_, yaw_cal_srv_, reset_srv_, jog_srv_,
-    seed_srv_, unload_tray_srv_;
+    seed_srv_, unload_tray_srv_, home_srv_, level_srv_, place_ground_srv_;
   rclcpp::Client<moveit_msgs::srv::ApplyPlanningScene>::SharedPtr apply_scene_cli_;
   rclcpp::Client<moveit_msgs::srv::GetPlanningScene>::SharedPtr get_scene_cli_;
   rclcpp::CallbackGroup::SharedPtr srv_cb_group_, scene_cb_group_, perc_cb_group_;

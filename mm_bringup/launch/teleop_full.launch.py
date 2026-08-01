@@ -1,8 +1,14 @@
-"""手柄双模式遥控 launch: 车模式开底盘 + 臂模式点动机械臂 (路线图 D2 收尾).
+"""手柄三态遥控 launch: 收拢 / 底盘行进 / 臂点动抓取 (路线图 D2 收尾).
 
     joy_node -> /joy ─┬─> teleop_twist_joy -> /cmd_vel_joy ─┐
                       │                                     ├─> joy_arm_teleop -> /cmd_vel
-                      └─> joy_arm_teleop (模式切换 + 臂点动) ─┘
+                      └─> joy_arm_teleop (状态机 + 臂点动) ──┘
+
+状态机: HOME ──START──> DRIVE <──SELECT──> ARM
+        臂 home         臂 ready          臂 look
+        车禁止          车放行            车禁止
+上电即 HOME (车臂都不动), 按 START 收臂到 ready 才放行底盘, SELECT 在行进/抓取间切。
+键位与状态机细节见 joy_arm_teleop.py 的模块 docstring。
 
 复用同包 teleop.launch.py 起前两个 (轴/按键/速度上限是 D2.2 实测定稿值, 不在这里
 重写一份), 只把它的输出从 /cmd_vel 改到 /cmd_vel_joy 交 joy_arm_teleop 仲裁。
@@ -44,6 +50,13 @@ def generate_launch_description():
             default_value=os.path.join(
                 get_package_share_directory('mm_bringup'), 'config', 'teleop_ps2.yaml'),
             description='手柄轴/按键映射 (D2.2 实测定稿, 与单独遥控共用同一份)'),
+        DeclareLaunchArgument(
+            'home_on_start', default_value='false',
+            description='起栈后自动把臂摆到 home 收拢位。臂当前位置未知时别开 (会突然大幅运动)'),
+        DeclareLaunchArgument(
+            'drive_without_arm', default_value='false',
+            description='臂栈没跑时也允许进 DRIVE 遥控底盘。⚠️ 绕过"臂已收拢"校验, '
+                        '仅在臂确实没通电时用'),
     ]
 
     # joy_node + teleop_twist_joy, 输出改到 /cmd_vel_joy 交 joy_arm_teleop 仲裁。
@@ -56,13 +69,17 @@ def generate_launch_description():
         }.items(),
     )
 
-    # 模式仲裁 + 臂点动。按键号/约束盒边界待真机实测, 用 -p 覆盖或改脚本里默认值。
+    # 状态机 + 臂点动。按键号/轴号已是 2026-08-01 实测定稿; 约束盒盒顶/四角仍待实测。
     arm_teleop = Node(
         package='mm_grasp',
         executable='joy_arm_teleop.py',
         name='joy_arm_teleop',
         output='screen',
-        parameters=[{'use_sim_time': False}],
+        parameters=[{
+            'use_sim_time': False,
+            'home_on_start': LaunchConfiguration('home_on_start'),
+            'drive_without_arm': LaunchConfiguration('drive_without_arm'),
+        }],
         remappings=[
             ('cmd_vel_in', '/cmd_vel_joy'),
             ('cmd_vel_out', '/cmd_vel'),
