@@ -51,6 +51,9 @@ static struct { float acc[3],gyro[3],angle[3]; } g_imu = {};
 static struct { float v,i; } g_bat = {};
 static volatile bool g_connected = false;
 static volatile uint32_t g_cmd_ms = 0;   // 上次收到 /cmd_vel 的时刻 (millis)
+// 时间同步失败标志: 连接照常建立, 但消息 header 用的是本地时钟而非同步后的 agent 时钟.
+// 随 /chassis_diag 上报 (sync=0), 否则这事在外部完全看不出来.
+static volatile bool g_time_unsynced = false;
 
 CmdVel MicroRos::getCmd() { portENTER_CRITICAL(&mux); CmdVel c=g_cmd; portEXIT_CRITICAL(&mux); return c; }
 int8_t MicroRos::getPump() { return g_pump; }
@@ -131,12 +134,13 @@ static void timer_callback(rcl_timer_t* t, int64_t) {
     const uint32_t stack_free = g_uros_task
       ? (uint32_t)uxTaskGetStackHighWaterMark(g_uros_task) * 4U : 0U;
     const int n = snprintf(diag_buf, sizeof(diag_buf),
-      "rst=%d up=%lus heap=%lu minheap=%lu urosstack=%lu",
+      "rst=%d up=%lus heap=%lu minheap=%lu urosstack=%lu sync=%d",
       (int)esp_reset_reason(),
       (unsigned long)up_s,
       (unsigned long)esp_get_free_heap_size(),
       (unsigned long)esp_get_minimum_free_heap_size(),
-      (unsigned long)stack_free);
+      (unsigned long)stack_free,
+      g_time_unsynced ? 0 : 1);
     msg_diag.data.data = diag_buf;
     msg_diag.data.size = (n > 0) ? (size_t)n : 0;
     msg_diag.data.capacity = sizeof(diag_buf);
@@ -240,9 +244,18 @@ void MicroRos::task(void* arg) {
 
       case AGENT_AVAILABLE:
         if (create_entities()) {
-          rmw_uros_sync_session(1000);   // 时间同步 (供 timer_callback 打时间戳)
+          // 时间同步 (供 timer_callback 打时间戳). **不阻断连接**:
+          // 原先裸调 sync_session(1000) 且不看返回值。若它在串口上不返回, g_connected 就
+          // 永远是 false, control_task 的 failsafe 恒真把四路 PWM 钉死在 0, 且状态机进不了
+          // AGENT_CONNECTED 就从不 spin_some -> odom/imu/diag 全哑, 外部完全看不出卡在哪。
+          // 时间戳只影响消息 header, 同步失败退化成本地时钟即可, 不值得赌整个连接。
+          // 超时 1000->200ms: 通不了就早点让路, 别拖着控制环空转。
+          // ⚠️ 这是预防性修复, **不是** 2026-08-01 那次静默停摆的根因 —— 该假设已被证伪
+          // (改完行为分毫未变; 事后实测 sync=1, 这条路径压根没触发)。别再照它查故障。
+          const rmw_ret_t sync = rmw_uros_sync_session(200);
           g_connected = true;
           state = AGENT_CONNECTED;
+          if (sync != RMW_RET_OK) g_time_unsynced = true;  // 随 /chassis_diag 上报
         } else {
           destroy_entities();            // 半成品清理, 回退重试
           state = WAITING_AGENT;
@@ -267,6 +280,7 @@ void MicroRos::task(void* arg) {
 
       case AGENT_DISCONNECTED:
         g_connected = false;
+        g_time_unsynced = false;   // 下轮重连重新判定, 否则一次失败后永远显示 sync=0
         destroy_entities();
         state = WAITING_AGENT;
         break;
