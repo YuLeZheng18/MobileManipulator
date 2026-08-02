@@ -18,6 +18,9 @@
 START 是**总开关**: HOME 按它启动进 DRIVE; DRIVE/ARM 按它停机 —— 车停 + 臂经 ready
 回零位。**零位必须真回到**: 臂是增量编码器无 homing, 上电即认当前位置为零, 停在别处
 再上电则零位基准错, 之后所有 base_link 系标定值跟着偏。
+故 HOME 态下 START 的去向由 `arm_homed` 决定: 真=启动进 DRIVE, 假(上次收臂中途失败,
+臂停在半途)=继续重试收臂。没有这个区分则失败后再按 START 会去启动底盘, 车拖着伸出的臂走,
+且零位永远回不去。
 
     DRIVE: /cmd_vel_joy 原样转发到 /cmd_vel。臂停在 ready (收身, 不拖着伸出的臂走)。
     ARM:   掐掉转发并补发一帧零速 (不补的话底盘保持最后一个速度, 要等固件
@@ -26,6 +29,9 @@ START 是**总开关**: HOME 按它启动进 DRIVE; DRIVE/ARM 按它停机 —�
 
 R1(btn 5) 是两个状态通用的死人开关: DRIVE 下它是 teleop_twist_joy 的 enable_button
 (那边 yaml 配的), ARM 下它是点动使能 —— 同一个键在互斥状态里各司其职, 不冲突。
+⚠️ ARM 态的死人开关**还包含"joy 帧未过期"这一半**(`joy_stale_sec`): tick() 读的是缓存帧,
+joy_node 崩掉/手柄被拔时缓存会永久停在最后一帧, 不检查过期则臂照着冻结的摇杆位置一直走。
+DRIVE 态不需要(joy 死了 teleop_twist_joy 自己停发, 固件 500ms failsafe 兜住)。
 
 臂模式下有**两套互不相干的运动路径**, 别混:
   ① 摇杆/十字键点动 -> /servo_node/delta_twist_cmds, 受下面的约束盒 (box_* 参数) 钳位。
@@ -44,8 +50,8 @@ R1(btn 5) 是两个状态通用的死人开关: DRIVE 下它是 teleop_twist_joy
     规划器不报、执行不停 (详见 grasp_node.cpp 里 transit_z 那段注释)。**两条路径都有这个
     缺口**, 不是遥控独有。
 约束盒只钳 TCP 的 x/y/z, 不钳姿态: 十字键转 roll/pitch 靠上面第一层兜, △ 键可随时回正。
-盒顶/四角当前仍是占位值 (box_z_min 0.12 是真值), 首次真机点动务必架空或把 servo_scale_*
-调到很小起步。
+盒的六个值已于 2026-08-01 真机实标 + IK 扫描复核 (见 box_* 参数处注释), 但标定环境是
+**空台架无货架围栏**, 故它保证的是"臂自身可达", 不是"不碰环境" —— 真上货架后要重标。
 
 ⚠️ 十字键在 DragonRise 手柄上是**轴不是按键** (2026-08-01 实测: axis 5=上下,
 axis 4=左右), 故 pitch/roll 按轴读。
@@ -59,7 +65,7 @@ import rclpy
 from geometry_msgs.msg import Twist, TwistStamped
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -75,6 +81,14 @@ class JoyArmTeleop(Node):
     def __init__(self):
         super().__init__('joy_arm_teleop')
         cb = ReentrantCallbackGroup()
+        # joy 回调**必须**单独一个互斥组: /joy 是 20Hz autorepeat 续帧, 留在 Reentrant 组里
+        # 则多帧在 MultiThreadedExecutor 下真并发, `if self.busy: return` 与 `busy=True`
+        # 之间隔着 _rising_edges/日志/_publish_zero 几步, 两帧都读到 busy==False 就双双放行
+        # ⇒ 起两个 worker, 各自往 MoveIt 发 action。
+        # 2026-08-01 实测症状: 按 START 后臂朝零位走到一半又被拽回 —— grasp_node 侧服务是
+        # 互斥的, 两个 worker 的 ready→home 交错成 ready→home→ready→home。
+        # 互斥组让 on_joy 串行, busy 的检查与占住、prev_buttons 的读改自然原子, 不必加锁。
+        joy_cb = MutuallyExclusiveCallbackGroup()
 
         # ---- 按键号 (DragonRise 手柄, 2026-08-01 真机 /joy 实测全部确认) ----
         self.btn_start = self.declare_parameter('btn_start', 9).value       # START: HOME->DRIVE
@@ -105,14 +119,26 @@ class JoyArmTeleop(Node):
         self.scale_wrist = self.declare_parameter('servo_scale_wrist', 0.15).value
 
         # ---- 约束盒 (base_link 系, TCP=suction_tip 不许出这个盒) ----
-        # 底: 与 grasp_node 的 pregrasp_height 同值 (抓取时臂本来就下到这个高度).
-        # 顶/四周: 手动 jog 到极限实测 —— 待真机量, 现为占位.
+        # 2026-08-01 真机实标 (RViz 拖臂走四角读 base_link->suction_tip) + /compute_ik
+        # 网格扫描复核 (吸盘朝下 yaw=-90°, 924 点 83% 有解).
+        # ⚠️ 标定环境是**空台架, 无货架围栏** —— 这组值反映的是**臂自身可达包络**,
+        #    不是"不碰环境". 真上货架/围栏后六个值全要重标.
+        #
+        # 底 0.12: 与 grasp_node 的 pregrasp_height 同值 (抓取时臂本来就下到这个高度).
+        #   实测最低可走到 z≈0.017, 但没采纳 —— 那只离地 6cm(地面 z=-0.0476), 而约束盒
+        #   钳不了腕姿态, 腕一歪就能怼地。
         self.box_z_min = self.declare_parameter('box_z_min', 0.12).value
-        self.box_z_max = self.declare_parameter('box_z_max', 0.40).value   # TODO 实测
-        self.box_x_min = self.declare_parameter('box_x_min', -0.32).value  # TODO 实测: 四角
-        self.box_x_max = self.declare_parameter('box_x_max', 0.32).value   # TODO 实测
-        self.box_y_min = self.declare_parameter('box_y_min', -0.34).value  # TODO 实测
-        self.box_y_max = self.declare_parameter('box_y_max', 0.10).value   # TODO 实测
+        # 顶 0.29: look 位实测 TCP z=0.295 (点动的起点, 盒必须容纳它).
+        self.box_z_max = self.declare_parameter('box_z_max', 0.29).value
+        self.box_x_min = self.declare_parameter('box_x_min', -0.17).value  # 实测 -0.167
+        # x_max 实测 0.146, 且扫描显示 x=+0.18 几乎全无解 —— 这是真的可达边缘, 不是保守值.
+        self.box_x_max = self.declare_parameter('box_x_max', 0.14).value
+        self.box_y_min = self.declare_parameter('box_y_min', -0.35).value  # 实测 -0.350
+        # y_max **刻意比实测的 -0.267 放宽**: look 位 TCP y=-0.201 在那之外, 照实测填则切进
+        # ARM 态时起点就在盒外, y 正向被永久钳住只能单向走回来。-0.19 给 look 起点留 10mm.
+        # 扫描确认 y∈[-0.21,-0.35] 全 z 全 x 干净; 再往上(y=-0.19)低 z 段中间 x 有空洞,
+        # 那是臂自身基座区, 归 servo 的 check_collisions 管 (第一层防护), 盒不重复兜.
+        self.box_y_max = self.declare_parameter('box_y_max', -0.19).value
 
         self.base_frame = self.declare_parameter('base_frame', 'base_link').value
         self.ee_frame = self.declare_parameter('ee_frame', 'suction_tip').value
@@ -125,11 +151,33 @@ class JoyArmTeleop(Node):
         # 没通电(或人眼确认已收拢)时用。臂栈在跑时保持 false, 让收臂失败拦住底盘。
         self.drive_without_arm = self.declare_parameter('drive_without_arm', False).value
 
+        # /joy 帧过期阈值: 超过这么久没收到新帧就当手柄不在, 停发点动。
+        # ⚠️ 这条是死人开关的**必要组成部分**, 不是优化 —— tick() 读的是缓存的 last_joy,
+        # 若 joy_node 崩了/手柄 USB 被拔, 而当时 R1 正按着摇杆正推着, 缓存就永久停在那一帧,
+        # tick() 会照着冻结的摇杆位置一直 30Hz 发点动, 臂走到撞上约束盒边界才停。
+        # DRIVE 态不需要这个(joy 死了 teleop_twist_joy 自己停发, 固件 500ms failsafe 兜住),
+        # **只有 ARM 态敞口**, 因为点动帧是本节点自己造的、永远新鲜。
+        # 取 0.4s: yaml 配 autorepeat 20Hz(50ms), 但 2026-08-01 实测 /joy 只有 15~16Hz 且
+        # **最大帧间隔 101ms** —— 阈值必须按实测的最坏间隔留余量, 不是按标称 50ms 算。
+        # 0.4s ≈ 4 个最坏间隔; 再小则偶发丢帧会误判掉线, 点动一顿一顿。
+        # 上限也别放太宽: 这是安全阈值, 手柄真掉了要在 0.4s 内停发, 期间臂最多多走
+        # 0.4s × 0.03m/s ≈ 12mm, 在约束盒的容差内。
+        self.joy_stale_sec = self.declare_parameter('joy_stale_sec', 0.4).value
+
         self.state = HOME
         self.last_joy = None
+        self.last_joy_time = None
         self.prev_buttons = []
         self.lock = threading.Lock()
         self.busy = False           # 服务在跑, 期间不接点动也不切状态
+        # 臂是否**确认**在零位。初值 True 是对的: 臂是增量编码器无 homing, 上电即认当前位置
+        # 为零, 所以"刚上电"与"在零位"是同一件事。
+        # 为什么需要这个标志: HOME 既是"臂在零位"也是各种失败后的兜底态, 两者不能混。
+        # 停机时 ready 或 home 失败, 臂停在半途而 state 已是 HOME ⇒ 再按 START 会走
+        # HOME->DRIVE(启动), 用户**永远没法用 START 重试收臂**。而零位必须真回到 ——
+        # 停在别处断电则下次上电零位基准错, 之后所有 base_link 系标定值跟着偏。
+        # 有了它, START 在 HOME 态就能分辨"该启动"还是"该重试停机"。
+        self.arm_homed = True
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -139,7 +187,7 @@ class JoyArmTeleop(Node):
             TwistStamped, '/servo_node/delta_twist_cmds', 10)
 
         self.create_subscription(Joy, 'joy', self.on_joy, qos_profile_sensor_data,
-                                 callback_group=cb)
+                                 callback_group=joy_cb)
         self.create_subscription(Twist, 'cmd_vel_in', self.on_cmd_vel, 10,
                                  callback_group=cb)
 
@@ -152,12 +200,24 @@ class JoyArmTeleop(Node):
         self.set_tray = self.create_client(SetParameters, '/grasp_node/set_parameters',
                                            callback_group=cb)
 
-        self.create_timer(1.0 / self.rate_hz, self.tick, callback_group=cb)
+        # tick 与 on_joy 同组: 点动发帧与状态迁移从此串行, 不会交错 ——
+        # 这也根治了原先靠"busy=True 必须写在 state=ARM 之前"缓解的那个瞬间窗口。
+        # 两者都不阻塞(tick 只查 TF, on_joy 只起线程), 放一个互斥组不会互相饿死。
+        self.create_timer(1.0 / self.rate_hz, self.tick, callback_group=joy_cb)
         self.get_logger().warn(
             '手柄三态遥控就绪 [HOME] — START(%d) 进 DRIVE, SELECT(%d) 切 DRIVE/ARM, '
             '死人开关 R1(%d)' % (self.btn_start, self.btn_select, self.btn_enable))
         if self.home_on_start:
-            self._run_action('上电收拢', '/grasp/home')
+            # after 给成空函数而不是默认的 _restart_servo: 这里是 HOME 态, servo 基准要等
+            # 切进 ARM 时才锁(_to_arm 里做), 此刻重锁毫无意义。
+            # 收拢期间 arm_homed 先置假 —— 臂上电位置未知才需要跑这一步, 只有**成功**才算
+            # 确认在零位, 故走 on_success 而不是 after(after 失败也会执行)。
+            self.arm_homed = False
+            self._run_action('上电收拢', '/grasp/home',
+                             after=lambda: None, on_success=self._mark_homed)
+
+    def _mark_homed(self):
+        self.arm_homed = True
 
     # ---- 底盘: 只有 DRIVE 态转发 ----
     def on_cmd_vel(self, msg):
@@ -167,6 +227,9 @@ class JoyArmTeleop(Node):
     def on_joy(self, msg):
         with self.lock:
             self.last_joy = msg
+            # 用本地时钟而不是 msg.header.stamp: 跨机时 stamp 受 NTP 对时影响,
+            # 而这里只关心"这一帧多久前到的我手上", 本地单调时间才是对的量。
+            self.last_joy_time = self.get_clock().now()
         pressed = self._rising_edges(msg)
         if pressed:
             # 诊断: 每个上升沿都记, 含被 busy 丢弃的 —— 查"某键触发了意外动作"必须
@@ -176,8 +239,10 @@ class JoyArmTeleop(Node):
         if not pressed or self.busy:
             return
         if self.btn_start in pressed:
-            # START 是总开关: HOME 时启动进 DRIVE, 其余状态一律停机回零位.
-            if self.state == HOME:
+            # START 是总开关: HOME 且臂确认在零位时启动进 DRIVE, 其余一律停机回零位.
+            # arm_homed 为假说明上次停机没收成(臂停在半途), 此时 START 继续重试收臂 ——
+            # 不能去启动底盘, 否则车拖着伸出的臂走, 且零位永远回不去。理由见 arm_homed 定义。
+            if self.state == HOME and self.arm_homed:
                 self._to_drive('START')
             else:
                 self._to_shutdown()
@@ -243,6 +308,9 @@ class JoyArmTeleop(Node):
         # 先把臂收回 ready 再放行底盘, 顺序不能反 —— 不然车拖着伸出的臂走.
         # 收臂期间挂在 HOME 这个过渡态: 车不放行, 臂也不接点动.
         prev, self.state = self.state, HOME
+        # 一旦开始往 ready 走就不再"确认在零位"了。必须在这里清而不是在 worker 里 ——
+        # 收臂失败时臂已离开零位停在半途, 那种情况下 START 必须走重试停机而非启动底盘。
+        self.arm_homed = False
         self._publish_zero()
         self.get_logger().warn('[%s->DRIVE] 经 %s: 收臂到 ready 中, 底盘暂不放行...'
                                % (prev, via))
@@ -272,6 +340,7 @@ class JoyArmTeleop(Node):
         分两段(先 ready 再 home)而不是从 look 直接规划回零: 跨度小, 规划失败率低。
         """
         prev, self.state = self.state, HOME
+        self.arm_homed = False   # 收成之前一律当"没在零位", 中途失败则 START 会继续重试
         self._publish_zero()
         self.get_logger().warn('[%s->HOME] 经 START 停机: 车已停, 臂回零位中...' % prev)
         self.busy = True   # 同步占住, 理由见 _run_action
@@ -280,15 +349,18 @@ class JoyArmTeleop(Node):
             try:
                 ok, m = self._call_sync('/grasp/ready')
                 if not ok:
-                    self.get_logger().error('停机中止 — 收 ready 失败: %s。臂未回零位, '
-                                            '断电前请手动确认' % m)
+                    self.get_logger().error('停机中止 — 收 ready 失败: %s。'
+                                            '⚠️ 臂未回零位, **再按一次 START 可重试**; '
+                                            '断电前必须确认已回零' % m)
                     return
                 ok, m = self._call_sync('/grasp/home')
                 if ok:
+                    self.arm_homed = True
                     self.get_logger().warn('[HOME] 臂已回零位, 车已停 — 可断电')
                 else:
-                    self.get_logger().error('回零位失败: %s。⚠️ 断电前必须手动回零, '
-                                            '否则下次上电零位基准是错的' % m)
+                    self.get_logger().error('回零位失败: %s。⚠️ **再按一次 START 可重试**。'
+                                            '断电前必须手动回零, 否则下次上电零位基准是错的'
+                                            % m)
             finally:
                 self.busy = False
         threading.Thread(target=worker, daemon=True).start()
@@ -297,9 +369,10 @@ class JoyArmTeleop(Node):
         self.pub_cmd.publish(Twist())
 
     # ---- 动作: 阻塞期间不接点动, 跑完回到点动待命 ----
-    def _run_action(self, name, srv, first=None, then=None, after=None):
+    def _run_action(self, name, srv, first=None, then=None, after=None, on_success=None):
         # after 默认 = 重锁 servo 基准. 本方法只在 ARM 态被调(点动态), 而每个动作都动了臂,
         # 所以"跑完必须重锁"是无例外的规则 —— 设成默认值而不是逐个调用点去传, 免得漏。
+        # after 在 finally 里**无条件**跑(失败也得重锁基准); 只该在成功时做的事走 on_success。
         if after is None:
             after = self._restart_servo
         # busy 必须在起线程**之前**同步占住: 若留给 worker 去设, 从这里返回到 worker 被
@@ -323,6 +396,8 @@ class JoyArmTeleop(Node):
                 if ok and then:
                     self.get_logger().warn('%s: 收尾 %s' % (name, then))
                     self._call_sync(then)
+                if ok and on_success:
+                    on_success()
             finally:
                 # 先重锁 servo 基准再放行点动, 顺序不能反 —— 任何 MoveIt 轨迹跑完,
                 # servo 里那份 last_sent_command_ 都已过时, 不重锁则第一帧点动会跳回旧位姿.
@@ -385,7 +460,14 @@ class JoyArmTeleop(Node):
             return
         with self.lock:
             joy = self.last_joy
+            jt = self.last_joy_time
         if joy is None:
+            return
+        # joy 帧过期 = 手柄/joy_node 没了 -> 停发(等同松开死人开关)。理由见 joy_stale_sec。
+        if jt is None or (self.get_clock().now() - jt) > Duration(seconds=self.joy_stale_sec):
+            self.get_logger().error(
+                '/joy 超过 %.1fs 无新帧 — 手柄或 joy_node 掉了, 点动已停发'
+                % self.joy_stale_sec, throttle_duration_sec=2.0)
             return
         if not self._btn(joy, self.btn_enable):
             # 死人开关松开: **停发**, 绝不发全零帧。
