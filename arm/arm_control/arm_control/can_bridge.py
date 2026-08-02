@@ -23,6 +23,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from sensor_msgs.msg import JointState
+from std_srvs.srv import Trigger
 from ament_index_python.packages import get_package_share_directory, PackageNotFoundError
 
 from .can_interface import CANInterface
@@ -88,12 +89,20 @@ class CanBridge(Node):
         # 发送死区(度): 目标相对上次实发变化<此值的电机不重发.
         # 目的: 轨迹到位后目标静止时停发, 不再对已到位电机每帧重启梯形规划器
         # (会触发堵转保护锁死), 同时让查询帧恢复->反馈不再饿死. 对齐 joint_gui「动时发/停时静」.
+        # ⚠️ 死区是**逐电机**判的, 不是"任一轴变了就六轴全发" —— 详见 _changed_motors().
         self.declare_parameter('send_deadband_deg', 0.05)
+        # 反馈看门狗: 超过这么久没收到任何 CAN 反馈就持续报 ERROR.
+        # 为什么必须有: 反馈断了的时候 TopicBasedSystem 会**回显命令值**当测量值, 于是
+        # /joint_states 照常 100Hz、JTC 见"位置已到" 8ms 报成功、MoveIt 报动作完成 ——
+        # 整条链全线自欺, 而臂一动没动。2026-08-01 因此白查五小时(三条错误假设)。
+        # 这个看门狗是**唯一**会在那种情况下出声的地方, 别删。
+        self.declare_parameter('feedback_timeout_sec', 1.0)
 
         command_topic = self.get_parameter('command_topic').value
         state_topic = self.get_parameter('state_topic').value
         speeds_override = list(self.get_parameter('motor_speeds').value)
         self._send_deadband_deg = float(self.get_parameter('send_deadband_deg').value)
+        self._fb_timeout = float(self.get_parameter('feedback_timeout_sec').value)
         # PCAN 通道是 ctypes TPCANHandle, 不适合做 ROS 参数, 直接用常量(与 joint_gui.py 一致)
         self.can_channel = PCAN_USBBUS1
         self.send_rate = float(self.get_parameter('send_rate_hz').value)
@@ -119,6 +128,9 @@ class CanBridge(Node):
         self._last_sent: Optional[list] = None
         # 电机反馈位置(度)
         self._motor_deg = [0.0] * MOTOR_COUNT
+        # 反馈看门狗状态: 最后一次收到有效反馈的时刻(每个电机各记一份, 便于定位是哪几个哑了)
+        self._last_fb_time = [0.0] * MOTOR_COUNT
+        self._fb_alarm = False      # 已进告警态, 用于恢复时打一条"已恢复"
 
         self._running = True
         self._receive_running = False
@@ -136,7 +148,25 @@ class CanBridge(Node):
         # 发布关节状态给 TopicBasedSystem
         self._state_pub = self.create_publisher(JointState, state_topic, qos_rel)
 
+        # 重新使能服务: 使能帧原先只在 _connect_can() 里发一次, 驱动一旦进保护态就再没有
+        # 软件侧恢复路径, 只能物理断电重上(2026-08-01 就是这么恢复的)。有了这个服务可以先
+        # 试软恢复。⚠️ 不做自动重发 —— 驱动进保护态往往有物理原因(堵转/碰撞), 自动重使能
+        # 等于无声地把保护解掉再撞一次, 必须由人确认现场后手动调。
+        self._enable_srv = self.create_service(Trigger, '~/reenable', self._on_reenable)
+
         self._connect_can()
+
+    def _on_reenable(self, req, res):
+        del req
+        if not self.can.is_open:
+            res.success, res.message = False, 'CAN 未连接'
+            return res
+        self._enable_motors(True)
+        # 使能后清掉发送记账, 让下一轮把当前目标重新发一遍(保护态期间的目标已丢)
+        self._last_sent = None
+        res.success = True
+        res.message = '已重发六个电机的使能帧; 若仍无反馈则需检查驱动/接线/供电'
+        return res
 
     # ---------- CAN 生命周期 ----------
     def _connect_can(self):
@@ -145,6 +175,18 @@ class CanBridge(Node):
             self.get_logger().error(f'CAN 初始化失败: {msg}')
             return
         self.get_logger().info('CAN 已连接')
+
+        # 连上后立刻报一次总线状态: "CAN 已连接"只代表 PCAN 句柄开了, 与总线上有没有
+        # 节点应答无关。启动即 BUSOFF/BUSHEAVY 就直接指向物理层或波特率不匹配, 不必等
+        # 看门狗超时后再猜。
+        _, status_txt = self.can.get_status()
+        self.get_logger().info('CAN 控制器状态: %s' % status_txt)
+        if self.can.is_bus_off():
+            ok, rmsg = self.can.reset()
+            self.get_logger().error(
+                '启动即 BUSOFF —— 总线上没有正常通信(常见: 波特率不匹配 / 终端电阻 / '
+                '某节点拉死总线)。已尝试重置: %s' % rmsg)
+            del ok
 
         if self.auto_enable:
             self._enable_motors(True)
@@ -195,27 +237,95 @@ class CanBridge(Node):
         period = 1.0 / self.send_rate if self.send_rate > 0 else 0.01
         while self._running:
             target = self._target_or_none()
-            # 仅在目标相对上次实发有变化时才发一轮; 目标静止(轨迹已到位)则整轮跳过,
-            # 既不重启已到位电机的梯形规划器(防堵转锁死), 也不占用总线(查询帧得以恢复->反馈不饿死).
-            if target is not None and self.can.is_open and self._target_changed(target):
+            # 只发**真的在动**的那几个电机; 已到位的整轮跳过, 既不重启它们的梯形规划器
+            # (会触发堵转保护锁死), 也不占用总线(查询帧得以恢复->反馈不饿死).
+            moving = self._changed_motors(target) if target is not None else []
+            if moving and self.can.is_open:
                 # 帧构造与总线纪律完全不变: 发位置期间 _query_paused 挡住查询帧插入双帧中间(防 00 EE),
                 # 电机间隔 1ms 防 PCAN 队列瞬时溢出.
                 self._query_paused = True
                 try:
-                    for i in range(MOTOR_COUNT):
-                        self._send_position_command(i + 1, target[i])
+                    if self._last_sent is None:
+                        self._last_sent = list(target)
+                    for i in moving:
+                        if self._send_position_command(i + 1, target[i]):
+                            # 逐个记账: 发失败的那个不更新 _last_sent, 下一轮自然重试。
+                            # 原先整批赋值, 发失败也当已发, 目标就永久丢了。
+                            self._last_sent[i] = target[i]
+                        else:
+                            self.get_logger().error(
+                                '电机%d 位置帧发送失败 (目标 %.3f°)' % (i + 1, target[i]),
+                                throttle_duration_sec=1.0)
                         time.sleep(0.001)
-                    self._last_sent = list(target)
                 finally:
                     self._query_paused = False
+            self._check_feedback_alive()
             time.sleep(period)
 
-    def _target_changed(self, target) -> bool:
-        """任一电机目标相对上次实发变化超过死区即需要重发; 首次(未发过)必发."""
+    def _changed_motors(self, target) -> list:
+        """返回需要重发的电机下标(**逐个判**, 不是任一变则全发)。首次(未发过)全发。
+
+        ⚠️ 这里原先用 `any(...)` 整体判: 一个轴动就六个轴全重发 —— 与上面 send_deadband_deg
+        的注释("变化<此值的**电机**不重发")自相矛盾, 且后果严重: 点动/轨迹执行期间目标一直
+        在变, 于是六个电机每 10ms 全被重启一次梯形规划器, 而注释自己写着这会触发堵转保护
+        锁死。2026-08-01 六个驱动一起停止应答就是这么来的(驱动一直通着电)。
+        改成逐电机后, 只有真在动的轴承压, 静止轴彻底不被打扰。
+        """
         if self._last_sent is None:
-            return True
-        return any(abs(target[i] - self._last_sent[i]) > self._send_deadband_deg
-                   for i in range(MOTOR_COUNT))
+            return list(range(MOTOR_COUNT))
+        return [i for i in range(MOTOR_COUNT)
+                if abs(target[i] - self._last_sent[i]) > self._send_deadband_deg]
+
+    def _check_feedback_alive(self):
+        """反馈看门狗: 长时间收不到 CAN 反馈就持续报 ERROR。
+
+        必须有, 因为反馈断了整条链会自欺(见 feedback_timeout_sec 参数注释):
+        TopicBasedSystem 回显命令值 -> /joint_states 照常 100Hz -> JTC 8ms 报到位 ->
+        MoveIt 报成功, 而臂根本没动。**这是唯一会出声的地方。**
+        """
+        if not self.can.is_open:
+            return
+        now = time.time()
+        # 还没发过任何指令时电机可能本就不该有动作, 不报(避免启动瞬间刷屏)
+        if self._last_sent is None:
+            return
+        with self._lock:
+            last = list(self._last_fb_time)
+        silent = [i + 1 for i in range(MOTOR_COUNT)
+                  if now - last[i] > self._fb_timeout]
+        if silent:
+            self._fb_alarm = True
+            # 同时问控制器自己的状态位: Read() 在总线彻底静默时只报"队列空", 分不出
+            # "暂时没数据"与"控制器已 bus-off"。错误类型直接指向排查方向 ——
+            # BUSOFF/BUSHEAVY = 物理层或波特率; 状态 OK 而无应答 = 驱动器侧没回。
+            _, status_txt = self.can.get_status()
+            self.get_logger().error(
+                'CAN 反馈超时 %.1fs: 电机 %s 无应答 | 控制器状态: %s。'
+                '⚠️ 此时 /joint_states 仍会照常发布(TopicBasedSystem 回显命令值), '
+                'MoveIt 会假报动作成功 —— 别信它。'
+                % (self._fb_timeout, silent, status_txt), throttle_duration_sec=2.0)
+            self._recover_bus_off()
+        elif self._fb_alarm:
+            self._fb_alarm = False
+            self.get_logger().warn('CAN 反馈已恢复, 六个电机均在应答')
+
+    def _recover_bus_off(self):
+        """bus-off 时重置控制器。**只做 bus-off, 不碰电机使能。**
+
+        bus-off 是 CAN 控制器错误计数超限后的自我隔离, 不 reset 则永远不再收发,
+        表现为 read 冻住而 write 照涨 —— 断电重上能好正是因为那样才重新初始化了控制器。
+        reset 是恢复通信的必要条件, 但**不足以让电机动**: 驱动器若因堵转进了保护态,
+        还需人工确认现场后调 ~/reenable(刻意不自动)。
+        """
+        if not self.can.is_bus_off():
+            return
+        ok, msg = self.can.reset()
+        self.get_logger().error(
+            'CAN 处于 BUSOFF, 已尝试重置控制器: %s。'
+            '⚠️ 重置只恢复通信, 若电机因保护态不动仍需手动调 ~/reenable' % msg,
+            throttle_duration_sec=5.0)
+        if ok:
+            self._last_sent = None   # 保护期间的目标已丢, 让下一轮重发一遍
 
     # ---------- 0xFD 梯形位置模式 (joint_gui 验证过的基线协议) ----------
     def _send_position_command(self, motor_id: int, position_deg: float) -> bool:
@@ -267,7 +377,8 @@ class CanBridge(Node):
                     if not ok2:
                         return False
             return True
-        except Exception:
+        except Exception as e:
+            self.get_logger().error('构造/发送位置帧异常: %r' % e, throttle_duration_sec=2.0)
             return False
 
     # ---------- 查询循环: 0x36 请求反馈 ----------
@@ -301,8 +412,15 @@ class CanBridge(Node):
                 if ok:
                     self._process_message(msg)
                 else:
+                    # receive_message 把"队列空"(正常, 每秒几百次)与真错误都返回 False,
+                    # 只能靠文案区分。队列空静默跳过, 其余(总线错误/句柄失效)必须出声 ——
+                    # 原先一律静默, 反馈死了五小时日志里一个字都没有。
+                    if isinstance(msg, str) and '队列为空' not in msg:
+                        self.get_logger().error('CAN 接收错误: %s' % msg,
+                                                throttle_duration_sec=2.0)
                     time.sleep(0.002)
-            except Exception:
+            except Exception as e:
+                self.get_logger().error('接收循环异常: %r' % e, throttle_duration_sec=2.0)
                 time.sleep(0.02)
 
     def _process_message(self, msg):
@@ -333,9 +451,10 @@ class CanBridge(Node):
 
             with self._lock:
                 self._motor_deg[idx] = angle
+                self._last_fb_time[idx] = time.time()   # 喂看门狗
             self._publish_state()
-        except Exception:
-            pass
+        except Exception as e:
+            self.get_logger().error('解析反馈帧失败: %r' % e, throttle_duration_sec=2.0)
 
     def get_motor_deg(self):
         with self._lock:
