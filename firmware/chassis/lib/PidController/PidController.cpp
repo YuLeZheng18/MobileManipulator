@@ -1,4 +1,5 @@
 #include "Arduino.h"
+#include <math.h>
 #include "PidController.h"
 
 // 构造函数，传入三个PID参数
@@ -13,7 +14,14 @@ float PidController::update(float current)
 {
     error_ = target_ - current; //  计算error
 
-    error_sum_ += error_; //  计算error_sum
+    // 积分分离: 误差大时**不积分**, 只在接近目标时才积。
+    // 起步/大阶跃阶段本该由 KP 出力, 那时积分只会疯狂累积 -> 到达后严重过冲, 且一旦
+    // 绕到限幅就极难退回(退回要靠反向误差同样慢慢积), 该轮 PID 就此失去调节能力 ——
+    // 表现是"某个轮子不跟指令走, 松手再按(清积分)就好了"。2026-08-08 实测复现。
+    // 阈值单位 m/s, 取 PID_INTEGRAL_SEP_BAND。
+    if (fabsf(error_) < integral_band_) {
+        error_sum_ += error_ * dt_;   // ⚠️ 必须乘 dt: 见下方 i_lim 注释
+    }
     // 抗饱和: 把积分项 ki*error_sum 钳在输出量程内 (ki>0 时 i_lim=out_max/ki),
     // 避免积分绕到远超输出上限、饱和后长时间退不回来 -> 持续满速
     float i_lim = (ki_ > 0.0f) ? (out_max_ / ki_) : intergral_up_;
@@ -71,4 +79,12 @@ void PidController::clearIntegral()
     prev_error_ = 0;
     error_ = 0;
     derror_ = 0;
+}
+void PidController::set_dt(float dt)
+{
+    if (dt > 0.0f) dt_ = dt;
+}
+void PidController::set_integral_band(float band)
+{
+    integral_band_ = (band > 0.0f) ? band : 1e9f;
 }

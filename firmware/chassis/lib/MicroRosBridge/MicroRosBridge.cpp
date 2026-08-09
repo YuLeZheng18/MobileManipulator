@@ -39,7 +39,9 @@ static rcl_timer_t timer;
 // (看 reset_reason 定性); 若 uptime 仍在原值上连续 -> 芯片没重启, 是任务/传输层死了. 两者修法不同.
 static rcl_publisher_t pub_diag;
 static std_msgs__msg__String msg_diag;
-static char diag_buf[192];
+// 384 而非 192: 追加四轮 tgt/meas/duty 共 12 个数后原尺寸会被 snprintf 截断
+// (截断不报错, 只是尾部字段悄悄消失, 排查时极易误判成"字段没实现")
+static char diag_buf[384];
 static TaskHandle_t g_uros_task = NULL;   // 自身句柄, 用于查栈水位
 
 // --- 共享数据 + 临界区 ---
@@ -47,6 +49,11 @@ static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 static CmdVel g_cmd;
 static volatile int8_t g_pump = 0;   // 气泵命令 (PUMP_STOP/SUCK/RELEASE)
 static struct { float x,y,yaw,vx,vy,wz; } g_odom = {};
+// 四轮目标/实测速度 + 占空比: 只走 /chassis_diag (2s 一次, 不进 /wheel_odom 免占带宽)。
+// 加这组的理由: 融合后的 /wheel_odom 看不出是哪个轮出问题, 之前只能靠"纯平移时四轮速度
+// 代数和应为 0"反推, 而那还依赖 Kinematics.cpp 轮序标注与实物接线一致(未验)。
+// 有了这组: 哪个轮跟不上目标、占空比是否顶到 ±255(饱和)、轮序对不对, 一眼可见。
+static struct { float tgt[4], meas[4]; int16_t duty[4]; } g_wheels = {};
 static struct { float acc[3],gyro[3],angle[3]; } g_imu = {};
 static struct { float v,i; } g_bat = {};
 static volatile bool g_connected = false;
@@ -62,6 +69,10 @@ void MicroRos::setOdom(float x,float y,float yaw,float vx,float vy,float wz){
 void MicroRos::setImu(const float a[3],const float g[3],const float an[3]){
   portENTER_CRITICAL(&mux); for(int i=0;i<3;i++){g_imu.acc[i]=a[i];g_imu.gyro[i]=g[i];g_imu.angle[i]=an[i];} portEXIT_CRITICAL(&mux); }
 void MicroRos::setBattery(float v,float i){ portENTER_CRITICAL(&mux); g_bat={v,i}; portEXIT_CRITICAL(&mux); }
+void MicroRos::setWheels(const float tgt[4], const float meas[4], const int16_t duty[4]){
+  portENTER_CRITICAL(&mux);
+  for(int i=0;i<4;i++){ g_wheels.tgt[i]=tgt[i]; g_wheels.meas[i]=meas[i]; g_wheels.duty[i]=duty[i]; }
+  portEXIT_CRITICAL(&mux); }
 bool MicroRos::isConnected(){ return g_connected; }
 uint32_t MicroRos::cmdAgeMs(){ return millis() - g_cmd_ms; }
 
@@ -133,14 +144,25 @@ static void timer_callback(rcl_timer_t* t, int64_t) {
     // 栈水位单位是"字", 乘 4 换成字节 (ESP32 32 位)
     const uint32_t stack_free = g_uros_task
       ? (uint32_t)uxTaskGetStackHighWaterMark(g_uros_task) * 4U : 0U;
+    // 四轮快照: 进临界区拷出, 避免读到 control_task 写一半的值
+    float wt[4], wm[4]; int16_t wd[4];
+    portENTER_CRITICAL(&mux);
+    for (int i = 0; i < 4; i++) { wt[i]=g_wheels.tgt[i]; wm[i]=g_wheels.meas[i]; wd[i]=g_wheels.duty[i]; }
+    portEXIT_CRITICAL(&mux);
+    // 轮序按 Kinematics::inverse 的标注: 0=左前 1=左后 2=右后 3=右前
+    // (该标注与实物接线是否一致尚未实测, 正可用本组数据校验: 只推前进时四轮 meas 应同号近似等大)
     const int n = snprintf(diag_buf, sizeof(diag_buf),
-      "rst=%d up=%lus heap=%lu minheap=%lu urosstack=%lu sync=%d",
+      "rst=%d up=%lus heap=%lu minheap=%lu urosstack=%lu sync=%d"
+      " tgt=%.3f,%.3f,%.3f,%.3f meas=%.3f,%.3f,%.3f,%.3f duty=%d,%d,%d,%d",
       (int)esp_reset_reason(),
       (unsigned long)up_s,
       (unsigned long)esp_get_free_heap_size(),
       (unsigned long)esp_get_minimum_free_heap_size(),
       (unsigned long)stack_free,
-      g_time_unsynced ? 0 : 1);
+      g_time_unsynced ? 0 : 1,
+      wt[0], wt[1], wt[2], wt[3],
+      wm[0], wm[1], wm[2], wm[3],
+      (int)wd[0], (int)wd[1], (int)wd[2], (int)wd[3]);
     msg_diag.data.data = diag_buf;
     msg_diag.data.size = (n > 0) ? (size_t)n : 0;
     msg_diag.data.capacity = sizeof(diag_buf);

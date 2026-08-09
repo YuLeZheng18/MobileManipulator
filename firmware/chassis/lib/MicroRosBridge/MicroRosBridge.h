@@ -19,6 +19,8 @@ namespace MicroRos {
   void setImu(const float acc[3], const float gyro[3],
               const float angle[3]);                // sensor_task 写 IMU
   void setBattery(float voltage, float current);    // sensor_task 写电源
+  // control_task 写四轮目标/实测速度与占空比 (只随 /chassis_diag 上报, 定位单轮故障用)
+  void setWheels(const float tgt[4], const float meas[4], const int16_t duty[4]);
 
   bool isConnected();       // agent 是否已连接
   uint32_t cmdAgeMs();      // 距上次收到 /cmd_vel 的毫秒数 (失效保护看门狗用)

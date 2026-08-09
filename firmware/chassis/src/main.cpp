@@ -266,6 +266,8 @@ void setup() {
   for (int i = 0; i < 4; i++) {
     pid[i].update_pid(PID_KP, PID_KI, PID_KD);
     pid[i].out_limit(-PID_OUT_LIMIT, PID_OUT_LIMIT);
+    pid[i].set_dt(1.0f / CONTROL_RATE_HZ);            // 积分项乘 dt, 使 ki 与采样率解耦
+    pid[i].set_integral_band(PID_INTEGRAL_SEP_BAND);  // 积分分离, 防大误差期积分饱和
   }
 
   // 运动学参数 (TODO: 填实测值后生效)
@@ -323,23 +325,35 @@ static void control_task(void* arg) {
     if (pump != lastPump) { apply_pump(pump); lastPump = pump; }
 
     static float wheelSpeed[4] = {0, 0, 0, 0};  // EMA 滤波后轮速 (跨周期保持)
+    int16_t duties[4] = {0, 0, 0, 0};           // 本 tick 四轮占空比 (诊断上报用)
     for (int i = 0; i < 4; i++) {
       long long d = encoders[i].readDelta();
       float meas = kin.pulsesToSpeed((long)d, dt);
+      // 物理合理性门限: 编码器爆量(干扰/接触瞬断/计数器异常)会让 meas 冲到几百 m/s,
+      // 一路灌进 PID 就是反向满占空比(轮子乱转), 灌进 updateOdom 就是一 tick 掀掉几百度
+      // 航向且永不恢复(位姿是累计量)。此门限是最后一道防线, 拦下后**沿用上一帧滤波值**
+      // 而非置零 —— 置零会被 PID 读成"轮子停了"同样顶满占空比。
+      // 阈值 WHEEL_SPEED_SANE_MAX 见 config.h, 取实际极限的数倍余量, 只拦物理不可能值。
+      if (!isfinite(meas) || fabsf(meas) > WHEEL_SPEED_SANE_MAX) {
+        meas = wheelSpeed[i];
+      }
       wheelSpeed[i] = SPEED_FILTER_ALPHA * meas + (1.0f - SPEED_FILTER_ALPHA) * wheelSpeed[i];
       if (failsafe) {
         pid[i].clearIntegral();   // 停车时清积分, 杜绝下次上电带饱和积分窜速
         motors[i].setPwm(0);
+        duties[i] = 0;
       } else {
         pid[i].update_target(target[i]);
         int duty = (int)pid[i].update(wheelSpeed[i]);
         motors[i].setPwm(duty);
+        duties[i] = (int16_t)duty;
       }
     }
 
     kin.updateOdom(wheelSpeed, dt);
     Odom o = kin.getOdom();
     MicroRos::setOdom(o.x, o.y, o.yaw, o.vx, o.vy, o.wz);
+    MicroRos::setWheels(target, wheelSpeed, duties);  // 四轮明细, 随 /chassis_diag 2s 一报
 
     vTaskDelayUntil(&last, period);
   }
