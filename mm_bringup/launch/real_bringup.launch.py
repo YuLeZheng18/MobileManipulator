@@ -53,6 +53,7 @@ def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time')
     run_mission = LaunchConfiguration('run_mission')
     use_lidar = LaunchConfiguration('use_lidar')
+    use_nav2 = LaunchConfiguration('use_nav2')
     use_cameras = LaunchConfiguration('use_cameras')
     use_perception = LaunchConfiguration('use_perception')
     agent_serial_dev = LaunchConfiguration('agent_serial_dev')
@@ -70,7 +71,12 @@ def generate_launch_description():
         DeclareLaunchArgument('run_mission', default_value='false',
                               description='true=起栈后自动跑 mm_task 状态机; false=只起栈'),
         DeclareLaunchArgument('use_lidar', default_value='true',
-                              description='起 rplidar_ros (思岚 A3 -> /scan, frame Link_12)'),
+                              description='起 rplidar_ros (思岚 A3 -> /scan, frame laser_link) '
+                                          '+ scan_filter (-> /scan_filtered)'),
+        DeclareLaunchArgument('use_nav2', default_value='true',
+                              description='起 Nav2 全套 (map_server/AMCL/controller/...). '
+                                          '建图时必须 false: AMCL 与 slam_toolbox 会抢发 '
+                                          'map->odom TF, 两个源同时发 TF 树跳变, 地图必乱'),
         DeclareLaunchArgument('use_cameras', default_value='false',
                               description='起相机驱动: 车体两路 USB (cam_a/cam_b) + 手眼 D435i'),
         DeclareLaunchArgument('use_perception', default_value='false',
@@ -112,7 +118,10 @@ def generate_launch_description():
     # 整车 robot_description 由这里的 RSP 唯一发布 (仿真里由 gazebo 发, 真机由此发)。
     arm_real = _include('arm_moveit_config', 'real_bringup.launch.py')
 
-    # 雷达: 思岚 A3 -> rplidar_ros -> /scan (frame_id=Link_12, 与仿真/URDF 一致, 架构 §5.1)
+    # 雷达: 思岚 A3 -> rplidar_ros -> /scan (frame_id=laser_link, 与仿真/URDF 一致, 架构 §5.1)
+    # ⚠️ frame_id 是 laser_link 不是 Link_12: 前者是**测量帧**, 后者是 mesh 帧, 两者差一个
+    #    Rz(pi) —— 真机雷达绕竖轴转了 180° 装。指成 Link_12 会让点云前后颠倒
+    #    (2026-08-08 实测三次挡测定案, 由来见 mm_robot.urdf 的 Joint_laser 注释)。
     lidar = Node(
         package='rplidar_ros',
         executable='rplidar_composition',
@@ -121,20 +130,44 @@ def generate_launch_description():
         parameters=[{
             'serial_port': lidar_serial_port,
             'serial_baudrate': 256000,   # A3
-            'frame_id': 'Link_12',
+            'frame_id': 'laser_link',
             'scan_mode': 'Standard',
+            'inverted': False,
+            # ⚠️ angle_compensate 必须 True(与 lidar_test.launch.py 对齐):
+            # False 时每圈点数随转速浮动(实测 285/286/287 三种), 而 slam_toolbox 在
+            # 注册传感器时按首帧点数固定, 之后帧帧报
+            # "LaserRangeScan contains 288 range readings, expected 287" 并最终**进程退出**
+            # —— 表现是"地图不再刷新"而车还在跑。2026-08-08 建图第一次尝试因此失败。
+            'angle_compensate': True,
         }],
         condition=IfCondition(use_lidar),
     )
 
-    # 车体两路 USB 相机 + 装反校正 (use_cameras:=true 时起):
-    #   cam_a (Link_13, ArUco): usb口2.2.2, 180°校正 -> /cam_a/image_rot
-    #   cam_b (Link_14, 监视):  usb口2.2.3, 180°校正 -> /cam_b/image_rot
-    # 手眼深度相机 (Link_30, D435i) 待臂复装后在 D5 补 realsense2_camera。
+    # 自遮挡滤除: /scan -> /scan_filtered。车后方被机械臂本体与线材挡住, 那段测距是"车自己"。
+    # 下游 (AMCL / 两张 costmap / 建图) 全部用 /scan_filtered, 见 scan_filter.yaml。
+    # ⚠️ 必须走 _include (GroupAction 隔离作用域) 且**显式传 params_file**:
+    # 本 launch 自己有个 params_file 参数(给 Nav2 的 nav2_params.yaml), 裸 include 会让它
+    # 泄漏进去覆盖 scan_filter 的默认值 -> filter chain 加载 nav2_params.yaml, 里面没有
+    # scan_filter_chain 键 ⇒ **一个 filter 都不装, /scan_filtered 原样透传**, 而节点照常
+    # 运行不报错。后果: 机械臂被建进地图成幽灵墙。2026-08-08 首次起栈时踩到。
+    scan_filter = _include(
+        'mm_navigation', 'scan_filter.launch.py',
+        launch_arguments={
+            'use_sim_time': use_sim_time,
+            'params_file': os.path.join(mm_nav_share, 'config', 'scan_filter.yaml'),
+        }.items(),
+        condition=IfCondition(use_lidar),
+    )
+
+    # 车体两路 USB 相机 (use_cameras:=true 时起), 每路只起 usb_cam 发 image_raw:
+    #   cam_a (Link_13, ArUco): usb口2.2.2, 装反   cam_b (Link_14, 监视): usb口2.2.3, 装反
+    # ⚠️ 这里**不做转正** (原先的 image_rotator 链 2026-08-03 已删)。看画面靠
+    # web_video_server 的 invert=1 服务端转正; ArUco 用 aruco_real.launch.py 自带的
+    # image_rotator。详见 cameras.launch.py 文件头。
     cameras = _include('mm_perception', 'cameras.launch.py',
                        condition=IfCondition(use_cameras))
 
-    stage1 = [micro_ros_agent, arm_real, lidar, cameras]
+    stage1 = [micro_ros_agent, arm_real, lidar, scan_filter, cameras]
 
     # ===== 阶段2 (t=5): EKF 状态估计 =====
     # robot_localization 融合 /wheel_odom + /imu -> /odom + odom->base_link TF。
@@ -148,15 +181,23 @@ def generate_launch_description():
             os.path.join(get_package_share_directory('mm_bringup'), 'config', 'ekf.yaml'),
             {'use_sim_time': use_sim_time},
         ],
+        # ⚠️ robot_localization 硬编码发到 /odometry/filtered, 而全栈约定是 /odom
+        # (nav2_params.yaml:47 controller_server 与 :401 velocity_smoother 都订 /odom,
+        #  仿真侧 planar_move 也直接发 /odom)。这个 remap 缺了则 Nav2 拿不到里程计,
+        # 表现是控制器不出 cmd_vel 却不报错。2026-08-08 首次真起 EKF 时发现。
+        remappings=[('odometry/filtered', 'odom')],
     )
     stage2 = TimerAction(period=5.0, actions=[ekf])
 
-    # ===== 阶段3 (t=10): Nav2 (无 RViz) + cmd_vel 平滑 + lane_navigator =====
+    # ===== 阶段3 (t=10): Nav2 (无 RViz) + cmd_vel 平滑 + 仲裁 + lane_navigator =====
     # 无头 (§7-E): 直接 include nav2_bringup/bringup_launch.py, 不走 mm_navigation 的
     # navigation2.launch.py (那个无条件起 rviz2)。
     # cmd_vel 走向: Nav2(controller/behavior 发 /cmd_vel) --SetRemap--> /cmd_vel_nav
-    #   -> cmd_vel_smoother 加速度限幅 -> /cmd_vel -> 底盘固件订阅。
+    #   -> cmd_vel_smoother 加速度限幅 -> /cmd_vel_nav_out -> twist_mux -> /cmd_vel -> 固件。
     #   (自研电机速度环无加减速斜坡, 平滑只能在上位机这级补, 与仿真同策略。)
+    # 末端多的那一级 twist_mux 是 D4.2: 手柄 /cmd_vel_manual 走同一个 mux 且优先级更高,
+    # 于是遥控与导航可以常驻共存 —— 不必再为测导航去杀 joy_arm_teleop。详见
+    # mm_navigation/config/twist_mux.yaml。
     nav2 = GroupAction([
         SetRemap('/cmd_vel', '/cmd_vel_nav'),
         IncludeLaunchDescription(
@@ -177,16 +218,36 @@ def generate_launch_description():
         parameters=[{
             'use_sim_time': use_sim_time,
             'input_topic': '/cmd_vel_nav',
-            'output_topic': '/cmd_vel',
-            'linear_acceleration': 3.0,
-            'angular_acceleration': 2.0,
+            'output_topic': '/cmd_vel_nav_out',
+            # 3.0/2.0 -> 0.6/3.0 对齐固件真实斜坡 (config.h MAX_LIN_ACCEL/MAX_ANG_ACCEL)
+            # 与 nav2_params.yaml velocity_smoother。上位机放行比固件能执行的更大的加速度
+            # 没有意义, 只会让 MPPI 的轨迹预测与实车脱节 (窄过道里即撞墙)。
+            'linear_acceleration': 0.6,
+            'angular_acceleration': 3.0,
             'rate': 50.0,
         }],
+    )
+    # 仲裁: 导航(低优先级) vs 手柄(高优先级) -> /cmd_vel。R1 死人开关天然是接管键,
+    # 松开后 0.5s timeout 自动交还导航, 见 twist_mux.yaml。
+    # ⚠️ twist_mux 的输出话题名固定为 `cmd_vel_out`(源码硬编码), 必须靠 remap 改成
+    # /cmd_vel —— 不能靠参数设。
+    twist_mux = Node(
+        package='twist_mux', executable='twist_mux', name='twist_mux', output='screen',
+        parameters=[os.path.join(mm_nav_share, 'config', 'twist_mux.yaml'),
+                    {'use_sim_time': use_sim_time}],
+        remappings=[('cmd_vel_out', '/cmd_vel')],
     )
     lane_navigator = Node(
         package='mm_navigation', executable='lane_navigator.py', name='lane_navigator',
         output='screen', parameters=[{'use_sim_time': use_sim_time}])
-    stage3 = TimerAction(period=10.0, actions=[nav2, cmd_vel_smoother, lane_navigator])
+    # use_nav2:=false 时整段跳过 (建图/纯遥操作场景)。三个都要跟着关, 不只 Nav2 本身:
+    #   cmd_vel_smoother 以 50Hz **持续**发 /cmd_vel(无输入时发零), 会与手柄 teleop 抢
+    #   同一话题, 零值把手柄指令冲掉 -> 表现是"手柄推了车不走或一顿一顿";
+    #   lane_navigator 会调 Nav2 action, Nav2 不在时只是空等, 但没有意义故一并关。
+    stage3 = TimerAction(period=10.0, actions=[
+        GroupAction([nav2, cmd_vel_smoother, lane_navigator],
+                    condition=IfCondition(use_nav2)),
+    ])
 
     # ===== 阶段4 (t=14): MoveIt move_group (无头, 依赖阶段1 的 RSP) =====
     move_group = _include('arm_moveit_config', 'move_group.launch.py', launch_arguments=real_arg)

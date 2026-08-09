@@ -1,0 +1,31 @@
+# /cmd_vel 仲裁 (路线图 D4.2)。解决"Nav2 与手柄不能同时起"的老约束:
+# 原先两者都直发 /cmd_vel, 谁在后谁的零值就把对方冲掉, 表现是"手柄推了车不走或一顿一顿",
+# 所以每次测导航都得先杀 joy_arm_teleop。有了 mux 两条链可以常驻。
+#
+# 链路 (固件订阅的 /cmd_vel 名字不变, 只在它上游插一级):
+#   controller_server ┐
+#   behavior_server   ├SetRemap→ /cmd_vel_nav → cmd_vel_smoother → /cmd_vel_nav_out ┐
+#                     ┘                                                              ├→ twist_mux → /cmd_vel
+#   joy_arm_teleop (仅 DRIVE 态转发) ─────────────────────────→ /cmd_vel_manual ─────┘
+#
+# **R1 死人开关就是接管键, 不需要额外按键**: teleop_ps2.yaml enable_button=5(R1),
+# teleop_twist_joy 只在按住时发(20Hz autorepeat), 松开发一帧零速后静默。于是
+# 按住 R1 -> 手柄高优先级压住导航; 松开 -> 0.5s timeout 到 -> 自动交还 Nav2。
+# timeout 取 0.5 而非更短: autorepeat_rate=20Hz 即 50ms 一帧, 0.5s 容得下 10 帧抖动,
+# 不会因偶发丢帧在行进中把控制权抖回 Nav2。
+#
+# ⚠️ 优先级差要拉开(10 vs 100)而不是相邻: twist_mux 只比大小, 拉开是为了以后插
+# 中间优先级(如 mm_task 的避障急停)时不用重排。
+twist_mux:
+  ros__parameters:
+    topics:
+      # 导航: Nav2 经 cmd_vel_smoother 限幅后的输出。低优先级, 手柄一按就让位。
+      nav:
+        topic   : /cmd_vel_nav_out
+        timeout : 0.5
+        priority: 10
+      # 手柄: joy_arm_teleop 仲裁后的输出(它自己只在 DRIVE 态发)。高优先级。
+      joystick:
+        topic   : /cmd_vel_manual
+        timeout : 0.5
+        priority: 100

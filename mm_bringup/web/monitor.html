@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<!--
+遥操作三路相机监视页 (2026-08-04)。
+
+图像不走 ROS 跨机, 走 Orin 上的 web_video_server (HTTP/MJPEG)。本页只是三个 <img>,
+浏览器直接拉流, 本机不起任何 ROS 图像节点 —— 这是解决长期卡顿的关键, 详见
+mm_bringup/launch/dev_bringup.launch.py 的文件头。
+
+⚠️ 本页由 **Orin 上的 python3 -m http.server (8081)** 发出, 不是本机文件:
+   地址 http://ubuntu.local:8081/  (teleop_stack.launch.py 里那个 monitor_page 进程)
+   为什么不用本机 file://: 本机 `text/html` 的 mimetype 关联被代理客户端
+   mihomo-party.desktop 抢走了, xdg-open 本地 html 会拉起那个代理软件而**永远不进
+   浏览器**(退出码还是 0, 极具误导性)。而 `x-scheme-handler/http` 关联是好的, 所以
+   改走 http:// 就绕开了。判据: Orin 侧 `ss -tn '( sport = :8080 )'` 有没有连接。
+   顺带的好处: 手机/平板同一个地址就能看, 且页面只有一份(在仓库里)。
+
+⚠️ 流地址里的主机名用 location.hostname 动态拼(见下 JS), 不硬编码:
+   页面从哪个地址打开, 流就从同一台机器取。Orin 的 wlP1p1s0 是 DHCP, IP 会变。
+
+⚠️ 分辨率定在 320x240, 别随手往上调。实测三路并发 (臂栈+yolo+servo 同跑) 的代价:
+    320x240 -> 网卡合计 176 KB/s, 各 ~30 fps                   <- 当前值
+    640x480 q60 -> 3613 KB/s, 且总有一路掉到 20 fps
+    640x480 q80 -> 5434 KB/s, 同样有一路掉到 20 fps
+  两次掉的不是同一路 (q60 掉 cam_b, q80 掉 cam_a) —— 是争抢, 不是某路的固有缺陷。
+  要画面大就靠下面的 CSS 布局(flex 三等分, 跟着窗口走): MJPEG 就是张 <img>,
+  拉伸是浏览器干的, 不产生额外带宽和 Orin 算力, 只是会发虚。
+
+⚠️⚠️ 卡顿(一顿一顿, 不是掉几帧)的根因**不在本页也不在网络**, 是 web_video_server 的
+  `publish_rate` 默认 -1 不限速时自我干扰。已在 teleop_stack.launch.py 里定为 15.0,
+  实测 >200ms 空档 43 次 -> 0 次。完整判据与五轮排除记录见那个文件的 web_video 段。
+  ⚠️ 排查画面卡顿**别看平均帧率, 要看帧间隔分布** —— 平均值会把成串丢帧摊平。
+
+⚠️ 车体两路是倒装的, 必须带 invert=1 (服务端转正, 省掉本机 image_rotator)。
+   深度相机不加 —— 它装正的。
+⚠️ 别从 web_video_server 首页 (:8080) 点链接进来: 那些链接**不带缩放参数**, 点进去是
+   原生 1280x720, 实测 5566 KB/s (44Mbps) 一路就把 WiFi 吃掉大半, 表现就是"打不开"。
+   首页只用来确认话题名。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>整车相机监视</title>
+<style>
+  html, body { height: 100%; }
+  body { margin: 0; padding: 6px; box-sizing: border-box; background: #1e1e1e;
+         color: #ddd; font-family: sans-serif; display: flex;
+         flex-direction: column; }
+  h1 { font-size: 14px; font-weight: normal; margin: 0 0 6px; color: #888;
+       flex: 0 0 auto; }
+  /* 强制横向三等分, 不换行: 之前用固定 480px 宽, 三个加间距超过屏宽就被 flex 换行
+     成竖排了。改成 flex:1 + min-width:0 后跟着窗口宽度走, 永远并排。 */
+  .grid { display: flex; flex-wrap: nowrap; gap: 6px; flex: 1 1 auto;
+          min-height: 0; }
+  .cam { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column;
+         background: #000; border: 1px solid #333; }
+  /* 画面按比例填满各自那一栏; contain 保证不裁切不变形 */
+  .cam img { flex: 1 1 auto; min-height: 0; width: 100%;
+             object-fit: contain; background: #000; }
+  .cam figcaption { flex: 0 0 auto; font-size: 12px; padding: 3px 6px;
+                    background: #2a2a2a; color: #aaa; white-space: nowrap;
+                    overflow: hidden; text-overflow: ellipsis; }
+</style>
+</head>
+<body>
+<h1 id="hdr">整车相机监视</h1>
+<div class="grid">
+  <figure class="cam">
+    <img id="cam_a" alt="cam_a">
+    <figcaption>cam_a &mdash; 车体左 (ArUco 兼监视), 倒装已转正</figcaption>
+  </figure>
+  <figure class="cam">
+    <img id="cam_b" alt="cam_b">
+    <figcaption>cam_b &mdash; 车体右 (监视), 倒装已转正</figcaption>
+  </figure>
+  <figure class="cam">
+    <img id="cam_d" alt="D435i">
+    <figcaption>D435i 彩色 &mdash; 手眼 (Link_30), 抓取视角</figcaption>
+  </figure>
+</div>
+<script>
+  // 流地址跟着本页的主机名走: 页面从哪台机器打开, 流就从那台机器的 8080 取。
+  // 这样 Orin 换了 IP 或改用 ubuntu.local 访问都不用动本文件。
+  // 本地 file:// 打开时 hostname 为空, 回落到 ubuntu.local。
+  var HOST = location.hostname || 'ubuntu.local';
+  var BASE = 'http://' + HOST + ':8080/stream?topic=';
+  // quality 逐路给: 车体 45, 深度 60 (帧越大越容易撞 is_busy(), 详见文件头)
+  var CAMS = {
+    cam_a: '/cam_a/image_raw&width=320&height=240&quality=45&invert=1',
+    cam_b: '/cam_b/image_raw&width=320&height=240&quality=45&invert=1',
+    cam_d: '/camera/camera/color/image_raw&width=320&height=240&quality=60'
+  };
+  for (var id in CAMS) {
+    document.getElementById(id).src = BASE + CAMS[id];
+  }
+  document.getElementById('hdr').textContent =
+    '整车相机监视 — 源 ' + HOST + ':8080 (web_video_server on Orin)';
+</script>
+</body>
+</html>

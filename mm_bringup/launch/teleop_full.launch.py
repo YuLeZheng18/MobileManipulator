@@ -25,7 +25,10 @@ mm_bringup 已 exec_depend mm_grasp, 反向再加依赖就成环, colcon 会拒�
     source ~/microros_ws/install/setup.bash
     ros2 run micro_ros_agent micro_ros_agent serial --dev /dev/esp32_chassis
 
-⚠️ 不与 Nav2 同时跑: 两者都往 /cmd_vel 发会打架 (路线图 D4.2 的 mux 还没做)。
+本 launch 的输出走 /cmd_vel_manual, 由 twist_mux 与 Nav2 仲裁后才到 /cmd_vel (D4.2 已做)。
+故**可以与 Nav2 同时跑**: 按住 R1 手柄接管(优先级 100 > 导航 10), 松开 0.5s 后自动交还。
+⚠️ 但必须有 twist_mux 在跑, 否则指令停在 /cmd_vel_manual 车不动 —— real_bringup 的
+   use_nav2:=true 会带起它; 只想单跑遥控就用 teleop.launch.py (直发 /cmd_vel)。
 
 ⚠️ 安全: 臂点动经 moveit_servo 直发 /arm_controller/joint_trajectory, **绕过 MoveIt
 碰撞检查**, 约束盒是唯一防线。而盒顶/四角当前是占位值, 首次真机务必架空或
@@ -82,7 +85,12 @@ def generate_launch_description():
         }],
         remappings=[
             ('cmd_vel_in', '/cmd_vel_joy'),
-            ('cmd_vel_out', '/cmd_vel'),
+            # /cmd_vel -> /cmd_vel_manual (D4.2): 交 twist_mux 仲裁而非直发固件。
+            # 手柄在 mux 里优先级 100 > 导航 10, 故按住 R1 就压住 Nav2, 松开 0.5s 后
+            # 自动交还 —— 遥控与导航可常驻共存, 不必再为测导航杀本节点。
+            # ⚠️ 没起 twist_mux 时车不会动 (指令停在 /cmd_vel_manual 没人转发)。
+            # 单跑遥控用 teleop.launch.py, 那条直发 /cmd_vel 不经仲裁。
+            ('cmd_vel_out', '/cmd_vel_manual'),
             ('joy', '/joy'),
         ],
     )

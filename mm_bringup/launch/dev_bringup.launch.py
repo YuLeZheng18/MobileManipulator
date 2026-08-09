@@ -2,15 +2,35 @@
 
 只跑给人看的可视化 + 粗粒度调度, 不碰任何硬件、不产任何 TF:
   - RViz (MoveIt 视图: 机器人模型 + 规划场景 + TF; 可手动加 Nav2 的 map/costmap/path 显示)。
-  - 相机监视 x3 (view_cameras:=true): cam_a(ArUco 转正)、cam_b(监视转正)、D435i 彩色。
+  - 三路相机监视 (默认开): xdg-open 拉浏览器开 web/monitor.html, 见下。
   - mm_task 状态机 (默认关): 发 /go_to /initialpose、调 /grasp/* 服务, 都是小消息粗指令。
 
-⚠️ 相机画面走"本机解码"而非 rqt 直吃 compressed:
-  Nano 把每路转正流/彩色流用 image_transport 发 <topic>/compressed 过网 (~0.5MB/s);
-  本机 republish 把 compressed 解回本地 raw (<name>/view, 走 loopback 不占 WiFi),
-  rqt 直接看本地 raw — 无需在 Transport 下拉手动切 compressed (那下拉易空/易错)。
-  两机都需装 compressed_image_transport (apt)。别直传原始大图/点云把 WiFi 打满。
-  深度图暂不看: compressedDepth 的 republish 有 bug, 且 depth raw ~15MB/s 过网太重。
+⚠️⚠️ 相机画面走浏览器, **不经 ROS** (2026-08-04 定案, 这是折腾一整晚的结论)。
+  Nano 上 teleop_stack 起了 web_video_server (HTTP/MJPEG); 本机这边 view_cameras:=true
+  (默认) 只是 xdg-open 一个本地 html, 页面里三个 <img> 直连 Orin。
+  三路地址/分辨率/invert 全写在 mm_bringup/web/monitor.html 里, 连同实测数据和
+  "为什么不能把分辨率调大"的判据 —— 要改画面就改那个 html, 不用碰本文件。
+  实测三路并发 (臂栈+yolo+servo 同跑): 各 29.9/29.6/28.1 fps, 本机网卡合计 1041KB/s,
+  Orin load 4.03/6 核。收到的帧率与机上 camera_info (30.596/30.264/28.853Hz) 一致。
+
+  **铁律: 本机 (或任何跨机进程) 绝不订阅图像话题。** 这是长期卡顿的唯一真凶 ——
+  usb_cam 的 image_raw 是未压缩的普通 ROS 发布者, 跨机订它 DDS 就把 640x480 rgb8
+  @30Hz ≈ 27MB/s 推上 WiFi, 两路把链路彻底打满, 所有流一起垮。
+  判据: 停掉两个 usb_cam, Orin 网卡发送 15312KB/s -> 24KB/s。
+  ROS/DDS 不是为跨 WiFi 传视频设计的 (可靠传输 + 每订阅者一份独立拷贝 + 全网发现);
+  HTTP 这条全绕开: 图像流留在 Nano 机内, 过网只有一条 TCP, 丢包由浏览器扛。
+
+  ⚠️ 2026-08-04 删掉了原先 view_cameras 起的三级链 (republish -> image_rotator ->
+  image_view, 每路三个进程共六个)。它能出画面, 但前提正是上面那条铁律禁止的事。
+  参数名保留了, 但现在它只管"要不要 xdg-open 那个网页"。
+  连带作废的一堆历史结论 (rqt_image_view 会自己滑回 raw / image_view 重映射键要带
+  /compressed 后缀 / Nano 侧 republish 白掉 8Hz / D435i 彩色 jpeg_quality 只在构造时
+  读一次) 都只在"跨机订图像"的前提下才有意义, 现在这个前提没了。别再加回来。
+
+  ⚠️ 测跨机带宽只能用 cat /sys/class/net/<iface>/statistics/rx_bytes 前后差。
+  ros2 topic bw/hz **自己就是订阅者**, 而 DDS 单播是每订阅者一份拷贝 —— 用它量跨机流量
+  会把结果翻倍 (早前那个"5.5 倍放大/重传"就是这么来的测量假象, 不是真的重传)。
+  量真实采集帧率要在**机上**量 camera_info (几十字节, 与图像同一次 publish, 不受传输影响)。
 
 机器人端全栈 (硬件/控制/Nav2/MoveIt/感知) 在 Nano 上由 nano_bringup.launch.py 起。
 两机同一 ROS_DOMAIN_ID + 同 LAN, DDS 自动发现, 话题/TF/服务/action 跨机透明。
@@ -31,17 +51,17 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import (DeclareLaunchArgument, ExecuteProcess,
+                            IncludeLaunchDescription, TimerAction)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
 
 
 def generate_launch_description():
     run_mission = LaunchConfiguration('run_mission')
-    view_cameras = LaunchConfiguration('view_cameras')
     mission_file = LaunchConfiguration('mission_file')
+    view_cameras = LaunchConfiguration('view_cameras')
 
     args = [
         DeclareLaunchArgument('run_mission', default_value='false',
@@ -52,9 +72,9 @@ def generate_launch_description():
             default_value=os.path.join(get_package_share_directory('mm_task'),
                                        'config', 'mission_real.yaml'),
             description='任务列表 (本机调度的是真机, 故默认 mission_real.yaml)'),
-        DeclareLaunchArgument('view_cameras', default_value='false',
-                              description='本机监视三路相机 (需 Nano use_cameras:=true + '
-                                          'D435i 就绪); 每路 republish 解码 compressed 再 rqt'),
+        DeclareLaunchArgument('view_cameras', default_value='true',
+                              description='拉浏览器开三路监视页 (web/monitor.html)。'
+                                          '只是开个网页, 不起任何 ROS 图像节点'),
     ]
 
     # RViz: MoveIt 视图 (use_sim_time=false 实机时钟)。robot_state_publisher 在 Nano,
@@ -66,26 +86,47 @@ def generate_launch_description():
         launch_arguments={'use_sim_time': 'false'}.items(),
     )
 
-    # 相机监视 (view_cameras:=true): 每路 = republish(compressed->本地raw) + rqt 看本地raw。
-    # compressed 过网 (~0.5MB/s), 本机解回 <name>/view (loopback), rqt 无需切 Transport。
-    def _view(name, compressed_in):
-        rep = Node(
-            package='image_transport', executable='republish',
-            name=f'decode_{name}', output='screen',
-            arguments=['compressed', 'raw'],
-            remappings=[('in/compressed', compressed_in), ('out', f'/{name}/view')],
-            condition=IfCondition(view_cameras))
-        view = Node(
-            package='rqt_image_view', executable='rqt_image_view', name=f'view_{name}',
-            arguments=[f'/{name}/view'], output='screen',
-            condition=IfCondition(view_cameras))
-        return [rep, view]
-
-    # cam_a/cam_b: 转正流的 compressed (mm_perception/cameras.launch.py 里的 republish 发的);
-    # D435i 彩色: realsense 双层命名空间 /camera/camera/...; 深度不看 (见文件头说明)。
-    cams = (_view('cam_a', '/cam_a/image_rot/compressed')
-            + _view('cam_b', '/cam_b/image_rot/compressed')
-            + _view('color', '/camera/camera/color/image_raw/compressed'))
+    # 三路监视画面: 只是拉浏览器开一个本地 HTML, **不起任何 ROS 图像节点** (本文件头的铁律)。
+    # 页面里三个 <img> 直连 Orin 的 web_video_server; 分辨率/画质/invert 都写在那个
+    # html 里 (连同实测数据和为什么不能调大的判据), 要改布局或参数改 html 即可, 不用碰这里。
+    # 延后 3s 是为了让 RViz 先抢到前台, 否则浏览器窗口会盖在它上面。
+    # 失败不阻塞 (|| true): 没装浏览器/无 DISPLAY 时不该因此起不来 RViz。
+    # ⚠️ 开的是 **Orin 上的 http 地址**, 不是本机 file:// —— 页面由 Orin 的
+    # teleop_stack.launch.py 里那个 http.server(8081) 发出, 本仓库只存源文件。
+    # 为什么不能开本地文件 (2026-08-04 实测): 本机 `text/html` 的 mimetype 关联被代理
+    # 客户端 mihomo-party.desktop 抢走了 (`xdg-mime query default text/html` 可复现),
+    # 于是 xdg-open 任何本地 html 都拉起那个代理软件而**永远不进浏览器** —— 退出码照样
+    # 是 0, 极具误导性。判据: Orin 侧 `ss -tn '( sport = :8080 )'` 一个连接都没有。
+    # 注意 `xdg-settings get default-web-browser` 报的是 firefox, 但那只管
+    # `x-scheme-handler/http` —— 与本地文件走的 `text/html` 是两套关联, 别被它骗。
+    # 走 http:// 正好用的是那套没被抢走的关联, 所以能进浏览器。
+    # 没有去改系统 mimetype 关联是刻意的: 那是用户桌面环境的全局设置, 不该由本仓库动,
+    # 而且代理软件下次更新可能再抢回去。
+    # 主机名用 ubuntu.local: Orin 的 wlP1p1s0 是 DHCP, IP 会变; 两机都跑 avahi-daemon。
+    #
+    # ⚠️ **先探测 8081 通了再开浏览器, 不能起来就开** —— 页面在 Orin 上, 而它是
+    # teleop_stack 的 **t=18s** 才起的。2026-08-04 踩过: 本机固定等 3s 就 xdg-open,
+    # 浏览器拿到"无法连接"错误页, 看着像"launch 没跳转", 其实命令执行成功了
+    # (判据: launch 日志里 `[bash-N]: process has finished cleanly`)。
+    # 现在改成轮询探测, 两机**任意顺序**起都行, 本机会自己等 Orin 就绪。
+    # 探测用 curl -sf 只取 HTTP 状态, 不下载页面; 60 次 x 2s = 最多等 2 分钟。
+    MONITOR_URL = 'http://ubuntu.local:8081/monitor.html'
+    wait_and_open = (
+        f'for i in $(seq 1 60); do '
+        f'  if curl -sf -m 2 -o /dev/null "{MONITOR_URL}"; then '
+        f'    echo "监视页就绪, 打开浏览器: {MONITOR_URL}"; '
+        f'    xdg-open "{MONITOR_URL}"; exit 0; '
+        f'  fi; '
+        f'  sleep 2; '
+        f'done; '
+        f'echo "等了 2 分钟 Orin 的 8081 还没通 —— teleop_stack 起了吗? '
+        f'手动开: {MONITOR_URL}" >&2'
+    )
+    cams = TimerAction(period=3.0, actions=[
+        ExecuteProcess(
+            cmd=['bash', '-c', f'{wait_and_open} || true'],
+            output='screen', condition=IfCondition(view_cameras)),
+    ])
 
     # mm_task: 顶层调度 (默认关, 调试时手动派命令; run_mission:=true 才自动整轮跑)
     mission = IncludeLaunchDescription(
@@ -97,4 +138,4 @@ def generate_launch_description():
         condition=IfCondition(run_mission),
     )
 
-    return LaunchDescription(args + [rviz] + cams + [mission])
+    return LaunchDescription(args + [rviz, cams, mission])

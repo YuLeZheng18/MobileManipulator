@@ -18,6 +18,10 @@
   <exec_depend>nav2_msgs</exec_depend>
   <exec_depend>action_msgs</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
+  <!-- scan_filter.launch.py: 砍雷达自遮挡扇区 (/scan -> /scan_filtered) -->
+  <exec_depend>laser_filters</exec_depend>
+  <!-- twist_mux.yaml: Nav2 与手柄共用 /cmd_vel 的优先级仲裁 -->
+  <exec_depend>twist_mux</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

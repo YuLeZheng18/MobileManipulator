@@ -5,7 +5,7 @@ find_package(ament_cmake REQUIRED)
 
 # Only install directories that actually exist so the skeleton package
 # builds before launch/config content is added.
-foreach(dir launch config udev)
+foreach(dir launch config udev web)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${dir}")
     install(DIRECTORY ${dir}
       DESTINATION share/${PROJECT_NAME}
@@ -21,9 +21,10 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
 )
 
-# 真机诊断工具 (跑在 Nano 上, 与上面的 mock 无关)
+# 真机诊断/运维工具 (跑在 Nano 上, 与上面的 mock 无关)
 install(PROGRAMS
   scripts/chassis_diag_logger.py
+  scripts/teleop_stack.sh
   DESTINATION lib/${PROJECT_NAME}
 )
 
