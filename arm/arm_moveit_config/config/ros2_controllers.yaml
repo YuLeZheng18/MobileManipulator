@@ -19,8 +19,28 @@ arm_controller:
       - Joint_14
       - Joint_15
       - Joint_16
+    # ⚠️ 必须 true, 别再关。2026-08-03 关成 false 试过, 当场把点动抖动**引入**回来。
+    #
+    # 机制: servo 点动是每 40ms 发一条**只含 1 个点**的轨迹。false 时 JTC 每收到新轨迹
+    # 就用**当前实测位置**当插值起点, 而实测位置因 CAN 反馈滞后落后于已发出的命令
+    # (实测滞后输出轴约 0.18°, 而每帧增量才 0.22° —— 同一量级)。于是每 40ms 命令被拽回
+    # 一步、再往前插三步 ⇒ 走三步退一步的锯齿。
+    # 实测(JTC 输入口 B=/arm_controller/joint_trajectory, 输出口 D=/arm_joint_commands):
+    #   点动 false: B 反转 1.0% 平滑 -> D 反转 63%、跳变/步 1.45、频率掉到 77.6Hz
+    #   规划 false: D 反转 0.0%、跳变/步 0.01、100.1Hz  ← 整条多点轨迹一次发完,
+    #               中途无新轨迹到达, 那个"重置起点"只执行一次, 所以规划一直是丝滑的
+    # 即同一个 JTC 同一批电机, 差别只在"单点轨迹流"这个用法上。
+    #
+    # ⚠️ 别再拿"实测跟随良好、没有锯齿"当关掉的理由(我 2026-08-03 就是这么错的):
+    # 那次只测了 B 口与 /arm_joint_states, **漏了 D 口** —— 而 D 口是唯一能看见这个
+    # 现象的地方(B 在上游还没被重置, /arm_joint_states 是反馈不是命令)。
+    open_loop_control: true
+    # velocity 与 position 一起声明: 开环双写, 不启 PID(JTC 只在无位置接口时才要 PID).
+    # 目的是让 TopicBasedSystem 填 /arm_joint_commands 的 velocity 字段, can_bridge
+    # 拿它前馈进 0xFD 速度字段. 详见 ros2_control.xacro 中 Joint_11 上方注释.
     command_interfaces:
       - position
+      - velocity
     state_interfaces:
       - position
       - velocity

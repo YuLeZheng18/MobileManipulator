@@ -113,9 +113,14 @@ public:
     // getOrDeclare: yaml 给了值时 automatically_declare_parameters_from_overrides 已声明,
     // 裸 declare_parameter 会撞 AlreadyDeclared 崩 (release_duration 踩过, exit -6).
     insert_shortfall_ = getOrDeclare<double>("insert_shortfall", -0.001);
-    // 吸取抽真空时长(秒), 到时转 PUMP_STOP 保压. 1s 足够: 实测 3s 里负压早已建立,
-    // 吸住后继续抽没有收益, 只是让泵空转发热.
-    suck_duration_ = node_->declare_parameter<double>("suck_duration", 1.0);
+    // 吸取抽真空时长(秒), 到时转 PUMP_STOP 保压.
+    // 2026-08-03 用户实机要求回到 3.0: 此前的 1.0 是按"3s 里负压早已建立"推的, 但那个判断
+    // 没有独立证据 (吸不上的几轮最后都是靠调 insert_shortfall 多插几 mm 解决的, 与抽气时长
+    // 无关), 而用户现场看到 1s 偏紧. 代价只是每次抓取多等 2s.
+    // 值改由 place.yaml 给, 故必须 getOrDeclare —— 裸 declare_parameter 会与
+    // automatically_declare_parameters_from_overrides 的自动声明撞 AlreadyDeclared,
+    // 整个节点 exit -6 崩掉 (release_duration 2026-07-28 踩过).
+    suck_duration_ = getOrDeclare<double>("suck_duration", 3.0);
     // 释放开阀时长(秒), 到时立刻 PUMP_STOP 关阀. 见 releasePulse(): 阀持续通电会发烫.
     // 2026-07-28 真机降到 1.0(place.yaml 给值): 破负压几百 ms 够, 3s 拖节拍. 值写在 yaml,
     // 故这里必须 getOrDeclare(裸 declare_parameter 会与 yaml 自动声明撞 AlreadyDeclared 崩).
@@ -186,6 +191,11 @@ public:
     tray_qz_ = getOrDeclare<std::vector<double>>("tray_qz", {1.0, 1.0});
     tray_qw_ = getOrDeclare<std::vector<double>>("tray_qw", {0.0, 0.0});
     tray_capacity_ = getOrDeclare<std::vector<int64_t>>("tray_capacity", {2, 2});
+    // 每层额外抬高量(米), 逐层累加: 第 L 层释放高度多加 layer_gap * L.
+    // 与"把 tray_z 抬 5mm"的区别: 那样只是整摞一起上移, 层间距不变; 这个让每层各自多留
+    // 5mm, 第 1 层 +5mm、第 2 层 +10mm. 2026-08-04 用户实机要求(见 place.yaml 同名注释).
+    // 两盘共用一个值 (用户确认"同一个"), 不做成数组.
+    layer_gap_ = getOrDeclare<double>("layer_gap", 0.005);
 
     // 类别 -> 托盘映射: category_ids[i] 的盒子放到 category_tray[i] 号托盘(0=右,1=左).
     category_ids_  = getOrDeclare<std::vector<int64_t>>("category_ids",  {1, 2, 3, 4});
@@ -284,6 +294,7 @@ public:
     // 运行时堆叠状态: 每托盘已放盒数 + 累计厚度. reset 服务清零(新一轮).
     tray_layers_.assign(num_trays_, 0);
     tray_stack_h_.assign(num_trays_, 0.0);
+    unload_seq_ = 0;
     // 已放盒持久碰撞体按托盘分组, 与堆叠状态同生命周期 (reset_stack 一并清).
     placed_ids_.assign(num_trays_, {});
     placed_poses_.assign(num_trays_, {});
@@ -739,6 +750,9 @@ public:
         std::lock_guard<std::mutex> lk(stack_mtx_);
         std::fill(tray_layers_.begin(), tray_layers_.end(), 0);
         std::fill(tray_stack_h_.begin(), tray_stack_h_.end(), 0.0);
+        // 卸货落点序号一起归零: 下面把 placed_unloaded_* 也清了, 地上没盒了, 序号不归零
+        // 会让下一轮第一个盒莫名去到第二个点.
+        unload_seq_ = 0;
         // 已落盒碰撞体一并清出规划场景. PSI removeCollisionObjects 是异步, 偶发不生效
         // (2026-07-29 实测 placed_t1_l1 残留挡下次放置). 兜底: 紧接着直接发一遍 REMOVE
         // 到 /collision_object, 同步链路绕过 PSI. 即便 placed_ids_ 漏追踪(历史 bug),
@@ -753,9 +767,13 @@ public:
         for (auto & rel : placed_release_) rel.clear();   // 卸货取回用的吸盘位姿
         for (auto & th : placed_th_) th.clear();
         // 兜底: 即便 placed_ids_ 空(计数漏追踪), 也按命名规则扫一遍清残留.
+        // placed_unloaded_* 也要扫: 它是卸到**地面**的盒, 从不进 placed_ids_(那是托盘的账),
+        // 所以上面那圈 placed_ids_ 完全覆盖不到它, 只能靠这里按命名清。
         for (int t = 0; t < num_trays_; ++t) {
           for (int L = 0; L < 64; ++L) {
-            char buf[32]; std::snprintf(buf, sizeof(buf), "placed_t%d_l%d", t, L);
+            char buf[40]; std::snprintf(buf, sizeof(buf), "placed_t%d_l%d", t, L);
+            all_ids.push_back(buf);
+            std::snprintf(buf, sizeof(buf), "placed_unloaded_%d_%d", t, L);
             all_ids.push_back(buf);
           }
         }
@@ -789,9 +807,10 @@ public:
         if (tray < 0 || tray >= num_trays_) {
           res->success = false; res->message = "seed_tray 越界"; return;
         }
-        // release 位姿 = 该托盘标定接触位姿, z = tray_z + 已累计 + 本盒厚 (与放置同式).
+        // release 位姿 = 该托盘标定接触位姿, z = tray_z + 已累计 + 本盒厚 + 本层间隙
+        // (与放置同式, 见 resolvePlaceTarget).
         geometry_msgs::msg::Pose pose = trayContactPose(tray);
-        pose.position.z = tray_z_[tray] + trayStackH(tray) + th;
+        pose.position.z = tray_z_[tray] + trayStackH(tray) + th + layer_gap_;
         pushLayer(tray, th, pose);
         char buf[160];
         std::snprintf(buf, sizeof(buf),
@@ -812,6 +831,23 @@ public:
         res->success = unloadTray(tray, err);
         res->message = res->success
           ? std::to_string(tray) + " 号托盘已卸完"
+          : err;
+      },
+      rmw_qos_profile_services_default, srv_cb_group_);
+    // 单个卸货: 只卸栈顶一个, 不回 ready. 遥控 L1/L2 走这条 —— 一按一个, 人跟着把盒取走。
+    // 与 unload_tray 分成两个服务而不是加参数: mm_task 状态机依赖"一次调用卸完整盘"
+    // (mission_real.yaml 明写), 改那条的语义会连带改状态机的一轮时长与重试逻辑。
+    // 同一个互斥回调组, 与 execute/unload_tray 三者绝不并发 (共用一条臂).
+    unload_one_srv_ = node_->create_service<std_srvs::srv::Trigger>(
+      "/grasp/unload_one",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        const int tray = static_cast<int>(node_->get_parameter("unload_tray").as_int());
+        std::string err;
+        res->success = unloadTray(tray, err, true);
+        res->message = res->success
+          ? std::to_string(tray) + " 号托盘卸下 1 个, 余 " +
+            std::to_string(trayLayers(tray)) + " 层"
           : err;
       },
       rmw_qos_profile_services_default, srv_cb_group_);
@@ -862,7 +898,7 @@ private:
 
   bool resolvePlaceTarget(const char * caller, PlaceTarget & out, std::string & err)
   {
-    const int category = currentCategory();
+    const int category = placeCategory();
     const int ci = categoryIndex(category);
     if (ci < 0) {
       err = "未知类别 " + std::to_string(category) + " (不在 category_ids)";
@@ -890,9 +926,11 @@ private:
 
     out.tray = tray;
     out.thickness = thickness;
-    // release z = 托盘空载接触 z + 累计下层厚度 + 本层厚度 (吸盘吸盒顶, 盒底落下层顶).
+    // release z = 托盘空载接触 z + 累计下层高度 + 本层厚度 + 本层间隙.
+    // (吸盘吸盒顶, 盒底落下层顶). trayStackH 里已含下面每一层各自的 layer_gap_, 故这里
+    // 只补本层那一份 —— 第 1 层 +1×gap, 第 2 层 +2×gap, 逐层累加.
     out.pose = trayContactPose(tray);
-    out.pose.position.z = tray_z_[tray] + trayStackH(tray) + thickness;
+    out.pose.position.z = tray_z_[tray] + trayStackH(tray) + thickness + layer_gap_;
     out.what = std::to_string(tray) + "号托盘第" +
                std::to_string(trayLayers(tray) + 1) + "层";
     return true;
@@ -963,6 +1001,19 @@ private:
   int currentCategory()
   {
     std::lock_guard<std::mutex> lk(cls_mtx_);
+    return have_category_ ? last_category_ : default_category_;
+  }
+
+  // 放置该用哪个类别: 优先"吸盘上这个盒"在下插时锁存的值, 没有才回退到当前缓存.
+  // 为什么必须锁存: /perception/object_class 与 object_pose 是两个独立话题, grasp_node
+  // 各存最新值。抓完盒还在吸盘上时 yolo 继续跑, 缓存会被视野里剩下的盒刷掉 ——
+  // 放置时读它就放错盘 (2026-08-03 实机复现, 详见 stageInsert 里的锁存点).
+  // 回退分支留给 /grasp/place_only 单独调用的场景 (真机分段验证: 盒是人手放上吸盘的,
+  // 没走过 stageInsert, 此时当前缓存就是最好的信息).
+  int placeCategory()
+  {
+    std::lock_guard<std::mutex> lk(cls_mtx_);
+    if (have_held_category_) return held_category_;
     return have_category_ ? last_category_ : default_category_;
   }
 
@@ -1042,7 +1093,9 @@ private:
   {
     std::lock_guard<std::mutex> lk(stack_mtx_);
     tray_layers_[t] += 1;
-    tray_stack_h_[t] += thickness;
+    // 累计高度含本层间隙: 下一层的释放高度由它打底, 故间隙必须进累计量, 否则第 2 层只会
+    // 抬自己那 5mm 而不叠上第 1 层的 5mm (用户要的是逐层累加).
+    tray_stack_h_[t] += thickness + layer_gap_;
 
     geometry_msgs::msg::Pose box = release_pose;
     box.position.z -= box_size_z_ / 2.0;   // 盒心在吸盘末端下方半个盒高 (工具朝下)
@@ -1078,7 +1131,7 @@ private:
       placed_ids_[t].pop_back();
 
       tray_layers_[t] -= 1;
-      tray_stack_h_[t] -= thickness;
+      tray_stack_h_[t] -= thickness + layer_gap_;   // 与 pushLayer 对称, 含本层间隙
       if (tray_layers_[t] < 0) tray_layers_[t] = 0;
       if (tray_stack_h_[t] < 0.0) tray_stack_h_[t] = 0.0;
 
@@ -1277,19 +1330,34 @@ private:
   // 走视觉重新识别根本拿不到目标.
   //
   // 顺序: 后进先出, 先取栈顶. 摞的时候后放的在上面, 从下面抽会带翻上层.
-  // 卸货点分配: 第 k 个卸下的盒去第 k 个点 (k=0 -> base x 负向, k=1 -> 正向), 两点由
-  // unload_base_x/y ± unload_x_offset 定, 释放高度 = unload_z + 本盒厚度.
-  bool unloadTray(int tray, std::string & err)
+  // 卸货点分配: 用**全局**的 unload_seq_ 计数器取点 (0 -> base x 负向, 1 -> 正向),
+  // 每卸一个推进一格模 num_unload_points_. 两点由 unload_base_x/y ± unload_x_offset 定,
+  // 释放高度 = unload_z + 本盒厚度.
+  // ⚠️ 用持久计数器而不是循环下标 k: single=true 每次调用只卸一个, 若还用 k 则两次单卸
+  // 的 k 都是 0, 第二个盒会落到第一个盒身上。计数器跨调用保持, 到 reset_stack 才归零。
+  // ⚠️ 计数器全局共用、不按托盘分: 卸货点是地面上的物理位置, 与盒来自哪个托盘无关 ——
+  // per-tray 时 L1 卸一个和 L2 卸一个会双双落到同一点 (2026-08-03 改).
+  // 整盘模式在计数器为 0 时的落点序列与原先按 k 完全一致。
+  //
+  // single=true: 只卸栈顶一个就返回, 且不回 ready (交给调用方决定去哪). 遥控 L1/L2 走这条,
+  // 一按一个便于人跟着取盒; mm_task 状态机走 single=false 整盘卸, 语义不变。
+  bool unloadTray(int tray, std::string & err, bool single = false)
   {
     if (tray < 0 || tray >= num_trays_) { err = "托盘号越界"; return false; }
     const int n = trayLayers(tray);
     if (n <= 0) { err = std::to_string(tray) + " 号托盘是空的, 无盒可卸"; return false; }
+    const int rounds = single ? 1 : n;
 
     RCLCPP_INFO(logger_,
-                "==== /grasp/unload_tray: %d 号托盘 %d 个盒 -> 卸货基准 (%.4f,%.3f) 沿 base x ±%.1fmm, 地面 z=%.3f ====",
-                tray, n, unload_base_x_, unload_base_y_, unload_x_offset_ * 1000, unload_z_);
+                "==== 卸货(%s): %d 号托盘 %d 个盒, 本次卸 %d 个 -> 卸货基准 (%.4f,%.3f) 沿 base x ±%.1fmm, 地面 z=%.3f ====",
+                single ? "单个" : "整盘", tray, n, rounds,
+                unload_base_x_, unload_base_y_, unload_x_offset_ * 1000, unload_z_);
 
-    for (int k = 0; k < n; ++k) {
+    for (int i = 0; i < rounds; ++i) {
+      // seq 单调递增(到 reset_stack 归零), 落点 k = seq % 点数. 碰撞体 id 用 seq 而不是 k:
+      // k 会绕回, 复用 id 等于把上一个盒的碰撞体挪走 —— 地上那个盒就此脱管, 下次规划不避它。
+      const int seq = unload_seq_;
+      const int k = seq % num_unload_points_;
       // ---- 取盒: 回到当初放它的吸盘位姿 ----
       geometry_msgs::msg::Pose release;
       double thickness = 0.0;
@@ -1317,7 +1385,7 @@ private:
       double popped_th = 0.0;
       if (!popLayer(tray, popped, popped_th)) { err = "popLayer 失败"; return false; }
 
-      // ---- 放到卸货点: 第 k 个盒去第 k 个点, 沿 base x 轴左右分开 ----
+      // ---- 放到卸货点: 按 slot 计数器取点, 沿 base x 轴左右分开 ----
       const double sign = (k % 2 == 0) ? -1.0 : 1.0;
       geometry_msgs::msg::Pose dest;
       dest.position.x = unload_base_x_ + sign * unload_x_offset_;
@@ -1349,16 +1417,27 @@ private:
         err = "卸货后竖直退开失败: 卸货点" + std::to_string(k);
         return false;
       }
-      // 卸到地面的盒不进堆叠 (那是托盘的账), 但要留个碰撞体防下一个盒放到它身上.
+      // 卸到地面的盒留个碰撞体防下一个盒放到它身上 (不进堆叠, 那是托盘的账).
       // id 必须带 placed_ 前缀: reset_stack 的同步 REMOVE 与其复查都只认这个前缀,
       // 叫别的名字就成了连重启都清不掉的幽灵碰撞体 (2026-07-29 事故), 而卸货点就在
       // look 位附近地面, 残留一个正好挡住下一轮直下段.
-      addPlacedBox("placed_unloaded_" + std::to_string(tray) + "_" + std::to_string(k),
-                   boxCenterFromRelease(dest, thickness));
+      //
+      // single 模式不登记 (2026-08-03): 遥控 L1/L2 一按卸一个, 人当场把盒取走, 场景里
+      // 那个碰撞体立刻变成地面上的幽灵 —— 位置恰在 look 位正前方, 下一次 ✕ 抓取的直下段
+      // 从它头上过, 规划直接判碰撞. 整盘模式(mm_task 自动跑)没人取盒, 盒确实还在地上,
+      // 那里必须登记.
+      if (!single) {
+        addPlacedBox("placed_unloaded_" + std::to_string(tray) + "_" + std::to_string(seq),
+                     boxCenterFromRelease(dest, thickness));
+      }
+      // 这一个确实落地了才推进 slot: 上面任一步失败都 return, 计数器不动, 重试仍用同一点.
+      unload_seq_ += 1;
     }
 
-    if (!moveToReady()) { err = "卸货后回 ready 失败"; return false; }
-    RCLCPP_INFO(logger_, "==== %d 号托盘 %d 个盒已全部卸完 ====", tray, n);
+    // single 下不回 ready: 调用方(遥控 L1/L2)紧接着自己去 look, 回 ready 只是白走一趟.
+    if (!single && !moveToReady()) { err = "卸货后回 ready 失败"; return false; }
+    RCLCPP_INFO(logger_, "==== %d 号托盘卸了 %d 个, 余 %d 层 ====",
+                tray, rounds, trayLayers(tray));
     return true;
   }
 
@@ -1992,9 +2071,22 @@ private:
     if (!currentTcp(cur)) { RCLCPP_ERROR(logger_, "③ 取当前位姿失败"); return false; }
 
     // 盒顶高度纯几何算: 地面(URDF 常量) + 该类别卡尺厚度. 不用视觉测高.
-    const int ci = categoryIndex(currentCategory());
+    const int cat = currentCategory();
+    const int ci = categoryIndex(cat);
     const double thickness = currentThickness(ci);
     const double box_top_z = ground_z_ + thickness;
+
+    // 把类别锁存成"手上这个盒的类别": 下插是确定抓哪个盒的最后时刻, 此刻的 last_category_
+    // 必与目标同盒 (yolo 侧用 p_cam 帧间最近邻锁目标, 四路话题指向同一个盒).
+    // 2026-08-03 实机: 桌上摆一个左盘盒 + 一个右盘盒, 概率性放错盘。根因是遥控流程
+    // ✕抓取 -> level -> (人按)■放置 中, resolvePlaceTarget 读的是**按 ■ 那一刻**的
+    // last_category_ —— 盒已在吸盘上, yolo 仍在跑, 视野里只剩另一个盒, 缓存早被刷成它的
+    // 类别了。自动流程 /grasp/execute 没这问题: 它进门就 resolve, 抓之前类别已定。
+    {
+      std::lock_guard<std::mutex> lk(cls_mtx_);
+      held_category_ = cat;
+      have_held_category_ = true;
+    }
 
     double stroke = cur.pose.position.z - box_top_z - insert_shortfall_;
     const double raw = stroke;
@@ -2093,6 +2185,13 @@ private:
   {
     move_group_->detachObject(kCarriedBoxId);
     psi_->removeCollisionObjects({kCarriedBoxId});
+    // 盒离手, 锁存的类别随之失效: 不清则下一轮 placeCategory() 会拿上一个盒的类别去
+    // 定托盘, 而下一个盒未必同类。detachBox 是盒离手的唯一出口(放置/卸货/dry_run 都过它),
+    // 清在这里不会漏。
+    {
+      std::lock_guard<std::mutex> lk(cls_mtx_);
+      have_held_category_ = false;
+    }
     RCLCPP_INFO(logger_, "盒子已 detach 并移出规划场景");
   }
 
@@ -2195,18 +2294,27 @@ private:
   // (盒底离地 ~5mm) -> 释放 + detach. 不在半空释放, 盒子落稳. 卸货用.
   bool placeAt(double x, double y, double z_tip, double clearance)
   {
-    // 抬起 (相对当前 +Z, 携盒)
+    // 抬起 (相对当前 +Z, 携盒). 只在起点低于下面那个"目的地上方"航点时才抬 ——
+    // 2026-08-03: ○ 放地面前遥控先调 /grasp/level (TCP 抬到离地 20cm, z≈0.152), 而航点
+    // z = place_z_ + place_clearance_ = 0.150, 于是这一抬把臂送到 0.182 再降回 0.150,
+    // 纯多余的一上一下. 抬起的用途是"脱离接触面, 别让规划器把盒沿地面拖过去", 起点已经
+    // 悬空高于航点时它不成立.
     geometry_msgs::msg::PoseStamped cur;
     if (!currentTcp(cur)) return false;
-    geometry_msgs::msg::Pose up = cur.pose;
-    up.position.z += lift_height_;
-    std::vector<geometry_msgs::msg::Pose> wps{up};
-    moveit_msgs::msg::RobotTrajectory traj;
-    move_group_->setStartStateToCurrentState();
-    if (move_group_->computeCartesianPath(wps, 0.005, 0.0, traj) > 0.5) {
-      move_group_->execute(traj);
-      settle();
-      RCLCPP_INFO(logger_, "放置: 已抬起 %.0fcm", lift_height_ * 100);
+    if (cur.pose.position.z < z_tip + clearance - 0.005) {
+      geometry_msgs::msg::Pose up = cur.pose;
+      up.position.z += lift_height_;
+      std::vector<geometry_msgs::msg::Pose> wps{up};
+      moveit_msgs::msg::RobotTrajectory traj;
+      move_group_->setStartStateToCurrentState();
+      if (move_group_->computeCartesianPath(wps, 0.005, 0.0, traj) > 0.5) {
+        move_group_->execute(traj);
+        settle();
+        RCLCPP_INFO(logger_, "放置: 已抬起 %.0fcm", lift_height_ * 100);
+      }
+    } else {
+      RCLCPP_INFO(logger_, "放置: 起点 z=%.3f 已高于目的地上方航点 %.3f, 跳过抬起",
+                  cur.pose.position.z, z_tip + clearance);
     }
 
     // 到目的地上方 (维持吸盘朝下姿态)
@@ -2296,29 +2404,40 @@ private:
     const double climb_z = climb_cands.empty() ? 0.0 : climb_cands.front();
     geometry_msgs::msg::PoseStamped cur;
     if (!currentTcp(cur)) { showTrayBoxes(tray); restorePlanScaling(); return false; }
-    geometry_msgs::msg::Pose up = cur.pose;
-    up.position.z = std::max(cur.pose.position.z + lift_height_, climb_z);
-    std::vector<geometry_msgs::msg::Pose> wps{up};
-    moveit_msgs::msg::RobotTrajectory traj;
-    move_group_->setStartStateToCurrentState();
-    const double up_frac = move_group_->computeCartesianPath(wps, 0.005, 0.0, traj);
-    if (up_frac > 0.5 && !dry_run_) {
-      move_group_->execute(traj);
-      settle();
-      geometry_msgs::msg::PoseStamped now;
-      const double reached = currentTcp(now) ? now.pose.position.z : up.position.z;
-      RCLCPP_INFO(logger_, "放置(%s): 已竖直爬升到 z=%.3f (目标 %.3f, 覆盖 %.0f%%)",
-                  what, reached, up.position.z, up_frac * 100);
-      if (reached < up.position.z - 0.02) {
-        RCLCPP_WARN(logger_, "放置(%s): 爬升未到位 (差 %.0fmm), transit 规划可能被别盘已放盒挡到",
-                    what, (up.position.z - reached) * 1000);
+    // 爬升目标就是 transit 高度本身, 不再叠 lift_height_.
+    // 2026-08-03: 原式 max(cur.z + lift_height_, climb_z) 在"起点已高过 transit"时会凭空
+    // 多抬 3cm 再下降 —— ■ 放托盘先经 /grasp/ready(TCP z≈0.294), max(0.324, 0.18)=0.324,
+    // 实机看到的就是"到 ready 后先抬一下才下去"(日志: 已竖直爬升到 z=0.324 目标 0.324).
+    // 爬升的用途只有一个: 从贴地的吸取位把臂拉到与 transit 航点同高, 免得规划器先横移再爬、
+    // 低空掠过别盘那摞盒. 起点本就够高时这一段没有任何作用, 整段跳过.
+    if (cur.pose.position.z < climb_z - 0.005) {
+      geometry_msgs::msg::Pose up = cur.pose;
+      up.position.z = climb_z;
+      std::vector<geometry_msgs::msg::Pose> wps{up};
+      moveit_msgs::msg::RobotTrajectory traj;
+      move_group_->setStartStateToCurrentState();
+      const double up_frac = move_group_->computeCartesianPath(wps, 0.005, 0.0, traj);
+      if (up_frac > 0.5 && !dry_run_) {
+        move_group_->execute(traj);
+        settle();
+        geometry_msgs::msg::PoseStamped now;
+        const double reached = currentTcp(now) ? now.pose.position.z : up.position.z;
+        RCLCPP_INFO(logger_, "放置(%s): 已竖直爬升到 z=%.3f (目标 %.3f, 覆盖 %.0f%%)",
+                    what, reached, up.position.z, up_frac * 100);
+        if (reached < up.position.z - 0.02) {
+          RCLCPP_WARN(logger_, "放置(%s): 爬升未到位 (差 %.0fmm), transit 规划可能被别盘已放盒挡到",
+                      what, (up.position.z - reached) * 1000);
+        }
+      } else if (dry_run_) {
+        RCLCPP_WARN(logger_, "放置(%s): [dry_run] 爬升到 z=%.3f 路径覆盖 %.0f%%, 不执行",
+                    what, up.position.z, up_frac * 100);
+      } else {
+        RCLCPP_WARN(logger_, "放置(%s): 爬升路径只覆盖 %.0f%%, 不执行爬升, 直接试 transit",
+                    what, up_frac * 100);
       }
-    } else if (dry_run_) {
-      RCLCPP_WARN(logger_, "放置(%s): [dry_run] 爬升到 z=%.3f 路径覆盖 %.0f%%, 不执行",
-                  what, up.position.z, up_frac * 100);
     } else {
-      RCLCPP_WARN(logger_, "放置(%s): 爬升路径只覆盖 %.0f%%, 不执行爬升, 直接试 transit",
-                  what, up_frac * 100);
+      RCLCPP_INFO(logger_, "放置(%s): 起点 z=%.3f 已在 transit 首档 %.3f 之上, 跳过爬升",
+                  what, cur.pose.position.z, climb_z);
     }
 
     // 规划到高空 transit 航点 (xy+朝向用标定值, z 绝对高度): 两端都在自由空间, 规划器不用
@@ -2734,6 +2853,7 @@ private:
   int num_trays_{2};
   std::vector<double> tray_x_, tray_y_, tray_z_, tray_qx_, tray_qy_, tray_qz_, tray_qw_;
   std::vector<int64_t> tray_capacity_, category_ids_, category_tray_;
+  double layer_gap_{0.005};   // 每层额外抬高量, 逐层累加 (两盘共用)
   std::vector<double> fallback_thickness_;
   bool dry_run_{false};
   double place_velocity_scaling_{1.0};
@@ -2765,6 +2885,15 @@ private:
   std::mutex stack_mtx_;
   std::vector<int> tray_layers_;
   std::vector<double> tray_stack_h_;
+  // 下一个卸下的盒该去哪个卸货点: 落点 = unload_seq_ % num_unload_points_.
+  // 跨服务调用保持, 使单个卸货(一按一个)不会把第二个盒摞到第一个身上; reset_stack 归零.
+  //
+  // **全局一个计数器, 不按托盘分** (2026-08-03 改): 两个卸货点是地面上的物理位置, 与盒
+  // 从哪个托盘来无关. 原先 per-tray 时, L1 卸 1 号盘第一个和 L2 卸 0 号盘第一个各自 seq=0,
+  // 会双双落到同一个点 —— 人若没及时取走第一个, 第二个直接摞上去, 而单卸模式已不登记
+  // 碰撞体(见 unloadTray 里那条), 规划器也不会帮着避开。
+  int unload_seq_{0};
+  int num_unload_points_{2};
   // 已放盒的持久碰撞体 id, 按托盘分组 (stack_mtx_ 保护). 放置成功后留在规划场景, 使后续
   // 放另一盘时 MoveIt 自动避让, 不再横扫已放盒 (2026-07-28 蹭飞事故). detach 的是携带盒
   // (carried_box), 这些是"已落盘"的独立世界碰撞体, 生命周期到 reset_stack 才清.
@@ -2780,6 +2909,9 @@ private:
   int last_category_{1};
   double last_thickness_{0.0};
   bool have_category_{false}, have_thickness_{false};
+  // "吸盘上这个盒"的类别: ③下插时锁存, detachBox 时清. 见 placeCategory().
+  int held_category_{1};
+  bool have_held_category_{false};
   double box_size_x_, box_size_y_, box_size_z_;
   std::string j1_name_;
   double look_j1_offset_;
@@ -2806,7 +2938,7 @@ private:
   rclcpp::Publisher<moveit_msgs::msg::CollisionObject>::SharedPtr co_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_, unload_srv_, ready_srv_, look_srv_,
     pick_srv_, place_srv_, coarse_srv_, cam_cal_srv_, yaw_cal_srv_, reset_srv_, jog_srv_,
-    seed_srv_, unload_tray_srv_, home_srv_, level_srv_, place_ground_srv_;
+    seed_srv_, unload_tray_srv_, unload_one_srv_, home_srv_, level_srv_, place_ground_srv_;
   rclcpp::Client<moveit_msgs::srv::ApplyPlanningScene>::SharedPtr apply_scene_cli_;
   rclcpp::Client<moveit_msgs::srv::GetPlanningScene>::SharedPtr get_scene_cli_;
   rclcpp::CallbackGroup::SharedPtr srv_cb_group_, scene_cb_group_, perc_cb_group_;

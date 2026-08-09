@@ -1,11 +1,14 @@
 """YOLO 盒子识别 + 抓取位姿 (深度相机 Link_30, 契约 §1 抓取版).
 
-彩色图 YOLO 出框 (自训练模型, 类别 1/2/3/4) + 对齐深度定位, 发布盒子顶面中心
+彩色图 YOLO 出框 (自训练模型, 类别 1/2/3/4) + 深度反投影定位, 发布盒子顶面中心
 位姿 /perception/object_pose (PoseStamped, base_link 系).
 
 前提 (本 launch 不代起, 需先各自就绪):
-  - 深度相机(RealSense)驱动已起, 发 color/image_raw + aligned_depth_to_color/image_raw
-    + color/camera_info (align_depth 必须启动时开, 否则彩色框落不到深度上);
+  - 深度相机(RealSense)驱动已起, 发 color/image_raw + depth/image_rect_raw
+    + depth camera_info;
+    ⚠️ **align_depth 刻意关掉**, 别照旧注释把它开回来 (2026-08-03 切路线):
+      本机彩色内参硬件层就坏 (PPX/PPY = -nan), 对齐图全废, 故走 use_raw_depth=true
+      直接吃原始深度流 + 深度内参 (fx=fy=428.403) 反投影。见 yolo_box_detector.yaml。
   - 整车 robot_state_publisher 已起 (TF 树含 Link_30 -> ... -> base_link),
     否则查不到 TF 只打印像素深度, 不发 pose. 可传 with_rsp:=true 顺带起.
 

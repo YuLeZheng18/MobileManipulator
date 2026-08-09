@@ -14,14 +14,61 @@ scale:
   joint: 0.30
 
 ## 出去的命令
-publish_period: 0.034            # ~30Hz
-low_latency_mode: false
+# ⚠️ 必须 **大于** controller_manager 的 update_rate 周期(100Hz=10ms), 别为"对齐"降到 0.01.
+# 2026-08-02 试过 0.01: servo 侧完美(98Hz 出轨迹, 抖动 0.1ms), 但**臂完全不动** ——
+# JTC 35 秒只往硬件写了 5 帧命令(0.1Hz)。原因: servo 每帧是单点轨迹, stamp=0 立即执行 +
+# time_from_start=10ms, 有效期正好一个控制周期, JTC 反复在"当前轨迹已走完"与"新轨迹
+# 还没到时刻"之间空转。0.034 时该点有 34ms 有效期、跨 3 个控制周期, 才有插值空间。
+# 2026-08-03 改 0.034 → 0.04: 取控制周期(10ms)的整数倍, 34ms 那 0.4 拍零头让 JTC
+# 每条轨迹末尾空转一小段。
+# ⚠️ 但"整数倍就没事了"这个当时的结论**已被实测推翻**: 改成 0.04 后 D 口
+# (/arm_joint_commands) 仍不是干净的 100Hz、插值跳变依旧。真因是 servo 每帧只发**单点**
+# 轨迹, JTC 每收一条就重置插值起点, 一条只覆盖 4 个控制周期 —— 与 publish_period 是否
+# 整除无关。2026-08-03 实测 D 口跳变/步 0.63、方向反转 13%, 而同期 B 口(servo 出)只
+# 0.13 / 0.4%: B 干净而 D 不干净 ⇒ 那部分粗糙是**在 JTC 内部生成的**。
+# ⇒ 别再指望调这个值解决 D 口粗糙, 它只管"别留零头"。
+# ⚠️ 只能往**长**调不能往短: 0.02 同样整除但只覆盖 2 拍, 余量比 34ms 更薄, 有重现
+# 上面 0.01 那个"臂完全不动"的风险。
+publish_period: 0.04
+# true: 绕过 publish_period 定时器, 收到 twist 立刻出帧 —— 出帧节奏与 twist(30Hz) 对齐,
+# 不再自起一个 34ms 网格。
+# 2026-08-02 为什么必须开: 实测点动时 /arm_joint_commands **71% 的相邻帧位置增量符号相反**
+# (方向反转 1113/1562 帧, 二阶/一阶=1.77), 而同一条 CAN 路径下 MoveIt 规划轨迹是
+# 反转 0 次、二阶/一阶=0.01。电机被要求每 10ms 正反抽一次 ⇒ 抖动 + 异响。
+# 根因是频率错配: twist 30Hz(33ms) 进, JTC 100Hz(10ms) 出, servo 自己按 34ms 网格发
+# 单点轨迹, JTC 每次收到新轨迹就重置插值起点 ⇒ 锯齿。
+# ⚠️ 这解释了之前在 CAN 层查的三轮全是错层(0xFD 顿挫 / 提加速度到 20000 剧烈抖 /
+#    换 0xFB 仍抖): 它们只是同一个来回锯齿在不同放大倍数下的表现, CAN 忠实执行了一个
+#    本身就在剧烈来回的位置序列。别再回去调 CAN。
+low_latency_mode: true
 command_out_type: trajectory_msgs/JointTrajectory
 publish_joint_positions: true
-publish_joint_velocities: false
+# velocities 必须 true —— 2026-08-02 点动"一顿一顿"的主因就是它是 false.
+# 只发位置时 JTC 拿到的是一串无速度轨迹点, 只能假定每点速度为零, 于是在点间做的五次样条
+# 是"从静止加速、再减速到静止", 位置目标序列本身就走走停停。
+# ⚠️ 当时在 CAN 层查了两轮(send_rate_hz 100->30、换 0xFB 直通限速)全是错的层:
+#    实测 0x37 电机位置误差只 ±0.1~0.4°(电机轴)、指令行程与实测行程差 0.02%,
+#    电机忠实跟随, 顿在 JTC 插值层, 换什么 CAN 帧格式都照样顿。
+# command_interfaces 只有 position 不影响: 发速度是给 JTC **插值时**用, 不需要速度命令接口.
+publish_joint_velocities: true
 publish_joint_accelerations: false
 
 smoothing_filter_plugin_name: "online_signal_smoothing::ButterworthFilterPlugin"
+# 一阶 Butterworth 低通的唯一可调参数, **越大越平滑但滞后越大**
+# (头文件原话: Larger filter_coeff -> more smoothing of servo commands, but more lag;
+#  截止频率 ∝ arccot(coeff))。
+# 原先没写这行 = 用默认 1.5, 几乎不滤。
+# ⚠️ 只能改 yaml 重启 servo, **不能 ros2 param set** —— 系数在 initialize() 时进
+# ButterworthFilter 构造函数算成 scale_term_/feedback_term_ 私有成员, 类没有 setter,
+# 结构上不可热更。2026-08-03 param set 报 successful 且回读 5.0, 实测 B 口跳变/步
+# 0.40->0.41 纹丝不动。判"生效没"只能看 B 口实测, 不能看参数回读。
+#
+# ⚠️⚠️ **这个系数不能写在本文件里**: grasp.launch.py 把整份 yaml 塞进
+# `{"moveit_servo": servo_yaml}`, 即本文件所有键都带 `moveit_servo.` 前缀; 而滤波器插件
+# 是在**节点根命名空间**声明 butterworth_filter_coeff 的, 写在这里会变成一个没人读的
+# `moveit_servo.butterworth_filter_coeff`。2026-08-03 试过, 且 servo 当场初始化不完
+# (参数一个都列不出来)。要改它得在 grasp.launch.py 的 servo_node parameters 里
+# **与 servo_params 并列**加一条 {"butterworth_filter_coeff": X}。
 
 # move_group 是主 planning scene, servo 不当主
 is_primary_planning_scene_monitor: false

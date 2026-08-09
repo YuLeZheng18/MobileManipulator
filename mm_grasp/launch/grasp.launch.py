@@ -33,6 +33,15 @@ def generate_launch_description():
     servo_yaml = load_yaml("mm_grasp", "config/servo.yaml")
     servo_params = {"moveit_servo": servo_yaml}
 
+    # ButterworthFilterPlugin 的唯一可调系数, **必须在这里给、不能写进 servo.yaml** ——
+    # 上一行把整份 yaml 塞进了 `moveit_servo.` 前缀下, 而插件是在**节点根命名空间**
+    # declare 这个参数的, 写进 yaml 只会造出一个没人读的 moveit_servo.butterworth_filter_coeff
+    # (2026-08-03 试过, 且 servo 当场初始化不完整, 参数一个都列不出来)。
+    # 越大越平滑但滞后越大(截止频率 ∝ arccot(coeff)); 默认 1.5 几乎不滤。
+    # ⚠️ 改了必须重启 servo: 系数在 initialize() 时算成滤波器私有成员, 无 setter,
+    # ros2 param set 会报成功但实测纹丝不动(B 口跳变/步 0.40->0.41)。
+    smoothing_params = {"butterworth_filter_coeff": 5.0}
+
     # 双托盘放置 + 按类别堆叠 + 安全测试参数 (真机标定值在此 yaml).
     place_params = os.path.join(
         get_package_share_directory("mm_grasp"), "config", "place.yaml")
@@ -44,6 +53,7 @@ def generate_launch_description():
         output="screen",
         parameters=[
             servo_params,
+            smoothing_params,
             moveit_config.robot_description,
             moveit_config.robot_description_semantic,
             moveit_config.robot_description_kinematics,

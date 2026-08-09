@@ -23,6 +23,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Float32MultiArray
 from std_srvs.srv import Trigger
 from ament_index_python.packages import get_package_share_directory, PackageNotFoundError
 
@@ -83,14 +84,40 @@ class CanBridge(Node):
         self.declare_parameter('send_rate_hz', 100.0)
         self.declare_parameter('query_rate_hz', 100.0)
         self.declare_parameter('auto_enable', True)
-        # per-motor speed 覆盖(电机内部0xFD的speed字段). 空=用~/.robot_arm_config.json的SPEEDS.
-        # 用途: J3减速比最低、每帧位移最小, 默认speed=150相对太快导致"瞬冲+空等"走停, 在此调低.
+        # per-motor 速度**上限**(0xFD speed 字段, 0.1RPM/LSB, 电机轴). 0=用 json 的 SPEEDS.
+        # ⚠️ 语义已变: 以前每帧恒发这个值, 现在只当上限 —— 实发值由指令流差分前馈算出,
+        # 见 _feedforward_speed(). 恒发巡航值是"冲到位再空等"的一半原因.
         self.declare_parameter('motor_speeds', [0, 0, 0, 0, 0, 0])
+        # per-motor 加减速度(0xFD 的加加/减加字段, RPM/s, 电机轴). 0=用 json 的 ACCELERATIONS.
+        # ⚠️ 顿挫的另一半原因就在这: 500RPM/s 下 J1 走完一帧增量(电机轴 0.044 转)是**三角
+        # 剖面** —— 峰值只 36RPM、需 145ms, 而 servo 帧周期 34ms, 每帧都在加速段就被下一帧
+        # 打断, 巡航段根本不存在, motor_speeds 那个值从未跑到 ⇒ 又慢又顿。
+        # 拉高到"加速段 << 帧周期"才有匀速段可言.
+        self.declare_parameter('motor_accels', [0, 0, 0, 0, 0, 0])
+        # 落后帧数 k: 实发速度按"用 k 个帧周期走完剩余距离"算, 使电机**永远差一点没到**,
+        # 下一帧目标就来了 ⇒ 不存在"走完空等"。k>1 才有这个余量, k=1 是刚好到(会短暂停).
+        # ⚠️ 别用"指令速度×系数"代替: 系数>1 提前到达→空等走停(2026-08-02 实测顿挫的直接
+        #    原因); 系数<1 又会无界落后(开环前馈没有回正机制)。按剩余距离算才自校正 ——
+        #    慢了距离变大自动加速, 快了自动减速, 稳态落后固定 k×每帧增量, 不累积。
+        #    推导: e_{n+1} = e_n(1-1/k) + Δ, 不动点 e*=kΔ, |1-1/k|<1 收敛, 且 v=Δ/T 不衰减.
+        self.declare_parameter('lag_frames', 1.3)
+        # 速度下限(占 motor_speeds 的比例): 兜底防算出 0 —— 速度字段为 0 电机不动.
+        self.declare_parameter('min_speed_frac', 0.02)
         # 发送死区(度): 目标相对上次实发变化<此值的电机不重发.
         # 目的: 轨迹到位后目标静止时停发, 不再对已到位电机每帧重启梯形规划器
         # (会触发堵转保护锁死), 同时让查询帧恢复->反馈不再饿死. 对齐 joint_gui「动时发/停时静」.
         # ⚠️ 死区是**逐电机**判的, 不是"任一轴变了就六轴全发" —— 详见 _changed_motors().
         self.declare_parameter('send_deadband_deg', 0.05)
+        # 位置模式: 'fd'=梯形曲线(基线) / 'fb'=直通限速. 详见 _send_position_command 上方注释.
+        # 点动用 fb(无梯形加减速, 不会每帧"瞬冲+空等"), 跑不通时一行切回 fd.
+        self.declare_parameter('position_mode', 'fd')
+        # 诊断: 查询循环额外发 0x37 读电机位置误差, 发到 /arm_pos_error (度, 电机轴).
+        # 用途 —— 判定"点动一顿一顿"到底顿在哪一层, 三种波形对应三个相反的处理方向:
+        #   误差每周期"从大跌到0再跳大" = 电机走完就空等(瞬冲+空等), 该换控制模式;
+        #   误差持续很大跟不上         = 电机限速跟不上指令, 该降 servo 增量或提 speed;
+        #   误差持续接近0             = 电机忠实跟随, 顿在上游(servo 出的增量本身不匀), 改 CAN 层白费.
+        # 默认关: 查询翻倍占总线, 平时不需要.
+        self.declare_parameter('query_pos_error', False)
         # 反馈看门狗: 超过这么久没收到任何 CAN 反馈就持续报 ERROR.
         # 为什么必须有: 反馈断了的时候 TopicBasedSystem 会**回显命令值**当测量值, 于是
         # /joint_states 照常 100Hz、JTC 见"位置已到" 8ms 报成功、MoveIt 报动作完成 ——
@@ -101,7 +128,16 @@ class CanBridge(Node):
         command_topic = self.get_parameter('command_topic').value
         state_topic = self.get_parameter('state_topic').value
         speeds_override = list(self.get_parameter('motor_speeds').value)
+        accels_override = list(self.get_parameter('motor_accels').value)
+        self._lag_frames = max(1.05, float(self.get_parameter('lag_frames').value))
+        self._min_speed_frac = float(self.get_parameter('min_speed_frac').value)
         self._send_deadband_deg = float(self.get_parameter('send_deadband_deg').value)
+        self._position_mode = str(self.get_parameter('position_mode').value).lower()
+        if self._position_mode not in ('fd', 'fb'):
+            self.get_logger().error('position_mode=%r 非法, 回落到 fd' % self._position_mode)
+            self._position_mode = 'fd'
+        self._query_pos_error = bool(self.get_parameter('query_pos_error').value)
+        self._pos_err_deg = [0.0] * MOTOR_COUNT
         self._fb_timeout = float(self.get_parameter('feedback_timeout_sec').value)
         # PCAN 通道是 ctypes TPCANHandle, 不适合做 ROS 参数, 直接用常量(与 joint_gui.py 一致)
         self.can_channel = PCAN_USBBUS1
@@ -114,7 +150,15 @@ class CanBridge(Node):
         for i in range(MOTOR_COUNT):
             if i < len(speeds_override) and speeds_override[i] > 0:
                 self.config.SPEEDS[i] = speeds_override[i]
-        self.get_logger().info(f'电机SPEEDS={self.config.SPEEDS}')
+            if i < len(accels_override) and accels_override[i] > 0:
+                self.config.ACCELERATIONS[i] = accels_override[i]
+        self.get_logger().info('电机速度上限=%s' % self.config.SPEEDS)
+        self.get_logger().info('电机加减速度=%s RPM/s (落后帧数=%.2f, 速度下限=%.0f%%)' % (
+            self.config.ACCELERATIONS, self._lag_frames, self._min_speed_frac * 100))
+        self.get_logger().warn('位置模式=0x%s (%s), 位置误差诊断=%s' % (
+            self._position_mode.upper(),
+            '直通限速, 无梯形加减速' if self._position_mode == 'fb' else '梯形曲线',
+            '开(/arm_pos_error)' if self._query_pos_error else '关'))
         self.can = CANInterface()
 
         self._lock = Lock()
@@ -126,6 +170,10 @@ class CanBridge(Node):
         self._target_deg: Optional[list] = None
         # 上次实际发出的目标(度), None 表示还没发过; 用于死区判重, 静止目标不重发
         self._last_sent: Optional[list] = None
+        # 指令流速度(度/秒, 输出轴), 由相邻两帧命令目标差分得到 —— TopicBasedSystem 发的
+        # JointState 里 velocity 是空的(command_interface 只有 position), 只能自己差分.
+        self._cmd_dt = 0.0             # 实测指令帧周期(秒), 滑动平均
+        self._prev_cmd_time = 0.0
         # 电机反馈位置(度)
         self._motor_deg = [0.0] * MOTOR_COUNT
         # 反馈看门狗状态: 最后一次收到有效反馈的时刻(每个电机各记一份, 便于定位是哪几个哑了)
@@ -147,6 +195,9 @@ class CanBridge(Node):
             JointState, command_topic, self._on_command, qos_be)
         # 发布关节状态给 TopicBasedSystem
         self._state_pub = self.create_publisher(JointState, state_topic, qos_rel)
+        # 诊断: 电机位置误差(度, 电机轴, 未除减速比). 仅 query_pos_error=true 时有数据.
+        self._err_pub = self.create_publisher(
+            Float32MultiArray, '/arm_pos_error', qos_be) if self._query_pos_error else None
 
         # 重新使能服务: 使能帧原先只在 _connect_can() 里发一次, 驱动一旦进保护态就再没有
         # 软件侧恢复路径, 只能物理断电重上(2026-08-01 就是这么恢复的)。有了这个服务可以先
@@ -154,7 +205,31 @@ class CanBridge(Node):
         # 等于无声地把保护解掉再撞一次, 必须由人确认现场后手动调。
         self._enable_srv = self.create_service(Trigger, '~/reenable', self._on_reenable)
 
+        # 调参用: 这几个值原先只在 __init__ 读一次快照, 试参数就得重启 can_bridge。
+        # 而重启它在臂不在零位时有风险(命令值与实测分叉), 故做成可在线改。
+        self.add_on_set_parameters_callback(self._on_set_params)
+
         self._connect_can()
+
+    def _on_set_params(self, params):
+        from rcl_interfaces.msg import SetParametersResult
+        for p in params:
+            if p.name == 'lag_frames':
+                self._lag_frames = max(1.05, float(p.value))
+            elif p.name == 'min_speed_frac':
+                self._min_speed_frac = float(p.value)
+            elif p.name == 'send_deadband_deg':
+                self._send_deadband_deg = float(p.value)
+            elif p.name == 'position_mode':
+                v = str(p.value).lower()
+                if v not in ('fd', 'fb'):
+                    return SetParametersResult(
+                        successful=False, reason='position_mode 只能是 fd 或 fb')
+                self._position_mode = v
+            else:
+                continue
+            self.get_logger().warn('参数在线改: %s = %r' % (p.name, p.value))
+        return SetParametersResult(successful=True)
 
     def _on_reenable(self, req, res):
         del req
@@ -221,6 +296,17 @@ class CanBridge(Node):
             fb = self.get_motor_deg()
             new_target = [new_target[i] if new_target[i] is not None else fb[i]
                           for i in range(MOTOR_COUNT)]
+        # 测指令帧周期(滑动平均), 供 _feedforward_speed 定"用几个周期走完剩余距离".
+        # 不用 msg.velocity: 速度已改为按剩余距离算(自校正), 不再需要指令速度本身 ——
+        # 用指令速度乘系数那条路会走停或无界落后, 见 lag_frames 注释.
+        now = time.time()
+        if self._prev_cmd_time > 0:
+            dt = now - self._prev_cmd_time
+            if 0.002 <= dt <= 0.2:      # 排掉同刻双帧与点动间歇后的第一帧
+                with self._lock:
+                    self._cmd_dt = dt if self._cmd_dt <= 0 else self._cmd_dt * 0.9 + dt * 0.1
+        self._prev_cmd_time = now
+
         with self._lock:
             self._target_deg = new_target
 
@@ -327,7 +413,23 @@ class CanBridge(Node):
         if ok:
             self._last_sent = None   # 保护期间的目标已丢, 让下一轮重发一遍
 
-    # ---------- 0xFD 梯形位置模式 (joint_gui 验证过的基线协议) ----------
+    # ---------- 位置模式: 0xFD 梯形 / 0xFB 直通限速 ----------
+    # 0xFD 每帧语义="按给定加减速与最大速度, **加速→减速→停在**目标位置"。
+    # 2026-08-02 关于顿挫查到这里:
+    #   ① 速度字段原先恒发巡航值(J1 恒 382RPM): 不论增量多小都命令"冲过去", 走完空等下一帧。
+    #      已由 _feedforward_speed() 按 JTC 给的 velocity 逐帧算, 替代恒定值。
+    #   ② 加速度**不是**可调的出路 —— 从 500 提到 20000 当场剧烈抖动 + 异响。因为每帧都重发
+    #      一次梯形规划, 加速度方向每 10ms 反向一次, 提高它等于把 100Hz 强迫激励加重, 正落
+    #      在步进共振带。500 之所以安静只是它连加速段都跑不完、从没那次减速反向。
+    #   ⇒ 真正要去掉的是**"每帧减速到停"**这个语义本身, 即换 0xFB 直通限速(见下), 而不是
+    #      在 0xFD 里调参数。这条别再试第二遍。
+    # ⚠️ 别再回去查 CAN 帧格式: 0x37 位置误差实测 ±0.1~0.4°(电机轴)、指令与实测行程差
+    #    0.02%, 电机忠实跟随, 换帧格式救不了这两个字段填错。
+    # 0xFB 直通限速: 同样是位置目标(可照用绝对标志), 但**没有梯形加减速**, 直奔目标。
+    # 帧短 4 字节(去掉两组加速度)。留作备用: 若 ① 拉高加速度后仍有异响/丢步, 它是另一条路。
+    # ⚠️ 没选 0xF6 速度模式: 它只给速度不给位置, 电机会一直转到下一条指令为止。而 servo
+    # 的停止方式是**停发**(见 joy_arm_teleop 里 zero-twist 那段), 停发就等于电机保持
+    # 最后速度一直转出约束盒 —— 那是把安全模型整个反过来, 要另做失效保护才敢用。
     def _send_position_command(self, motor_id: int, position_deg: float) -> bool:
         if not self.can.is_open or not (1 <= motor_id <= MOTOR_COUNT):
             return False
@@ -335,7 +437,7 @@ class CanBridge(Node):
         idx = motor_id - 1
 
         motor_direction = self.config.DIRECTION_MAP[idx]
-        motor_speed = self.config.SPEEDS[idx] * 10
+        motor_speed = self._feedforward_speed(idx, position_deg)
         motor_accel = self.config.ACCELERATIONS[idx]
 
         if motor_direction:
@@ -350,6 +452,37 @@ class CanBridge(Node):
             pos_with_red = int(abs(position_deg) * 10)
         return self._send_position_frame(can_id, direction, motor_speed, motor_accel, pos_with_red)
 
+    def _feedforward_speed(self, idx: int, target_deg: float) -> int:
+        """速度字段(0.1RPM/LSB, 电机轴): 按"用 lag_frames 个帧周期走完**剩余距离**"算。
+
+        为什么不是"指令速度 × 余量":
+          余量>1 ⇒ 提前到达目标, 剩下的时间电机停着等下一帧 = 走停顿挫;
+          余量<1 ⇒ 每帧都少走一点, 开环前馈没有回正机制, 会无界地越落越远(即"衰减")。
+        按剩余距离算则自校正: 落后多了距离变大 ⇒ 自动加速; 跑快了距离变小 ⇒ 自动减速。
+        稳态落后固定在 lag_frames × 每帧增量(J1 约 0.42°), 不累积, 且此时实发速度恰好
+        等于指令速度(推导见 lag_frames 参数注释)。电机永远差一点没走到, 所以不会停。
+
+        ⚠️ 必须用**实测反馈**算剩余距离, 不能用上一帧指令 —— 用指令就退化成开环, 自校正
+           那一半没了。反馈的量化噪声不影响: 它只抬高速度上限, 不改变位置目标。
+        """
+        ratio = self.config.REDUCTION_RATIOS[idx] or 1.0
+        cap = self.config.SPEEDS[idx] * 10           # 上限, 0.1RPM
+        with self._lock:
+            cur = self._motor_deg[idx]
+        remain_deg = abs(target_deg - cur)           # 输出轴
+        horizon = self._lag_frames * self._cmd_period()
+        dps = remain_deg / horizon if horizon > 0 else 0.0
+        # 输出轴 deg/s -> 电机轴 0.1RPM: rpm = dps/360*60*ratio = dps*ratio/6
+        val = int(dps * ratio / 6.0 * 10)
+        return max(int(cap * self._min_speed_frac), min(val, cap))
+
+    def _cmd_period(self) -> float:
+        """指令帧周期(秒), 实测滑动平均。不写死 0.01 是因为它由上游决定:
+        MoveIt 规划执行时是 JTC 的 100Hz, servo 点动时取决于 publish_period(现 34ms),
+        写死会让 lag_frames 的物理含义在两种场景下不一致。"""
+        with self._lock:
+            return self._cmd_dt if self._cmd_dt > 0 else 0.01
+
     def _can_send(self, can_id, data, is_extended=True):
         """所有 CAN 发送的唯一出口, 经 _can_tx_lock 串行化, 杜绝并发拼帧损坏."""
         with self._can_tx_lock:
@@ -359,12 +492,21 @@ class CanBridge(Node):
         try:
             pos_bytes = position.to_bytes(4, byteorder='big')
             speed_bytes = speed.to_bytes(2, byteorder='big')
-            accel_bytes = int(accel).to_bytes(2, byteorder='big')
             # 帧尾(官方ZDT_X57_V2): 相对绝对标志(0x01绝对) + 多机同步标志(0x00立即执行) + 0x6B
             abs_flag = 0x01
             sync_flag = 0x00
-            data_bytes = ([0xFD, direction] + list(accel_bytes) + list(accel_bytes)
-                          + list(speed_bytes) + list(pos_bytes) + [abs_flag, sync_flag, 0x6B])
+            if self._position_mode == 'fb':
+                # 0xFB: FB + 符号 + 速度(2) + 位置(4) + abs + sync + 6B = 11 字节
+                data_bytes = ([0xFB, direction] + list(speed_bytes) + list(pos_bytes)
+                              + [abs_flag, sync_flag, 0x6B])
+            else:
+                accel_bytes = int(accel).to_bytes(2, byteorder='big')
+                # 0xFD: FD + 符号 + 加加(2) + 减加(2) + 速度(2) + 位置(4) + abs + sync + 6B = 15 字节
+                data_bytes = ([0xFD, direction] + list(accel_bytes) + list(accel_bytes)
+                              + list(speed_bytes) + list(pos_bytes) + [abs_flag, sync_flag, 0x6B])
+            func_code = data_bytes[0]
+            # 分包规则(协议 7.2): >8 字节要拆包, 帧 ID = (地址<<8) + 包号,
+            # 且**每包首字节都是功能码**。故第 1 包要重新带一次功能码。
             first = data_bytes[:8]
             second = data_bytes[8:]
             # 双帧必须在同一锁内连发, 防止中间被查询帧插入打断
@@ -373,7 +515,7 @@ class CanBridge(Node):
                 if not ok1:
                     return False
                 if second:
-                    ok2, _ = self.can.send_message(can_id + 1, [0xFD] + second, True)
+                    ok2, _ = self.can.send_message(can_id + 1, [func_code] + second, True)
                     if not ok2:
                         return False
             return True
@@ -390,11 +532,17 @@ class CanBridge(Node):
     def _query_loop(self):
         period = 1.0 / self.query_rate if self.query_rate > 0 else 0.01
         data = [0x36, 0x6b]
+        err_data = [0x37, 0x6b]
         while self._query_running:
             if self.can.is_open and not self._query_paused:
                 for mid in range(1, MOTOR_COUNT + 1):
-                    self._can_send(0x100 + (mid - 1) * 0x100, data, True)
+                    can_id = 0x100 + (mid - 1) * 0x100
+                    self._can_send(can_id, data, True)
                     time.sleep(0.001)
+                    # 位置误差紧跟位置查, 同一轮里问同一个电机 —— 两个量时间上对齐才好对照
+                    if self._query_pos_error:
+                        self._can_send(can_id, err_data, True)
+                        time.sleep(0.001)
             time.sleep(period)
 
     # ---------- 接收循环: 解析反馈 -> 发布 joint_states ----------
@@ -431,11 +579,23 @@ class CanBridge(Node):
             data = msg.get('data')
             if isinstance(data, (bytes, bytearray)):
                 data = list(data)
-            if not (0x100 <= can_id <= 0x600 and len(data) >= 7
-                    and data[0] == 0x36 and data[-1] == 0x6b):
+            if not (0x100 <= can_id <= 0x600 and len(data) >= 7 and data[-1] == 0x6b):
                 return
             idx = (can_id >> 8) - 1
             if not (0 <= idx < MOTOR_COUNT):
+                return
+            # 0x37 位置误差(诊断用): 符号 + 4 字节, ×100 放大.
+            # ⚠️ 刻意**不喂看门狗** —— 看门狗只该认位置帧(0x36), 否则误差帧照常来
+            # 就能掩盖位置反馈断流, 而那正是 TopicBasedSystem 回显陷阱的触发条件.
+            if data[0] == 0x37:
+                if self._err_pub is not None:
+                    e = int.from_bytes(data[2:6], byteorder='big', signed=False) / 100.0
+                    self._pos_err_deg[idx] = -e if data[1] == 0x01 else e
+                    m = Float32MultiArray()
+                    m.data = [float(v) for v in self._pos_err_deg]
+                    self._err_pub.publish(m)
+                return
+            if data[0] != 0x36:
                 return
 
             direction = data[1]

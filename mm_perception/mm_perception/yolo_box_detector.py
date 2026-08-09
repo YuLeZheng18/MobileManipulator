@@ -4,11 +4,14 @@
 分工:
   - YOLO 在彩色图上出目标框, 负责 "是不是盒子 / 在哪" (比纯深度分割更能滤掉
     手/支架等非盒子凸起);
-  - 框内 ROI 在**对齐深度** (aligned_depth_to_color, 与彩色逐像素对齐) 上做深度
-    分割 + minAreaRect 长轴, 负责 "顶面中心精确 xyz + 绕竖直轴 yaw".
+  - 框内 ROI 在深度图上做深度分割 + minAreaRect 长轴, 负责 "顶面中心精确 xyz +
+    绕竖直轴 yaw".
+    ⚠️ 走的是**原始深度流** (depth/image_rect_raw, use_raw_depth=true), 不是对齐深度 ——
+    本机彩色内参坏 (PPX/PPY = -nan) 使 aligned_depth 全废。彩色框像素靠
+    _color_px_to_depth_px() 换算到深度画幅。别照旧注释改回 aligned_depth。
 
 数据流:
-  订阅 color(rgb8) + aligned_depth_to_color(16UC1, 同分辨率同视角) + color camera_info
+  订阅 color(rgb8) + depth/image_rect_raw(16UC1, 不同分辨率/视角) + depth camera_info
     -> YOLO 推理彩色图, 出目标框 (可按类别名过滤)
     -> 每框 ROI 内: 估台面深度 -> 取盒子顶面掩码 -> 最大轮廓 minAreaRect
     -> 顶面中心像素取对齐深度中值 d -> 反投影(光学系)-> 左乘固定旋转到 Link_30 机械系
@@ -31,8 +34,8 @@
   误差**, 要达抓取精度须用 camera_calibration 重标定彩色相机后 K 才有效.
 
 依赖:
-  - 深度相机驱动 (RealSense) 已起, 发 color/image_raw + aligned_depth_to_color/image_raw
-    + color/camera_info;
+  - 深度相机驱动 (RealSense) 已起, 发 color/image_raw + depth/image_rect_raw
+    + depth camera_info (align_depth 关着, 见上);
   - 整车 robot_state_publisher 已起 (TF 树含 Link_30 -> ... -> base_link), 否则查不到
     TF 只打印像素/深度, 不发 pose;
   - 通用 yolov8n.pt (COCO) 无 "盒子" 类, 仅跑通链路; 换自训练模型改 model_path,

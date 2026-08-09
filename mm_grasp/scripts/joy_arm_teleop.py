@@ -35,7 +35,10 @@ DRIVE 态不需要(joy 死了 teleop_twist_joy 自己停发, 固件 500ms failsa
 
 臂模式下有**两套互不相干的运动路径**, 别混:
   ① 摇杆/十字键点动 -> /servo_node/delta_twist_cmds, 受下面的约束盒 (box_* 参数) 钳位。
-  ② 按键动作 (✕抓取 ■放托盘 ○放地面 L1/L2卸盘 △回正) -> 调 /grasp/* 服务, 走 grasp_node
+  ② 按键动作 (✕抓取 ■放托盘 ○放地面 L1/L2卸盘各一个 △回正) -> 调 /grasp/* 服务, 走 grasp_node
+     放托盘不选左右: 盘号由盒子类别定 (place.yaml category_tray, 类别1/2->左盘1, 3/4->右盘0).
+     L1/L2 是卸货, 每按一次只卸栈顶一个 (/grasp/unload_one); 装货卸货完都回 look 待命。
+     动作执行期间 busy=True, 点动与状态切换全部拦住, 必须等这一轮跑完。
      的 MoveIt plan()+execute() 带碰撞检查, **约束盒不参与**。放托盘/卸货的可达性与避障
      由规划器负责, 与本节点无关。
 
@@ -111,12 +114,32 @@ class JoyArmTeleop(Node):
         self.deadzone = self.declare_parameter('deadzone', 0.15).value
 
         # ---- 点动速度 (speed_units: m/s 与 rad/s, servo.yaml command_in_type) ----
-        # 保守起步. 约束盒是唯一防线, 快了撞上再钳位也来不及.
         # 右摇杆实测只到 0.88/0.81 (左摇杆满 1.00), 故 z/yaw 实际最大速比设定低约 15%.
-        self.scale_lin = self.declare_parameter('servo_scale_linear', 0.03).value
-        self.scale_rot = self.declare_parameter('servo_scale_angular', 0.20).value
+        #
+        # 0.08 而非原来的 0.03: 3cm/s 走完盒 y 向(16cm)要 5 秒多, 太慢。
+        # 上限由**钳位是反应式的**决定 —— _clamp_to_box 是越界后才把该方向置零, 没有提前
+        # 减速, 所以越界深度 ≈ 速度 × 反应延迟。延迟链: tick 30Hz(33ms) + servo
+        # publish_period(34ms) + CAN 落后 lag_frames 1.3 帧(44ms) ≈ 111ms, 另有 TF 滞后未计。
+        # 0.08 对应越界约 9mm; 0.15 就要 17mm。
+        # 2026-08-03 从 0.08 提到 0.35: 提速本身**减轻**了点动粗糙, 这是实测因果不是副作用。
+        # 机理(用户提出, 已测量证实): can_bridge 只在位移超 send_deadband_deg(0.05°) 才发
+        # CAN 帧。0.08 下从动轴每帧位移远小于死区 —— 实测 J14 帧位移 0.0043°(死区的 0.09 倍)
+        # 要攒 97 帧≈1s 才发一次, J15 攒 176 帧 —— 即从动轴在做**秒级阶跃**而非连续跟随,
+        # 六轴发帧节奏互不同步, 合成末端轨迹带横向抽动。提速把更多轴推过死区。
+        # ⚠️ 别指望调 send_deadband_deg 解决: 降到 0.005 实测无改善且手感更差(从动轴变成
+        #    100Hz 微幅斜坡重启, 激励频率进可感带), 两头都不舒服 —— 根子在 0xFD 每帧重启
+        #    梯形斜坡的语义, 不在死区取值。
+        # ⚠️⚠️ 安全代价, 装货架前必读: 约束盒是**软**钳位(超界才减速), 越界深度 ≈ 速度 ×
+        #    反应延迟(tick 33ms + servo publish_period 40ms + CAN lag_frames 1.3 帧 44ms
+        #    ≈ 117ms, 另有 TF 滞后未计)。0.08 越界约 9mm, **0.35 越界约 41mm**。
+        #    而六个 box_ 值是**空台架无货架围栏**标的(见下方 box_ 注释), 只反映臂自身可达
+        #    包络, 不含"不碰环境"。上货架/围栏后必须重标 box_, 或把此值降回 0.15(越界 18mm)。
+        self.scale_lin = self.declare_parameter('servo_scale_linear', 0.35).value
+        # 0.20 -> 0.5 -> 0.8 rad/s: yaw 只转腕不平移 TCP, 不受约束盒制约, 故可比 linear 激进.
+        self.scale_rot = self.declare_parameter('servo_scale_angular', 0.8).value
         # roll/pitch 单独一档更小的: 腕一歪相机跟着歪, cam_target 标定立刻失效.
-        self.scale_wrist = self.declare_parameter('servo_scale_wrist', 0.15).value
+        # 提得比 yaw 保守, 且**约束盒钳不了腕姿态** —— 腕一歪就能怼地(见 box_z_min 注释).
+        self.scale_wrist = self.declare_parameter('servo_scale_wrist', 0.5).value
 
         # ---- 约束盒 (base_link 系, TCP=suction_tip 不许出这个盒) ----
         # 2026-08-01 真机实标 (RViz 拖臂走四角读 base_link->suction_tip) + /compute_ik
@@ -142,7 +165,10 @@ class JoyArmTeleop(Node):
 
         self.base_frame = self.declare_parameter('base_frame', 'base_link').value
         self.ee_frame = self.declare_parameter('ee_frame', 'suction_tip').value
-        self.rate_hz = self.declare_parameter('publish_rate', 30.0).value
+        # 25Hz = 40ms, 必须与 servo.yaml 的 publish_period 一致: low_latency_mode 下
+        # servo 只在收到 twist 时出帧, 出帧节奏由这里决定, 只改 servo 那边不生效。
+        # 40ms 是控制周期 10ms 的整数倍, 理由见 servo.yaml publish_period 上方注释。
+        self.rate_hz = self.declare_parameter('publish_rate', 25.0).value
         # 上电是否自动摆 home: 真机第一次测时臂可能停在任意位置, 自动跑会突然大幅运动,
         # 故默认关. 桌面快捷方式那条命令里再打开 (那时臂位置已知).
         self.home_on_start = self.declare_parameter('home_on_start', False).value
@@ -179,6 +205,11 @@ class JoyArmTeleop(Node):
         # 有了它, START 在 HOME 态就能分辨"该启动"还是"该重试停机"。
         self.arm_homed = True
 
+        # 点动速度要在线扫: 上面三个 scale_* 原先只在 __init__ 读一次快照, 改一档就得重启
+        # 遥控栈(会连带 joy_node/teleop_twist_joy 一起重起, 且残留进程要手动清)。
+        # 2026-08-03 因此白测一轮: ros2 param set 报成功而实际没生效, 拿到的是旧速度的数据。
+        self.add_on_set_parameters_callback(self._on_set_params)
+
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -194,7 +225,7 @@ class JoyArmTeleop(Node):
         self.cli = {n: self.create_client(Trigger, n, callback_group=cb) for n in (
             '/grasp/home', '/grasp/ready', '/grasp/look', '/grasp/level',
             '/grasp/pick_only', '/grasp/place_only', '/grasp/place_ground',
-            '/grasp/unload_tray')}
+            '/grasp/unload_one')}
         self.start_servo = self.create_client(Trigger, '/servo_node/start_servo',
                                               callback_group=cb)
         self.set_tray = self.create_client(SetParameters, '/grasp_node/set_parameters',
@@ -215,6 +246,22 @@ class JoyArmTeleop(Node):
             self.arm_homed = False
             self._run_action('上电收拢', '/grasp/home',
                              after=lambda: None, on_success=self._mark_homed)
+
+    def _on_set_params(self, params):
+        """只放行点动速度三档。约束盒与按键号刻意不可在线改 —— 盒是安全边界,
+        改错了没有第二层兜(planning scene 里没有货架/围栏, 只有盒能拦)。"""
+        from rcl_interfaces.msg import SetParametersResult
+        for p in params:
+            if p.name == 'servo_scale_linear':
+                self.scale_lin = float(p.value)
+            elif p.name == 'servo_scale_angular':
+                self.scale_rot = float(p.value)
+            elif p.name == 'servo_scale_wrist':
+                self.scale_wrist = float(p.value)
+            else:
+                continue
+            self.get_logger().warn('参数在线改: %s = %r' % (p.name, p.value))
+        return SetParametersResult(successful=True)
 
     def _mark_homed(self):
         self.arm_homed = True
@@ -368,6 +415,17 @@ class JoyArmTeleop(Node):
     def _publish_zero(self):
         self.pub_cmd.publish(Twist())
 
+    def _log_result(self, text, ok):
+        """按成功/失败选日志级别。**不能**写成 `log = warn if ok else error` 再调 ——
+        rclpy 按"文件+行号"缓存 logger 配置, 同一行先后用两个级别会抛
+        ValueError: Logger severity cannot be changed between calls, 而这个异常会直接
+        掀掉 worker 线程: 2026-08-03 卸货成功后那句"回 look"因此从未执行过 (finally 里
+        仍清了 busy, 所以看起来不像崩)。分成两个调用点, 两个级别各占自己的行号。"""
+        if ok:
+            self.get_logger().warn(text)
+        else:
+            self.get_logger().error(text)
+
     # ---- 动作: 阻塞期间不接点动, 跑完回到点动待命 ----
     def _run_action(self, name, srv, first=None, then=None, after=None, on_success=None):
         # after 默认 = 重锁 servo 基准. 本方法只在 ARM 态被调(点动态), 而每个动作都动了臂,
@@ -391,8 +449,7 @@ class JoyArmTeleop(Node):
                         self.get_logger().error('%s 中止 — %s 失败: %s' % (name, first, m))
                         return
                 ok, m = self._call_sync(srv)
-                log = self.get_logger().warn if ok else self.get_logger().error
-                log('%s -> %s %s' % (name, ok, m))
+                self._log_result('%s -> %s %s' % (name, ok, m), ok)
                 if ok and then:
                     self.get_logger().warn('%s: 收尾 %s' % (name, then))
                     self._call_sync(then)
@@ -407,7 +464,11 @@ class JoyArmTeleop(Node):
         threading.Thread(target=worker, daemon=True).start()
 
     def _run_unload(self, name, tray):
-        """卸货: 先把 grasp_node 的 unload_tray 设成目标盘号, 再调服务, 完事回 look."""
+        """卸货: 先把 grasp_node 的 unload_tray 设成目标盘号, 再调服务, 完事回 look.
+
+        调 /grasp/unload_one (每次只卸栈顶一个), 不是 /grasp/unload_tray (整盘).
+        整盘那条留给 mm_task 状态机, 遥控要的是一按一个、人跟着取盒。
+        """
         self.busy = True   # 同步占住, 理由见 _run_action
 
         def worker():
@@ -415,9 +476,8 @@ class JoyArmTeleop(Node):
                 if not self._set_tray_param(tray):
                     self.get_logger().error('%s 中止: 设 unload_tray=%d 失败' % (name, tray))
                     return
-                ok, m = self._call_sync('/grasp/unload_tray')
-                log = self.get_logger().warn if ok else self.get_logger().error
-                log('%s (盘%d) -> %s %s' % (name, tray, ok, m))
+                ok, m = self._call_sync('/grasp/unload_one')
+                self._log_result('%s (盘%d) -> %s %s' % (name, tray, ok, m), ok)
                 if ok:
                     self._call_sync('/grasp/look')
             finally:
@@ -439,7 +499,15 @@ class JoyArmTeleop(Node):
         res = fut.result()
         return bool(res.results) and res.results[0].successful
 
-    def _call_sync(self, srv, timeout=180.0):
+    # 30 而不是原来的 180: 超时**不是**"动作还没跑完"的正常等待, 而是 response 丢了。
+    # 2026-08-02 实测: grasp_node 正常完成 look 并返回(日志"已到看货姿势"), teleop 侧却
+    # 到 180s 才报超时 = 请求发出 + 整个 timeout, 那个 response 从头到尾没到客户端。
+    # 同一份日志里 servo_node 有一模一样的签名 (failed to send response ...
+    # client will not receive response), 两个互不相干的服务端都是"回调返回了、response
+    # 投不出去" ⇒ rmw_fastrtps 传输层, 疑似 /dev/shm 孤儿段(见记忆里 matched=0 那条)。
+    # 期间 busy 一直是 True, 所有按键被丢弃, 看起来像死锁 —— 其实超时一到 finally 就放行。
+    # 取 30s: MoveIt 最长一段执行实测约 8s, 30s 够宽; 丢包时只白等 30s 而不是 3 分钟。
+    def _call_sync(self, srv, timeout=30.0):
         c = self.cli.get(srv)
         if not c or not c.service_is_ready():
             return False, '服务 %s 不在线' % srv

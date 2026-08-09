@@ -18,8 +18,15 @@
                     <plugin>mock_components/GenericSystem</plugin>
                 </xacro:unless>
             </hardware>
+            <!-- velocity 命令接口不是给驱动发速度指令用的(0xFD 吃的是位置 + 速度上限),
+                 而是为了让 TopicBasedSystem 把 JTC 算出的速度填进 /arm_joint_commands
+                 的 velocity 字段 —— 它只在**声明了 velocity 命令接口**时才填, 否则该字段是空的,
+                 can_bridge 就只能自己差分位置去估速度(把 JTC 已知的量丢掉再估回来)。
+                 can_bridge 用这个速度前馈进 0xFD 速度字段, 替代原先每帧恒发巡航值。
+                 JTC command_interfaces=[position, velocity] 是合法组合, 开环双写, 不需要 PID。 -->
             <joint name="Joint_11">
                 <command_interface name="position"/>
+                <command_interface name="velocity"/>
                 <state_interface name="position">
                   <param name="initial_value">${initial_positions['Joint_11']}</param>
                 </state_interface>
@@ -27,6 +34,7 @@
             </joint>
             <joint name="Joint_12">
                 <command_interface name="position"/>
+                <command_interface name="velocity"/>
                 <state_interface name="position">
                   <param name="initial_value">${initial_positions['Joint_12']}</param>
                 </state_interface>
@@ -34,6 +42,7 @@
             </joint>
             <joint name="Joint_13">
                 <command_interface name="position"/>
+                <command_interface name="velocity"/>
                 <state_interface name="position">
                   <param name="initial_value">${initial_positions['Joint_13']}</param>
                 </state_interface>
@@ -41,6 +50,7 @@
             </joint>
             <joint name="Joint_14">
                 <command_interface name="position"/>
+                <command_interface name="velocity"/>
                 <state_interface name="position">
                   <param name="initial_value">${initial_positions['Joint_14']}</param>
                 </state_interface>
@@ -48,6 +58,7 @@
             </joint>
             <joint name="Joint_15">
                 <command_interface name="position"/>
+                <command_interface name="velocity"/>
                 <state_interface name="position">
                   <param name="initial_value">${initial_positions['Joint_15']}</param>
                 </state_interface>
@@ -55,6 +66,7 @@
             </joint>
             <joint name="Joint_16">
                 <command_interface name="position"/>
+                <command_interface name="velocity"/>
                 <state_interface name="position">
                   <param name="initial_value">${initial_positions['Joint_16']}</param>
                 </state_interface>
