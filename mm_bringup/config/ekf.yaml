@@ -30,12 +30,23 @@ ekf_filter_node:
     odom0_relative: false
     odom0_queue_size: 10
 
-    # IMU: 取 yaw 姿态 + vyaw 角速度 + 平面线加速度 (HWT906P 已融合姿态)
+    # IMU: 取 yaw 姿态 + 平面线加速度 (HWT906P 已融合姿态)
+    #
+    # ⚠️ vyaw(第 12 位) 刻意关掉 —— 2026-08-08 实测: 固件发的 /imu 里
+    #    angular_velocity 三轴**恒为 0.0**(静止 383 帧一个 bit 不变, 直行一趟也全 0),
+    #    而 linear_acceleration 有真实值(z≈9.835=重力) ⇒ 加速度计在工作,
+    #    陀螺角速度没被填进消息。开着这一位等于持续告诉 EKF"车没在转",
+    #    与 odom0 的真实 vyaw 观测直接冲突, 原地转时尤其有害。
+    #    固件补上 angular_velocity 后可改回 true —— 那才是治本。
+    #
+    # ⚠️ 另一个已知问题(未处置): /imu 所有 *_covariance 全为 0。ROS 约定
+    #    covariance[0]=-1 表示"该字段无效", 全 0 意味着"零方差=绝对可信",
+    #    EKF 因此会无条件相信 IMU yaw。若长距离建图发现航向被拖偏, 先查这里。
     imu0: /imu
     imu0_config: [false, false, false,
                   false, false, true,
                   false, false, false,
-                  false, false, true,
+                  false, false, false,
                   true,  true,  false]
     imu0_differential: false
     imu0_relative: false

@@ -26,7 +26,10 @@ def generate_launch_description():
                 'channel_type': 'serial',
                 'serial_port': serial_port,
                 'serial_baudrate': 256000,
-                'frame_id': 'Link_12',
+                # laser_link 是雷达的**测量帧**, 不是 Link_12(那是 mesh 帧)。
+                # 雷达绕竖轴转了 180° 装, 两帧差一个 Rz(pi), 指错则点云前后颠倒。
+                # 实测由来见 mm_robot.urdf 的 Joint_laser 注释。
+                'frame_id': 'laser_link',
                 'inverted': False,
                 'angle_compensate': True,
                 'scan_mode': scan_mode,

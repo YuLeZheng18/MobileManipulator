@@ -1,0 +1,94 @@
+# slam_toolbox online_async 建图参数 — 真机激光 SLAM (D4.1)
+#
+# ⚠️ scan_topic 必须是 /scan_filtered 不是 /scan:
+#    车后方 ±25° 是机械臂本体与线材(见 scan_filter.yaml)。喂原始 /scan 建图, 机械臂会被
+#    当成障碍物写进地图, 且它随车移动 ⇒ 沿途留下一条"跟着车走的幽灵墙", 地图直接废掉。
+#
+# ⚠️ odom_frame=odom 意味着建图精度**直接吃 EKF 航位推导的精度**。
+#    截至 2026-08-08 EKF 只验过静态(链路通/17Hz/TF 存在), 动态精度(D3.2)未验。
+#    建图第一段要盯: 直走时墙是否画成直线、回到原点时是否与起始墙重影。
+#    出现歪斜/重影先怀疑 EKF 航向, 不是 slam_toolbox 参数。
+#
+# 帧约定: map -> odom(本节点发) -> base_link(EKF 发)。base_frame 用 base_link,
+# 与 ekf.yaml 的 base_link_frame 一致(整车 URDF 根即 base_link, 无 base_footprint 层)。
+
+slam_toolbox:
+  ros__parameters:
+    use_sim_time: false
+
+    # ===== 帧与话题 =====
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link
+    scan_topic: /scan_filtered      # 见文件头警告, 别改回 /scan
+    mode: mapping
+
+    # ===== 求解器 =====
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+
+    debug_logging: false
+    throttle_scans: 1
+    transform_publish_period: 0.02
+    map_update_interval: 1.0        # 建图时勤更新, 便于 RViz 里边走边看覆盖情况
+
+    # A3 量程 16m, 但远处点角分辨率稀、误差大, 且仓库通道跨度远小于此。
+    # 取 12m: 保留看穿整条通道的能力, 又不把噪声大的远点纳入匹配。
+    max_laser_range: 12.0
+    # A3 实际下限 0.15m(与 nav2_params.yaml 的 laser_min_range 同源)。默认 0.0 会把
+    # 近距噪声点当有效读数纳入匹配。
+    min_laser_range: 0.15
+    resolution: 0.05               # 与 nav2 两张 costmap 的 resolution 一致, 避免重采样
+
+    # 一格要被至少 2 条射线穿过才判为空闲: 单条射线穿过常是噪声/掠射,
+    # 默认 2 已合适, 显式写出以便日后调。occupancy_threshold 0.1 同理(偏向保留障碍, 安全侧)。
+    min_pass_through: 2
+    occupancy_threshold: 0.1
+
+    minimum_time_interval: 0.2
+    transform_timeout: 0.2
+    tf_buffer_duration: 30.0
+    stack_size_to_use: 40000000
+
+    # ===== 建图推进节奏 =====
+    # 底盘限速 0.36m/s 且建图时手动慢开, 阈值取小些让关键帧密一点, 匹配更稳。
+    minimum_travel_distance: 0.2
+    minimum_travel_heading: 0.2
+    scan_buffer_size: 30
+    scan_buffer_maximum_scan_distance: 12.0
+
+    # ===== 回环检测 =====
+    # 长直货架通道的特征本就贫乏(见 scan_filter.yaml 为何不砍到 180°),
+    # 回环是纠正累计漂移的主要手段, 保持开启。
+    do_loop_closing: true
+    loop_search_maximum_distance: 3.0
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45
+
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+
+    # ===== 扫描匹配 =====
+    use_scan_matching: true
+    use_scan_barycenter: true
+    correlation_search_space_dimension: 0.5
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
+    loop_search_space_dimension: 8.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+
+    distance_variance_penalty: 0.5
+    angle_variance_penalty: 1.0
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true

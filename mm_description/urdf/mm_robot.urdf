@@ -356,6 +356,33 @@
     <origin xyz="0.10568947 -0.00001261 0.22079956" rpy="-3.14159265 0 -0.00000367"/>
     <axis xyz="0 0 1"/>
   </joint>
+  <!-- ===== laser_link: 雷达的**测量帧**, 与 Link_12(mesh 帧) 刻意分开 =====
+       2026-08-08 真机实测定案 (三次挡测, 每次 100 帧取最小):
+         挡车头 (base 0°)   -> scan 报 180°
+         挡车左 (base +90°) -> scan 报 -90°
+       唯一解 theta_scan = theta_base + 180, 即**纯旋转 180°, 无镜像**
+       (镜像假设预测挡左出现在 +90°, 实测 -90°, 已排除)。
+       物理含义: 雷达 +Z 朝上没错, 但整个装置绕竖轴转了 180° 装, 它的 0° 指向车尾。
+
+       ⚠️ 为什么不直接改 Joint_6 的 rpy, 而要新增一个帧:
+       Link_12.stl 包围盒 Z: -0.0400 ~ 0.0000 —— mesh 主体画在自己坐标系的 Z 负半侧,
+       故 Joint_6 的 roll=-pi **是 mesh 需要的**(把朝下的模型翻上来), 不是笔误。
+       若改成 yaw=pi: scan 对了, 但 mesh 从 z=0.2208 向下长到 0.1808 **陷进底盘** ——
+       而 Link_12 带 <collision> 用同一个 mesh, MoveIt 拿它做自碰撞检查,
+       雷达碰撞体位置错了会导致臂扫过雷达真实位置时**不报碰撞**, 这是安全问题。
+       一个帧满足不了 mesh(需 Rx(pi)) 与 scan(需 Rz(pi)) 两个需求, 故拆开。
+
+       xyz 沿用 Joint_6 的安装原点(雷达在底盘上的位置没变, 只是朝向转了)。
+       严格说光学中心在 mesh 中轴上、比安装面高约 2cm, 但对 2D 导航只有 x/y 进投影,
+       z 差远小于建图分辨率(5cm), 不折腾。
+       ⚠️ 驱动的 frame_id 必须指 laser_link 而非 Link_12, 仿真侧 sensor 同理 ——
+       否则 sim 自洽而 real 错, 这个 bug 正是这样藏了两个月。 -->
+  <link name="laser_link"/>
+  <joint name="Joint_laser" type="fixed">
+    <parent link="base_link"/>
+    <child link="laser_link"/>
+    <origin xyz="0.10568947 -0.00001261 0.22079956" rpy="0 0 3.14159265"/>
+  </joint>
   <joint name="Joint_7" type="fixed">
     <parent link="base_link"/>
     <child link="Link_13"/>

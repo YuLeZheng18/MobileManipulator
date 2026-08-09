@@ -84,21 +84,28 @@
     <xacro:wheel_frictionless link="Link_9"/>
     <xacro:wheel_frictionless link="Link_10"/>
 
-    <!-- 雷达 sensor: 挂在整车雷达 link (Link_12). Link_12 在 base_link 中 X=前/Y=右/Z=下,
-         扫描平面水平、0°对准车头; Z 朝下只影响角度手性, frame_id=Link_12 + TF 自洽.
-         ±150°(总300°) 盲区落在车后. (参数移植自旧 omni_base.urdf.xacro) -->
+    <!-- 雷达 sensor: 射线在 **laser_link**(测量帧) 里生成, 与真机驱动一致.
+         2026-08-08 改: 原先射线在 Link_12(mesh 帧) 里生成、frame_name=Link_12, 仿真内部自洽,
+         但真机雷达实际绕竖轴转了 180° 装 —— 于是 sim 对 real 错, 这个偏差藏了两个月.
+         现在两边共用同一个测量帧定义 (laser_link, 见 mm_robot.urdf 的 Joint_laser).
+         sensor 仍挂 Link_12(gazebo 的 reference 要求是带惯量的真 link), 靠 pose 把射线
+         转到 laser_link 朝向: Rx(pi)^-1 · Rz(pi) = Ry(pi), 故 pitch=pi.
+
+         FOV 改 360°(原 ±150°): 真机 A3 驱动本来就发完整 360°, 仿真砍成 300° 是不真实的.
+         "后方看不见"的真正来源是机械臂遮挡 —— 那由 laser_filters 砍扇区统一处理
+         (sim 里 URDF 已有臂几何, Gazebo 射线会自然自遮挡, 再过同一个 filter 就与真机一致). -->
     <gazebo reference="Link_12">
         <sensor name="lidar_sensor" type="ray">
-            <pose>0 0 0 0 0 0</pose>
+            <pose>0 0 0 0 3.14159265 0</pose>
             <visualize>true</visualize>
             <update_rate>10</update_rate>
             <ray>
                 <scan>
                     <horizontal>
-                        <samples>1200</samples>
+                        <samples>720</samples>
                         <resolution>1</resolution>
-                        <min_angle>-2.61799</min_angle>
-                        <max_angle>2.61799</max_angle>
+                        <min_angle>-3.14159265</min_angle>
+                        <max_angle>3.14159265</max_angle>
                     </horizontal>
                 </scan>
                 <range>
@@ -117,7 +124,7 @@
                     <remapping>~/out:=scan</remapping>
                 </ros>
                 <output_type>sensor_msgs/LaserScan</output_type>
-                <frame_name>Link_12</frame_name>
+                <frame_name>laser_link</frame_name>
             </plugin>
         </sensor>
     </gazebo>
