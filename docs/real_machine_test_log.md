@@ -37,6 +37,9 @@
   launch(要把 yaml 里的相对模型名拼成 share 绝对路径,不能裸 Node 起),传 `with_rsp:=false`。
 - **RealSense 从来没有任何 launch 起过**,一直手动补。并进 `cameras.launch.py`,
   `align_depth.enable:=true` 硬编(事后 param set 改不了)、`pointcloud.enable:=false`。
+  > 【2026-08-03 后续】`align_depth.enable` 已改回 **false**:彩色内参硬件层坏
+  > (PPX/PPY = -nan),对齐图全废,yolo 改走 `use_raw_depth=true` 吃原始深度流。
+  > 本条保留当时原文,现状见 `system_architecture.md` §阶段B 与 `cameras.launch.py`。
 - `mm_task/package.xml` 依赖 `pymoveit2`(已删的 Python grasp_node 遗留)→ 本机编不过。
 - `mm_bringup/package.xml` 依赖 `rplidar_ros`(Nano apt 装的)→ 整包在本机编不过。
   `install/mm_bringup` 时间戳比该提交还早,证明本机从未编过它。已移出 exec_depend 并注明。

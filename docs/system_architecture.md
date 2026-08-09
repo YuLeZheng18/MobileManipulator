@@ -229,13 +229,21 @@ mm_task: goToPose(目标货架) → 放下 → 循环
 ```
 3. rplidar_ros        → /scan (frame Link_12)
 4. 车体两路 USB 相机 (mm_perception/cameras.launch.py):
-     cam_a (Link_13, ArUco) / cam_b (Link_14, 监视), 均装反 -> image_rotator 转正
-     -> /cam_x/image_rot(+ compressed 供本机跨网监视)
+     cam_a (Link_13, ArUco) / cam_b (Link_14, 监视), 均装反。
+     每路**只起 usb_cam**, 发 /cam_x/image_raw(+/compressed) + camera_info, 到此为止。
+     ⚠️ 本 launch 不做转正 (2026-08-03/08-04 精简)。转正有两个各自独立的去处:
+        看画面 -> web_video_server 的 invert=1 服务端转正 (见 §7.4)
+        ArUco  -> aruco_real.launch.py 自带 image_rotator -> /cam_a/image_rot
+     故 cam_x_rotation 参数已不起作用, 仅保留签名。
 5. 手眼深度相机 D435i (Link_30, 同上 launch): realsense2_camera
-     ⚠️ align_depth.enable:=true 必须启动时开 —— yolo_box_detector 吃
-        /camera/camera/aligned_depth_to_color/image_raw, 靠它把彩色框像素直接查深度;
-        不开则只有未对齐的 depth/image_rect_raw, 彩色框落不到深度上, 检测拿不到 z.
-        (驱动按启动配置建 pipeline, 事后 ros2 param set 改不了.)
+     ⚠️ align_depth.enable **刻意关掉** (2026-08-03 起, 与早前文档相反):
+        本机彩色内参硬件层就坏 (rs-enumerate-devices -c 每个彩色分辨率 PPX/PPY = -nan),
+        对齐图全废。故 yolo_box_detector 改走 use_raw_depth=true, 直接吃
+        depth/image_rect_raw + 深度模块内参 (fx=fy=428.403) 反投影。
+        开着则驱动每秒 30 次把 848x480 深度重投影到 1280x720 彩色画幅, 而
+        /aligned_depth_to_color/image_raw 实测**订阅者 0** —— 无人订阅的计算没必要做。
+        ⚠️ 但别指望它省 CPU: 实测 realsense 节点 67.9% -> 79.6%, 并没有下降。
+        真要用对齐图, 前提是先把彩色内参标好。
      pointcloud.enable:=false —— 点云既不过网也不在机上白算.
 ```
 
@@ -388,7 +396,8 @@ ros2 launch mm_bringup real_bringup.launch.py use_cameras:=true use_perception:=
 | Nav2 栈(amcl/planner/controller/behavior/bt)+ lane_navigator | **Nano** | (b) 控制环 scan→cmd_vel;WiFi 掉线也不断驱动环 |
 | cmd_vel_smoother | **Nano** | (b) 末端安全:WiFi 掉线时仍在机上斜坡归零 |
 | **RViz** | **本机** | 人看的可视化;只读消费 Nano 的 TF/场景 |
-| **rqt_image_view x2** | **本机** | 监视车体相机 + 手眼深度相机画面;**走压缩传输**(见下) |
+| **web_video_server** | **Nano** | 三路画面转 HTTP/MJPEG;本机用**浏览器**看,不经 ROS(见 §7.4) |
+| **浏览器 (monitor.html)** | **本机** | 三路监视画面;**本机不起任何图像 ROS 节点** |
 | **mm_task 状态机** | **本机** | 粗粒度调度(发 /go_to /initialpose、调 /grasp/*,全是小消息) |
 
 **跨 LAN 数据流(只有这些过 WiFi):**
@@ -403,7 +412,9 @@ Nano → 本机 (只读可视化 + 状态回报):
   /scan /map /global_costmap /local_costmap /odom /plan /arm_joint_states  → 本机 RViz
   /lane_navigator/status(String)   → 本机 mm_task(S1 完成回报)
   /perception/object_pose(PoseStamped, 小)  → 本机 mm_task(S3 判新鲜可达)
-  各相机的 <topic>/compressed  → 本机 republish 解码后 rqt 看 (raw 直传会打满 WiFi)
+
+⚠️ **图像一律不走 DDS 过网** (2026-08-04 定案)。三路画面走 Nano 上 web_video_server 的
+   HTTP/MJPEG, 浏览器直连 —— 那是普通 TCP, 不在上面这张 ROS 话题表里。详见 §7.4。
 ```
 **在 Nano 本地闭环(绝不过 WiFi,这就是分割的意义):**
 ```
@@ -421,22 +432,60 @@ object_pose + servo TwistStamped → servo_node → 稠密关节指令 → JTC �
 1. **发现机制**:默认 DDS 走多播,不少 WiFi/路由屏蔽多播 → 两机发现不了。确认路由放行多播,或配 Fast-DDS Discovery Server(单播)。有线网基本无此问题。
 2. **时钟同步**:两机必须 NTP/chrony 对时。TF 用时间戳,钟一漂 tf2 立刻报 extrapolation、Nav2/MoveIt 全乱(实机 `use_sim_time=false`,靠真实钟)。
 3. **DOMAIN_ID / RMW 一致**:`ROS_DOMAIN_ID` 与 `RMW_IMPLEMENTATION` 两机不一致就互相看不见。
-4. **带宽/延迟兜底**:感知与所有闭环已就地在 Nano,过网的只剩 TF/可视化/小指令。**本机要监视相机/深度画面**:两机装 `compressed_image_transport` + `compressed_depth_image_transport`,Nano 驱动随 `image_transport` 自动发 `<topic>/compressed`(彩色 JPEG)与 `<topic>/compressedDepth`(深度 PNG),本机 `rqt_image_view` 在 Transport 下拉选对应压缩类型;**深度看图别拉点云**(点云过网太重)。默认 raw 直传会把 WiFi 打满。
+4. **带宽/延迟兜底**:感知与所有闭环已就地在 Nano,过网的只剩 TF/可视化/小指令。
+
+   **⚠️ 铁律:本机(或任何跨机进程)绝不订阅图像话题。看画面开浏览器。**(2026-08-04 定案)
+
+   这是长期"画面卡顿"的**唯一真凶**,且它会连带把整条链路上所有流一起拖垮:
+   `usb_cam` 的 `image_transport::CameraPublisher` 同时发 `image_raw`(未压缩) 和
+   `image_raw/compressed`。`image_raw` 是普通 ROS 发布者,**跨机订它**时 DDS 就把
+   640x480 rgb8 @30Hz ≈ 27MB/s 推上 WiFi,两路直接打满。
+   判据(不是推测):停掉两个 usb_cam,Orin 网卡发送量 **15312 KB/s → 24 KB/s**。
+
+   **正确做法** —— Nano 上 `web_video_server` 转 HTTP/MJPEG,浏览器直连:
+   图像流全留在 Nano 机内(机内订阅不过网),过网只有一条普通 TCP,丢包由浏览器扛。
+   本机 `dev_bringup.launch.py` 默认 `xdg-open` 打开 `mm_bringup/web/monitor.html`,
+   三路 URL/画质/invert 都写在那个 html 里。
+   实测三路并发(320x240 quality=60,臂栈+yolo+servo 同跑):各 29.9/29.6/28.1 fps,
+   本机网卡合计 1041 KB/s,Orin load 4.03/6 核;与机上 camera_info 测得的采集率一致。
+   - 车体两路装反,URL 加 `invert=1` **服务端**转正 —— 本机不必起 image_rotator。
+   - 别把分辨率往上调:640x480 要 3.6~5.4MB/s,且三路里总有一路掉到 20fps(争抢)。
+     要画面大就靠浏览器/CSS 拉伸,MJPEG 就是张 `<img>`,拉伸不花带宽也不花 Orin 算力。
+   - 别从 web_video_server 首页点链接:那些链接**不带缩放参数**,点进去是原生
+     1280x720,实测 5566 KB/s 一路就吃掉大半 WiFi,表现就是"打不开"。
+   - `type=ros_compressed` 是零编码开销的原样转发,但**忽略 width/height/quality**
+     (实测 2.9MB/s 一路)。为这 10 倍带宽差,宁可让 Nano 多编一次。
+
+   **⚠️ 测量方法论**(三条早前的错误结论都是量错导致的):
+   - 量跨机带宽只能用 `cat /sys/class/net/<iface>/statistics/rx_bytes` 前后差。
+     `ros2 topic bw/hz` **自己就是订阅者**,而 DDS 单播是每订阅者一份独立拷贝 ——
+     用它量跨机流量会把结果翻倍(早前那个"5.5 倍放大/重传"就是这么来的测量假象)。
+   - 量真实**采集**帧率要在**机上**量 `camera_info`:它只有几十字节,与图像同一次
+     publish,不受传输丢包和编码开销影响。量 `image_raw`(921KB/帧)量的是传输,不是相机。
+
+   已作废的旧方案(别照着改回去):本机 `compressed_image_transport` + `republish` 解码 +
+   `image_rotator` 转正 + `rqt_image_view`/`image_view` 三级链。它能出画面,但前提正是上面
+   那条铁律禁止的事。`rqt_image_view` 还有个自身缺陷:它选 transport 的唯一入口是话题串
+   本身,启动时选中的 compressed 会在后台刷新话题列表后**自己滑回 raw**,现场表现是
+   "好好的突然全卡了"。**深度图不看**,深度 raw ~15MB/s 过网太重,`compressedDepth` 的
+   republish 另有 bug。**点云绝不过网**。
 
 ### 7.5 双机部署 Checklist(施工卡片)
 
-> 上真机双机调试照此走。相机传的是**连续图像帧流**(默认 `compressed`=MJPEG 式,帧内压 JPEG/PNG,看着是实时视频但非 H.264);带宽紧要真视频编码再上 `theora_image_transport` / `ffmpeg_image_transport`。**点云绝不过网**(要三维在 Nano 本地看)。
+> 上真机双机调试照此走。**图像不进这张 ROS 话题清单** —— 三路画面走 Nano 上
+> `web_video_server` 的 HTTP/MJPEG,浏览器直连(§7.4 的铁律)。**点云绝不过网**。
 
 **① 装依赖**
 ```
-# 两机都装(相机压缩图, 缺则看不了画面)
-sudo apt install ros-humble-compressed-image-transport ros-humble-compressed-depth-image-transport
 # 仅 Nano(贴硬件运行时依赖, 刻意不写进 mm_bringup 的 exec_depend ——
 #   写了会让本机没装这些驱动时整个 mm_bringup 编不过, 而本机压根不需要它们)
 sudo apt install ros-humble-robot-localization ros-humble-rplidar-ros \
                  ros-humble-realsense2-camera ros-humble-usb-cam
+# 仅 Nano: 画面转 HTTP/MJPEG(会连带装 ros-humble-async-web-server-cpp)
+sudo apt install ros-humble-web-video-server
 #   micro-ROS 代理: 独立 ws ~/microros_ws(用时 source)
-# 仅本机: rqt_image_view(桌面版通常自带)
+# 本机什么图像包都不用装 —— 看画面用浏览器(§7.4)。
+#   早前"两机都装 compressed_image_transport 给 rqt 看"已作废: 那条路正是卡顿的成因。
 ```
 
 **② 网络 & 环境(两机必须一致)**
@@ -448,9 +497,19 @@ export RMW_IMPLEMENTATION=rmw_fastrtps_cpp   # 两机同一 RMW
 - 多播可达(WiFi 常屏蔽 → 发现失败,改配 Fast-DDS Discovery Server 单播);优先有线/5GHz。
 
 **③ CAN(仅 Nano,机械臂前置)**
+
+⚠️ **不是 socketcan。** 走 PEAK 的 **PCAN 库**(`libpcanbasic` + 字符设备
+`/dev/pcanusb32`,通道 `PCAN_USBBUS1`),`can_interface.py` 直接调库。
+早前这里写的 `ip link set can0 up type can bitrate 1000000` **已过时且会误导** ——
+`can0` 这个网络接口压根不存在,照着敲只会得到 "Cannot find device"。
 ```
-sudo ip link set can0 up type can bitrate 1000000
+ls -l /dev/pcanusb32          # 设备节点在 = 驱动已加载
+cat /proc/pcan                # 看 read/write 计数: write 涨而 read 冻住 = 发出去没人回
 ```
+波特率由 `robot_arm_config.json` 里的配置在建连接时下发,不用手工设。
+⚠️ PEAK 驱动是外挂内核模块,**内核升级后会失效**(`pcan.ko` 留在旧版本目录),
+表现是 `/dev/pcanusb32` 消失。需重装 9.2.0(必须指定 gcc-12,且 `make install`
+不能跳);长期解法是改 dkms,尚未做。安装脚本见 `docs/scripts/install_pcan.sh`。
 
 **④ 启动(Nano 先,本机后)**
 ```
@@ -468,7 +527,8 @@ ros2 node list                              # 看到 Nano 节点=发现 OK
 ros2 topic hz /scan                         # 传感器过来了
 ros2 run tf2_ros tf2_echo map base_link     # TF 跨机可用
 ros2 topic pub /go_to std_msgs/String "{data: p2}"   # 手动派一段导航
-# RViz 看模型/TF/costmap; rqt_image_view 的 Transport 选 compressed / compressedDepth 看画面
+# RViz 看模型/TF/costmap; 相机画面看浏览器(dev_bringup 会自动开 monitor.html)
+# ⚠️ 别用 ros2 topic hz/bw 量图像话题: 它自己是订阅者, 一量就把图像流拉过网(§7.4)
 ```
 
 **⑥ 相机监视要点**:rqt 打开后**必须在 Transport 下拉选压缩类型**(默认 raw 打满带宽);卡顿降 Nano 端分辨率/帧率;要点云在 Nano 本地看,不拉过网。
