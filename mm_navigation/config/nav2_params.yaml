@@ -251,10 +251,18 @@ controller_server:
       # 离终点 0.6~1.4m 时 PathFollow 已关、GoalCritic 还没开 -> 没有任何 critic 推前进,
       # MPPI 退化成 ~1.5cm/s 蠕动并触发 progress 失败反复重规划(曾导致"没到拐角就卡死").
       # 设 0.5(< GoalCritic 0.6)使两者首尾相接无缝衔接: 远处 PathFollow 推进, 近终点 GoalCritic 接管减速.
+      # 11 -> 22 (2026-08-11, 实测): 必须与 PathAlignCritic 同量级, 否则车只会爬不会走。
+      # 上一轮把 PathAlign 拉到 28 而这里留 11, 贴路径的罚是前进推力的 2.5 倍 ——
+      # MPPI 一发现开快了会让 56x0.05=2.8s 预测窗内的横向偏差累积、对齐代价飙升,
+      # 就**用减速去换贴合**, 越贴越慢越慢越贴, 荡成锯齿油门。
+      # 实测 (home->pick1, logs_0811/cmdvel3.log): 直线段 vx 以 ~1.5s 周期在 0.11 <-> 0.014
+      # 之间来回荡, 全程均值仅 **0.045**, 从没摸到 vx_max=0.22 —— 限幅根本没起作用。
+      # ⚠️ 修法是抬 PathFollow 而不是压 PathAlign: 后者是"循车道方向"的主力(用户硬需求),
+      #    压了车就又开始走弦斜插。两者要一起加减, 只动一边就是在速度和贴合间跷跷板。
       PathFollowCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 11.0
+        cost_weight: 22.0
         offset_from_furthest: 5
         threshold_to_consider: 0.5
       # 方向承诺(防冻结)+ 横移容忍: mode 0(FORWARD_PREFERRED)看"到最远路径点的方向",
