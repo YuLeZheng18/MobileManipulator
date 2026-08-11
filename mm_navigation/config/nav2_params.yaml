@@ -159,7 +159,14 @@ controller_server:
       # 0.2->0.05: 必须随 vy_max 同改。采样标准差远大于上限时大半 batch 被截断到 ±vy_max,
       # 等于用 2000 条轨迹里的一小部分做优化, 白烧算力还降低有效样本数。
       vy_std: 0.05
-      wz_std: 0.4
+      # 0.4->0.2 (2026-08-11, 治"进门口犹豫"): 采样航向的散布。vy_max 已压到 0.05, 行进
+      # 方向≈车头方向, 于是航向一散、横向落点跟着散。2.8s 视界(56*0.05)下 wz_std 0.4 的
+      # 横向扇形远宽于门口那条 16cm 的免代价带 ⇒ 高速样本几乎全落进罚区, softmax 后只剩
+      # "慢下来"的样本存活 —— MPPI 不是在绕障, 是在用降速换横向确定性, 表现即门口爬行。
+      # 减半后扇形收窄, 高速样本能留在门缝里。与本设计天然相符: 转向由 lane_navigator 的
+      # cspin 原地转完成, MPPI 只负责锁切线巡路, 本就不需要大转速采样。
+      # ⚠️ 代价: 临场纠偏变钝。若日后发现车贴墙走后回不到中线, 先怀疑这里。
+      wz_std: 0.2
       # 0.36->0.22: 全图瓶颈是去 place1 的南北通道, 精确欧氏距离变换实测净距 **0.300m**
       # (旧注释写 0.350m 是当时用 4 连通 BFS 当净距场算的, 那给的是曼哈顿距离、系统性
       #  高估最多 28%, 已换精确 EDT 修正)。
@@ -185,7 +192,10 @@ controller_server:
       iteration_count: 1
       prune_distance: 1.7
       transform_tolerance: 0.2
-      temperature: 0.3
+      # 0.3->0.15 (2026-08-11, 治犹豫): softmax 温度。门口的样本天然分成"冲过去"与
+      # "等一等"两簇, 温度越高加权平均越软, 输出就是两簇之间那个谁也不像的中间态 ——
+      # 观感正是"犹豫"。压低则更贪心地跟随最优样本, 该冲就冲。
+      temperature: 0.15
       gamma: 0.015
       motion_model: "Omni"
       visualize: false
@@ -223,7 +233,19 @@ controller_server:
       # 白收 —— 两个数要一起降才真的腾出通行带。
       # ⚠️ 这里的 inflation_radius/cost_scaling_factor 不是独立参数, 必须与
       #    local_costmap.inflation_layer **逐字一致** —— MPPI 用它们把代价值反算回
-      #    "离障碍多远", 对不上则整条轨迹的距离估计系统性偏移。随 R 同步 0.26 -> 0.22。
+      #    "离障碍多远", 对不上则整条轨迹的距离估计系统性偏移。
+      # inflation_radius 0.22 -> 0.35, collision_margin_distance 0.05 -> 0.02
+      # (2026-08-11 第二轮, 治"进门口犹豫"):
+      #   ① 0.22 == robot_radius 是个陷阱。Nav2 里硬禁区由 robot_radius(内切圆)划定,
+      #      inflation_radius 只控制内切圆**之外**那段软衰减。两者相等 ⇒ 软衰减带宽为零,
+      #      代价场退化成纯阶跃(0.22 外恒 0, 内直接 253)。MPPI 在门口于是**没有梯度可循**,
+      #      不知道自己正在变窄, 只知道再偏一点就掉悬崖 —— 没有引导就只能降速换确定性。
+      #      放大到 0.35 后重新有碗形代价谷: 门口(半宽 0.30)中线处 252*e^(-8*0.08)=133,
+      #      偏 5cm 处 =198, 谷底在中线 ⇒ 车有方向可循。repulsion_weight 0.1 才终于有
+      #      作用对象(此前它作用的衰减区根本不存在)。
+      #   ② 余量 0.05 叠在 R 0.22 上 = 实际禁入 0.27, 而门半宽 0.30 ⇒ 横向只剩 3cm 就撞
+      #      critical_weight 20 的陡罚。降到 0.02 后余量 3cm -> 6cm。车真实半宽 0.187,
+      #      R 0.22 本身已多留 3.3cm, 车皮到墙仍有实际余量。
       # consider_footprint 保持 false: 圆形口径下内切 == 外接 == R, 该开关管的
       #    "低于外接半径阈值就直接放过、否则做完整多边形检查"两级判定退化成一级,
       #    开了只是白烧算力(batch 2000 x 56 步 = 11.2 万点), 拿不到任何额外精度。
@@ -234,9 +256,9 @@ controller_server:
         critical_weight: 20.0
         consider_footprint: false
         collision_cost: 10000.0
-        collision_margin_distance: 0.05
+        collision_margin_distance: 0.02
         near_goal_distance: 0.5
-        inflation_radius: 0.22
+        inflation_radius: 0.35
         cost_scaling_factor: 8.0
       # 贴路径主力。18->28 且 offset_from_furthest 20->6 (2026-08-11):
       # offset_from_furthest 是"从轨迹最远端往回数多少个点才开始算对齐代价", nav2 默认 20
@@ -339,13 +361,14 @@ local_costmap:
       # 数值小但方向错 —— 这一版的整个意图是把禁区收紧到刚好够用, 留着默认值等于漏算。
       footprint_padding: 0.0
       plugins: ["obstacle_layer", "inflation_layer"]
-      # ⚠️ inflation_radius 必须 >= robot_radius, 否则代价地图允许路径贴到比车还近的地方
-      # -> 必然蹭障(这是曾经"蹭障"的元凶: 半径 0.20 配膨胀 0.18)。故随 R 同步 0.26 -> 0.22。
-      # 不取更大: 大了会让沿墙行驶持续吃高代价而减速(推离障碍由全局 costmap 膨胀负责)。
+      # inflation_radius 0.22 -> 0.35 (2026-08-11 第二轮):
+      # local costmap 必须与 ObstaclesCritic 的 inflation_radius 保持一致。
+      # 两者相等时意味着 MPPI 的距离反算与 costmap 实际代价分布吻合。
+      # 理由见 ObstaclesCritic 注释: 0.22==robot_radius → 软衰减带宽为零 → 无梯度 → 犹豫。
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 8.0
-        inflation_radius: 0.22
+        inflation_radius: 0.35
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -380,21 +403,15 @@ global_costmap:
       footprint_padding: 0.0
       resolution: 0.05
       track_unknown_space: true
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
-      obstacle_layer:
-        plugin: "nav2_costmap_2d::ObstacleLayer"
-        enabled: True
-        observation_sources: scan
-        scan:
-          topic: /scan_filtered
-          max_obstacle_height: 2.0
-          clearing: True
-          marking: True
-          data_type: "LaserScan"
-          raytrace_max_range: 3.0
-          raytrace_min_range: 0.2
-          obstacle_max_range: 2.5
-          obstacle_min_range: 0.2
+      # 2026-08-11 去掉 obstacle_layer (根治"越跑越堵"):
+      # 全局规划只信静态地图——真实新增障碍靠 local costmap + MPPI 现场绕, local 是
+      # rolling window 会自清, 不会累积。保留 obstacle_layer 的后果已实测:
+      # 南北通道净距 0.350m, 车经过时 AMCL 5~6cm 落点误差导致同一堵墙在连续帧里被打到
+      # 略微不同位置, marking 层层叠加把墙"加厚" -> 通道被标成 253 -> 规划失败、车被困。
+      # raytrace 清除只沿当前视线生效, 车一旦驶离就再也清不掉。
+      # lane_navigator 绕过 bt_navigator 直调 planner_server, Nav2 自带恢复行为不触发,
+      # 规划失败直接原地卡死。lane_navigator 侧已加每次 /go_to 前主动清 costmap 兜底。
+      plugins: ["static_layer", "inflation_layer"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True

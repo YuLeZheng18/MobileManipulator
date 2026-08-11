@@ -42,6 +42,7 @@ from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoS
 
 from action_msgs.msg import GoalStatus
 from nav2_msgs.action import FollowPath, ComputePathToPose
+from nav2_msgs.srv import ClearEntireCostmap
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped, Twist
 from std_msgs.msg import String
@@ -160,6 +161,8 @@ class LaneNavigator(Node):
         self._follow_client = ActionClient(self, FollowPath, 'follow_path')
         # 路线规划(去路网后这是**唯一**路径来源) + drive 段受阻时的绕障重规划, 同一个客户端。
         self._planner_client = ActionClient(self, ComputePathToPose, 'compute_path_to_pose')
+        self._clear_costmap_client = self.create_client(
+            ClearEntireCostmap, '/global_costmap/clear_entirely_global_costmap')
 
         # 状态机状态:
         #   _active_target : 当前正在追的目标名(None = 空闲)
@@ -445,6 +448,8 @@ class LaneNavigator(Node):
         goal.use_start = False        # 起点用机器人当前 TF
         goal.planner_id = 'GridBased'
         self.get_logger().info(f'Planning route -> "{target}" ({tx:.2f},{ty:.2f})')
+        if self._clear_costmap_client.service_is_ready():
+            self._clear_costmap_client.call_async(ClearEntireCostmap.Request())
         fut = self._planner_client.send_goal_async(goal)
         fut.add_done_callback(lambda f: self._on_route_plan_accept(f, ep, target))
 
