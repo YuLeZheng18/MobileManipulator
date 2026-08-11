@@ -8,7 +8,7 @@
 分阶段错峰 (TimerAction, 上层等下层就绪):
   t=0   micro-ROS 代理(底盘) + 机械臂实机 (RSP hw:=real + ros2_control + CAN 桥) + 雷达/相机
   t=5   robot_localization EKF: 融合 /wheel_odom + /imu -> /odom + odom->base_link TF
-  t=10  Nav2 (无 RViz) + cmd_vel 平滑 + lane_navigator
+  t=10  Nav2 (无 RViz, 自带 velocity_smoother 限幅) + twist_mux 仲裁 + lane_navigator
   t=14  MoveIt move_group
   t=18  moveit_servo + grasp_node
   t=20  mm_perception 真感知 (yolo_box_detector + aruco_localizer; 默认关)
@@ -192,14 +192,29 @@ def generate_launch_description():
     # ===== 阶段3 (t=10): Nav2 (无 RViz) + cmd_vel 平滑 + 仲裁 + lane_navigator =====
     # 无头 (§7-E): 直接 include nav2_bringup/bringup_launch.py, 不走 mm_navigation 的
     # navigation2.launch.py (那个无条件起 rviz2)。
-    # cmd_vel 走向: Nav2(controller/behavior 发 /cmd_vel) --SetRemap--> /cmd_vel_nav
-    #   -> cmd_vel_smoother 加速度限幅 -> /cmd_vel_nav_out -> twist_mux -> /cmd_vel -> 固件。
+    # cmd_vel 走向 (三路汇入 mux, 只有 mux 能发 /cmd_vel):
+    #   Nav2 controller/behavior --SetRemap--> /cmd_vel_nav -> velocity_smoother(Nav2 自带,
+    #       加速度限幅) --SetRemap--> /cmd_vel_nav_out ┐
+    #   lane_navigator cspin 闭环转向 -> /cmd_vel_spin ├-> twist_mux -> /cmd_vel -> 固件
+    #   joy_arm_teleop (仅 DRIVE 态) -> /cmd_vel_manual ┘
     #   (自研电机速度环无加减速斜坡, 平滑只能在上位机这级补, 与仿真同策略。)
-    # 末端多的那一级 twist_mux 是 D4.2: 手柄 /cmd_vel_manual 走同一个 mux 且优先级更高,
-    # 于是遥控与导航可以常驻共存 —— 不必再为测导航去杀 joy_arm_teleop。详见
+    # 末端那一级 twist_mux 是 D4.2: 手柄优先级最高(100) > cspin(50) > 导航(10), 于是遥控与
+    # 导航可以常驻共存 —— 不必再为测导航去杀 joy_arm_teleop。详见
     # mm_navigation/config/twist_mux.yaml。
+    # ⚠️ 任何一路都不许直发 /cmd_vel: mux 在所有输入超时时持续发零, 谁绕过 mux 就与那串零
+    # 形成两个发布者交替 -> 车抽搐。2026-08-09 同时踩到两处 (cspin 直发 + Nav2
+    # velocity_smoother 直发), 见下方 SetRemap 与 lane_navigator.py 的 cmd_pub 注释。
     nav2 = GroupAction([
         SetRemap('/cmd_vel', '/cmd_vel_nav'),
+        # ⚠️ 把 Nav2 自带 velocity_smoother 的输出从 /cmd_vel 改接到 /cmd_vel_nav_out,
+        # 使它经 twist_mux 而不是直怼固件。nav2_bringup/navigation_launch.py:182 原本写死
+        #   remappings + [('cmd_vel','cmd_vel_nav'), ('cmd_vel_smoothed','cmd_vel')]
+        # 即 Nav2 原生就自带一条 controller -> /cmd_vel 的完整平滑链。它绕过 mux ->
+        # 与 mux 一起成为 /cmd_vel 的两个发布者互相冲刷, 车抽搐; 且手柄 R1 压不住导航
+        # (mux 只能压 mux 自己那路)。2026-08-09 跑 pick3 时实测 /cmd_vel Publisher count=2。
+        # 这条 SetRemap 能盖住节点自带那条: launch_ros/actions/node.py:468-476 把
+        # global_remaps(SetRemap) 排在节点 remappings **之前**, 而 rcl 取首条命中。
+        SetRemap('/cmd_vel_smoothed', '/cmd_vel_nav_out'),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 os.path.join(nav2_bringup_share, 'launch', 'bringup_launch.py')),
@@ -210,23 +225,12 @@ def generate_launch_description():
             }.items(),
         ),
     ])
-    cmd_vel_smoother = Node(
-        package='mm_description',
-        executable='cmd_vel_smoother.py',
-        name='cmd_vel_smoother',
-        output='screen',
-        parameters=[{
-            'use_sim_time': use_sim_time,
-            'input_topic': '/cmd_vel_nav',
-            'output_topic': '/cmd_vel_nav_out',
-            # 3.0/2.0 -> 0.6/3.0 对齐固件真实斜坡 (config.h MAX_LIN_ACCEL/MAX_ANG_ACCEL)
-            # 与 nav2_params.yaml velocity_smoother。上位机放行比固件能执行的更大的加速度
-            # 没有意义, 只会让 MPPI 的轨迹预测与实车脱节 (窄过道里即撞墙)。
-            'linear_acceleration': 0.6,
-            'angular_acceleration': 3.0,
-            'rate': 50.0,
-        }],
-    )
+    # (原先这里还起一个自研 mm_description/cmd_vel_smoother.py 做 /cmd_vel_nav ->
+    #  /cmd_vel_nav_out 的限幅, 2026-08-09 删。理由: Nav2 自带的 velocity_smoother 是
+    #  同一份活儿且配置更全(nav2_params.yaml:423 有 OPEN_LOOP 反馈/deadband/三轴独立限幅),
+    #  两个平滑器并行接在同一输入上纯属重复。上面那条 SetRemap 已把 Nav2 那个的输出接进
+    #  mux, 链路遂成单一路径: controller -> /cmd_vel_nav -> velocity_smoother
+    #  -> /cmd_vel_nav_out -> twist_mux -> /cmd_vel。)
     # 仲裁: 导航(低优先级) vs 手柄(高优先级) -> /cmd_vel。R1 死人开关天然是接管键,
     # 松开后 0.5s timeout 自动交还导航, 见 twist_mux.yaml。
     # ⚠️ twist_mux 的输出话题名固定为 `cmd_vel_out`(源码硬编码), 必须靠 remap 改成
@@ -237,15 +241,19 @@ def generate_launch_description():
                     {'use_sim_time': use_sim_time}],
         remappings=[('cmd_vel_out', '/cmd_vel')],
     )
+    # corner_radius 必须显式传: 节点默认 0.8 是仿真值, 在真机图上会撞 —— 去 place1 要过
+    # x≈-2.6 那条净宽仅 0.65~0.70m 的南北通道, 半径 >=0.35 时倒出的圆弧被甩到通道内侧墙上
+    # (实测 r=0.4 撞 1 点 / r=0.5~0.8 撞 2 点, 撞点都在 (-2.56,+1.9) 附近)。<=0.3 全部通过。
     lane_navigator = Node(
         package='mm_navigation', executable='lane_navigator.py', name='lane_navigator',
-        output='screen', parameters=[{'use_sim_time': use_sim_time}])
-    # use_nav2:=false 时整段跳过 (建图/纯遥操作场景)。三个都要跟着关, 不只 Nav2 本身:
-    #   cmd_vel_smoother 以 50Hz **持续**发 /cmd_vel(无输入时发零), 会与手柄 teleop 抢
-    #   同一话题, 零值把手柄指令冲掉 -> 表现是"手柄推了车不走或一顿一顿";
+        output='screen', parameters=[{'use_sim_time': use_sim_time,
+                                      'corner_radius': 0.3}])
+    # use_nav2:=false 时整段跳过 (建图/纯遥操作场景)。⚠️ twist_mux 也在这一段里, 故关掉
+    # Nav2 时手柄是**直连**固件的 —— joy_arm_teleop 得自己发 /cmd_vel 才能动车。若哪天想让
+    # mux 常驻, 要把它挪出这个 GroupAction 并确认 joy_arm_teleop 的出口话题跟着改。
     #   lane_navigator 会调 Nav2 action, Nav2 不在时只是空等, 但没有意义故一并关。
     stage3 = TimerAction(period=10.0, actions=[
-        GroupAction([nav2, cmd_vel_smoother, lane_navigator],
+        GroupAction([nav2, twist_mux, lane_navigator],
                     condition=IfCondition(use_nav2)),
     ])
 

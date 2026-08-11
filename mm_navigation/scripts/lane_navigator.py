@@ -35,8 +35,9 @@ from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoS
 from action_msgs.msg import GoalStatus
 from nav2_msgs.action import FollowPath, ComputePathToPose
 from nav_msgs.msg import Path
-from geometry_msgs.msg import PoseStamped, Twist
+from geometry_msgs.msg import PoseStamped, Twist, Point
 from std_msgs.msg import String
+from visualization_msgs.msg import Marker, MarkerArray
 from tf2_ros import Buffer, TransformException, TransformListener
 
 
@@ -67,9 +68,11 @@ class LaneNavigator(Node):
         # 第一个车道节点 -> 一次转到位, 残余横移交 MPPI PathAlign 拉正(避免 90+90 折线掉头)
         self.declare_parameter('merge_skip_dist', 0.25)
         # 拐角圆角半径(米): 每个内部顶点处把直角倒成此半径的圆弧, 车沿圆弧边平移边缓转,
-        # 不在拐点停车. 越大越顺但越占走廊内侧空间; 机器人半径 0.20. 0.8: 弯更缓, 进弯前
-        # MPPI 高速样本不被甩出弯 -> 减速/重规划消失; 代价是占内侧 0.8m, 走廊须够宽.
-        self.declare_parameter('corner_radius', 0.8)
+        # 不在拐点停车. 越大越顺但越占走廊内侧空间; 机器人内切半径 0.19.
+        # 大半径的好处: 弯更缓, 进弯前 MPPI 高速样本不被甩出弯 -> 减速/重规划消失;
+        # 代价: 占走廊内侧空间. 上限由地图几何决定, 不是 nav2 参数 ——
+        # 真机卧室图(maps/room_real)实测 >=0.35 会把圆弧甩到南北通道内侧墙上, 故默认 0.3.
+        self.declare_parameter('corner_radius', 0.3)
         # 终点 yaw 闭环对齐参数(cspin): Nav2 Spin 是开环(到点停发命令), 底盘 cmd_vel 有加速度
         # 斜坡+惯性 -> 停发后滑过目标留残差. 改用本节点读 TF 真实 yaw 的 P 闭环, 过冲自动反向
         # 修回, 落在 final_yaw_tol 内. (位置精度交 MPPI drive 段的 xy_goal_tolerance, 不在此处)
@@ -128,11 +131,18 @@ class LaneNavigator(Node):
             reliability=QoSReliabilityPolicy.RELIABLE,
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.plan_pub = self.create_publisher(Path, 'lane_plan', latched)
+        # 整张车道图的静态叠加(节点球+名字+边线): 起栈发一次, latched 让晚开的 RViz 也能拿到.
+        self.graph_pub = self.create_publisher(MarkerArray, 'lane_graph_markers', latched)
         # 路由终态回报(供 mm_task 状态机知悉 S1 完成/失败): "<target>:SUCCEEDED" / "<target>:FAILED".
         # latched: 晚订阅者也能拿到最后一条终态.
         self.status_pub = self.create_publisher(String, 'lane_navigator/status', latched)
-        # 终点闭环 spin 直接发 /cmd_vel(与 Nav2 Spin 行为同一话题), 经 cmd_vel_smoother 到底盘
-        self.cmd_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+        # cspin(起步/终点闭环对齐)的速度出口。⚠️ 必须发 /cmd_vel_spin 走 twist_mux, 不能直发
+        # /cmd_vel: twist_mux 的输出就 remap 在 /cmd_vel 上, 且它在两路输入都超时时**持续发零**。
+        # 直发会变成"cspin 的 wz"与"mux 的零"两个发布者在同一话题上交替 -> 固件收到
+        # 零/wz/零/wz, 车原地抽搐而不是平稳转 (2026-08-09 跑 pick3 实测, 采样到
+        # /cmd_vel angular.z = 0.0/0.0/0.073/0.0)。mux 里 spin 优先级 50, 夹在 nav(10) 与
+        # 手柄(100) 之间: 转向时压住 Nav2 的零输出, 手柄按下仍能接管。
+        self.cmd_pub = self.create_publisher(Twist, 'cmd_vel_spin', 10)
         self.go_sub = self.create_subscription(String, 'go_to', self.on_go_to, 10)
 
         self._follow_client = ActionClient(self, FollowPath, 'follow_path')
@@ -157,6 +167,8 @@ class LaneNavigator(Node):
         #   _cspin_timer   : 终点闭环对齐控制定时器(20Hz); 抢占/失败/完成时取消并停车
         self._cspin_timer = None
 
+        self.publish_graph_markers()
+
         self.get_logger().info(
             f'Lane graph loaded: {len(self.nodes)} nodes, {len(self.adj)} adjacency entries. '
             f'Trigger with: ros2 topic pub --once /go_to std_msgs/msg/String "{{data: <node>}}"')
@@ -168,14 +180,109 @@ class LaneNavigator(Node):
         self.frame_id = data.get('frame_id', 'map')
         self.point_spacing = float(data.get('point_spacing', 0.05))
         self.nodes = {}
+        # hold_yaw: 可选, 单位米。置了则该节点**最后 hold_yaw 米**的路径朝向全部写成节点
+        # 目标 yaw, 而不是路径切线 —— 车保持这个朝向平移/倒行进去, 到点即已对齐。
+        # 用途: 净距不够原地自转的死头位(外接圆 > 净距), 终点 cspin 若真转会撞墙。
+        # 不置(None)则沿用原行为: 朝向 = 切线, 终点靠 cspin 转到目标 yaw。
+        self.hold_yaw = {}
         for name, v in data['nodes'].items():
             self.nodes[name] = (float(v['x']), float(v['y']), float(v.get('yaw', 0.0)))
+            hy = v.get('hold_yaw')
+            self.hold_yaw[name] = None if hy is None else float(hy)
         self.adj = {name: [] for name in self.nodes}
         for a, b in data['edges']:
             d = math.hypot(self.nodes[a][0] - self.nodes[b][0],
                            self.nodes[a][1] - self.nodes[b][1])
             self.adj[a].append((b, d))
             self.adj[b].append((a, d))
+
+    def publish_graph_markers(self):
+        """整张车道图 -> MarkerArray: 边线(灰) + 节点球 + 节点名+目标朝向箭头.
+
+        任务点(有实际停靠语义的)与转接点(w_*, 只是路过)用颜色区分; 带 hold_yaw 的画成
+        橙色以提示"该点末段锁朝向、不原地自转"."""
+        ma = MarkerArray()
+        stamp = self.get_clock().now().to_msg()
+
+        edge_m = Marker()
+        edge_m.header.frame_id = self.frame_id
+        edge_m.header.stamp = stamp
+        edge_m.ns = 'lane_edges'
+        edge_m.id = 0
+        edge_m.type = Marker.LINE_LIST
+        edge_m.action = Marker.ADD
+        edge_m.scale.x = 0.02
+        edge_m.color.r, edge_m.color.g, edge_m.color.b, edge_m.color.a = 0.5, 0.5, 0.55, 0.8
+        edge_m.pose.orientation.w = 1.0
+        seen = set()
+        for a in self.adj:
+            for b, _ in self.adj[a]:
+                if (b, a) in seen:
+                    continue
+                seen.add((a, b))
+                for n in (a, b):
+                    edge_m.points.append(Point(x=self.nodes[n][0], y=self.nodes[n][1], z=0.01))
+        ma.markers.append(edge_m)
+
+        for i, (name, (x, y, yaw)) in enumerate(sorted(self.nodes.items())):
+            # 转接点前缀: w_(放货区入口) j_(home 行与南北列的交点) c_(东西廊道的交点).
+            # 三类都只过路不停, 其 yaw 是占位值。
+            is_transit = name.startswith(('w_', 'j_', 'c_'))
+            held = self.hold_yaw.get(name) is not None
+
+            sph = Marker()
+            sph.header.frame_id = self.frame_id
+            sph.header.stamp = stamp
+            sph.ns = 'lane_nodes'
+            sph.id = i
+            sph.type = Marker.SPHERE
+            sph.action = Marker.ADD
+            sph.pose.position.x, sph.pose.position.y, sph.pose.position.z = x, y, 0.02
+            sph.pose.orientation.w = 1.0
+            d = 0.08 if is_transit else 0.13
+            sph.scale.x = sph.scale.y = sph.scale.z = d
+            if held:
+                sph.color.r, sph.color.g, sph.color.b = 1.0, 0.55, 0.0
+            elif is_transit:
+                sph.color.r, sph.color.g, sph.color.b = 0.6, 0.6, 0.65
+            else:
+                sph.color.r, sph.color.g, sph.color.b = 0.1, 0.85, 1.0
+            sph.color.a = 0.95
+            ma.markers.append(sph)
+
+            txt = Marker()
+            txt.header.frame_id = self.frame_id
+            txt.header.stamp = stamp
+            txt.ns = 'lane_labels'
+            txt.id = i
+            txt.type = Marker.TEXT_VIEW_FACING
+            txt.action = Marker.ADD
+            txt.pose.position.x, txt.pose.position.y, txt.pose.position.z = x, y, 0.22
+            txt.pose.orientation.w = 1.0
+            txt.scale.z = 0.13
+            txt.color.r = txt.color.g = txt.color.b = txt.color.a = 1.0
+            txt.text = f'{name}*' if held else name
+            ma.markers.append(txt)
+
+            # 转接点没有停靠语义, 其 yaw 只是占位, 画箭头会误导
+            if is_transit:
+                continue
+            arw = Marker()
+            arw.header.frame_id = self.frame_id
+            arw.header.stamp = stamp
+            arw.ns = 'lane_yaw'
+            arw.id = i
+            arw.type = Marker.ARROW
+            arw.action = Marker.ADD
+            arw.pose.position.x, arw.pose.position.y, arw.pose.position.z = x, y, 0.02
+            z, w = yaw_to_quat(yaw)
+            arw.pose.orientation.z, arw.pose.orientation.w = z, w
+            arw.scale.x, arw.scale.y, arw.scale.z = 0.28, 0.045, 0.045
+            arw.color.r, arw.color.g, arw.color.b, arw.color.a = 1.0, 0.9, 0.1, 0.9
+            ma.markers.append(arw)
+
+        self.graph_pub.publish(ma)
+        self.get_logger().info(f'Published lane graph markers: {len(ma.markers)} markers')
 
     def nearest_edge(self, px, py):
         """车投影到最近车道边. 返回 (dist, qx, qy, node_a, node_b)."""
@@ -239,6 +346,34 @@ class LaneNavigator(Node):
         return t.transform.translation.x, t.transform.translation.y, yaw
 
     # ---------- path ----------
+    def _end_heading(self, xy, at_start, baseline=0.15):
+        """路径首端/末端的行进方向, 用"跨过 baseline 米的位移"算而非相邻两点差分。
+
+        ⚠️ 不能只取 xy[0]->xy[1]: 路径头尾常出现间距远小于 point_spacing 的近重合点
+        (车已在节点上时垂足与首节点几乎重合, 圆角化又会在接缝处再插点), 两点差分的方向
+        于是被浮点噪声主导。2026-08-10 跑 pick3 实测: 目标在正前方偏右 8°, 而 xy[0]->xy[1]
+        算出 -143deg, 起步 cspin 照着它把车掉头转了大半圈再倒着开过去 (路径 pose #2 往后
+        全是正确的 -8.4deg, 只有 #0/#1 是垃圾值)。
+        baseline 0.15m: 比 point_spacing(0.05) 大数倍以压掉噪声, 又远小于最短边, 不会
+        跨过第一个拐角而把方向算到下一段去。
+        """
+        if len(xy) < 2:
+            return 0.0
+        if at_start:
+            p0 = xy[0]
+            for p in xy[1:]:
+                if math.hypot(p[0] - p0[0], p[1] - p0[1]) >= baseline:
+                    return math.atan2(p[1] - p0[1], p[0] - p0[0])
+            p1 = xy[-1]     # 整条路径都比 baseline 短: 退化成首末连线
+        else:
+            p1 = xy[-1]
+            for p in reversed(xy[:-1]):
+                if math.hypot(p1[0] - p[0], p1[1] - p[1]) >= baseline:
+                    return math.atan2(p1[1] - p[1], p1[0] - p[0])
+            p0 = xy[0]
+            return math.atan2(p1[1] - p0[1], p1[0] - p0[0])
+        return math.atan2(p1[1] - p0[1], p1[0] - p0[0])
+
     def _sample_line(self, xy, p0, p1):
         """把线段 p0->p1 按 point_spacing 加密追加到 xy(不含 p0, 含 p1)."""
         seg = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
@@ -300,22 +435,33 @@ class LaneNavigator(Node):
                 self._sample_line(xy, cur, pts[i])
                 cur = pts[i]
 
+        # 去重阈值取 point_spacing 的 1/5 (默认 0.05/5=1cm) 而非 1e-4(0.1mm):
+        # 0.1mm 阈值会把接缝处间距 1mm 级的近重合点全留下, 而下游 path_from_xy 按相邻点
+        # 差分算朝向 -> 1mm 的位移里浮点噪声就能翻出几十度的方向误差。
+        # (2026-08-10 pick3 实测: 路径 #0/#1 朝向算成 -143deg/-75deg, 而真实方向是 -8.4deg。)
+        min_gap = max(1e-4, self.point_spacing / 5.0)
         dedup = [xy[0]]
         for p in xy[1:]:
-            if math.hypot(p[0] - dedup[-1][0], p[1] - dedup[-1][1]) > 1e-4:
+            if math.hypot(p[0] - dedup[-1][0], p[1] - dedup[-1][1]) > min_gap:
                 dedup.append(p)
         return dedup
 
     def path_from_xy(self, xy):
-        """加密点列 -> nav_msgs/Path, 每点朝向 = 到下一点的切线(末点沿用前一朝向)."""
+        """加密点列 -> nav_msgs/Path, 每点朝向 = 到下一点的切线(末点沿用前一朝向).
+
+        ⚠️ 差分门槛用 point_spacing/5 而非 1e-6: 1 微米的位移里浮点噪声就足以翻出几十度
+        的假方向, 而这些朝向会被 MPPI 的 PathAlignCritic(use_path_orientations) 当成
+        "该段车头指向"照着锁。低于门槛时沿用前一朝向(方向没变才对), 不要信噪声。
+        """
         path = Path()
         path.header.frame_id = self.frame_id
         path.header.stamp = self.get_clock().now().to_msg()
+        min_step = max(1e-6, self.point_spacing / 5.0)
         prev_h = 0.0
         for k in range(len(xy)):
             if k < len(xy) - 1:
                 dx, dy = xy[k + 1][0] - xy[k][0], xy[k + 1][1] - xy[k][1]
-                h = math.atan2(dy, dx) if math.hypot(dx, dy) > 1e-6 else prev_h
+                h = math.atan2(dy, dx) if math.hypot(dx, dy) > min_step else prev_h
             else:
                 h = prev_h
             self.append_pose(path, xy[k][0], xy[k][1], h)
@@ -339,6 +485,35 @@ class LaneNavigator(Node):
             poses[k].pose.orientation.z = z
             poses[k].pose.orientation.w = w
             prev_h = h
+
+    def _rewrite_tail_orientations(self, path, hold_meters, target_yaw):
+        """把 path 末尾 hold_meters 米内所有 pose 的朝向改写成 target_yaw, 返回锁定段起始下标.
+
+        用于"死头位": 终点净距不够原地自转(外接圆 > 净距), 不能靠终点 cspin 转朝向, 只能
+        让车提前转好、靠全向底盘平移/倒行进去. MPPI 的 PathAlignCritic(use_path_orientations)
+        读的就是这些 pose 朝向, 于是末段车头被锁死在 target_yaw, 到点时 yaw 已经对了.
+        返回 0 表示锁定段覆盖整条路径(调用方据此把起步 cspin 也对齐 target_yaw)."""
+        poses = path.poses
+        # 从末点往前累距, 找到"距终点 >= hold_meters"的那一点, 它之后全部锁朝向
+        acc = 0.0
+        idx = 0
+        for k in range(len(poses) - 1, 0, -1):
+            acc += math.hypot(
+                poses[k].pose.position.x - poses[k - 1].pose.position.x,
+                poses[k].pose.position.y - poses[k - 1].pose.position.y)
+            if acc >= hold_meters:
+                idx = k - 1
+                break
+        z, w = yaw_to_quat(target_yaw)
+        for k in range(idx, len(poses)):
+            poses[k].pose.orientation.x = 0.0
+            poses[k].pose.orientation.y = 0.0
+            poses[k].pose.orientation.z = z
+            poses[k].pose.orientation.w = w
+        self.get_logger().info(
+            f'Hold yaw {math.degrees(target_yaw):.0f}deg over last {hold_meters:.2f}m '
+            f'(poses {idx}..{len(poses) - 1} of {len(poses)})')
+        return idx
 
     def append_pose(self, path, x, y, yaw):
         p = PoseStamped()
@@ -409,6 +584,21 @@ class LaneNavigator(Node):
                 f'Direct merge to {route[0]} (d_lat={d_lat:.2f} q_to_first={q_to_first:.2f}) '
                 f'-> route {" -> ".join(route)}')
             waypoints = [(px, py)] + route_pts
+            # ⚠️ 车可能已经**越过**首节点一点点(如停在 home 前方 4cm): 那样首节点落在车后方,
+            # 路径遂以一段短促的倒退开头, 起步 cspin 照着这段算朝向就把车掉头转走。
+            # 判据: 首节点很近(< 2*corner_radius) 且 "车->首节点" 与 "首节点->次节点" 方向
+            # 基本相反(点积<0, 即夹角>90°) -> 说明它在身后, 丢掉它直奔次节点。
+            # (2026-08-10 pick3 实测: 车 (0.034,0.026) / home (0,0), 起步 cspin 转到 -143deg,
+            #  车掉头大半圈再倒着开过去; 落点虽准但白绕, 窄道里这么甩极危险。)
+            if len(waypoints) >= 3:
+                v0 = (waypoints[1][0] - px, waypoints[1][1] - py)          # 车 -> 首节点
+                v1 = (waypoints[2][0] - waypoints[1][0],
+                      waypoints[2][1] - waypoints[1][1])                    # 首节点 -> 次节点
+                if math.hypot(*v0) < 2.0 * self.corner_radius and \
+                        v0[0] * v1[0] + v0[1] * v1[1] < 0.0:
+                    self.get_logger().info(
+                        f'  first node {route[0]} is behind (d={math.hypot(*v0):.3f}m) -> skip it')
+                    waypoints.pop(1)
         else:
             self.get_logger().info(
                 f'Merge on edge {a}-{b} at ({qx:.2f},{qy:.2f}) -> {" -> ".join(route)}')
@@ -437,13 +627,29 @@ class LaneNavigator(Node):
             self.get_logger().info('Degenerate route, nothing to do')
             return
         path = self.path_from_xy(xy)
-        first_heading = math.atan2(xy[1][1] - xy[0][1], xy[1][0] - xy[0][0])
-        last_heading = math.atan2(xy[-1][1] - xy[-2][1], xy[-1][0] - xy[-2][0])
+        target_yaw = self.nodes[target][2]
+        # hold_yaw: 末段锁定朝向(见 load_graph 注释)。把最后 hold_yaw 米的 pose 朝向全部
+        # 改写成目标 yaw, 于是 MPPI 的 PathAlignCritic(use_path_orientations) 把车头锁在
+        # 这个朝向, 车靠全向底盘平移/倒行走完末段 -> 到点时 yaw 已经对了, 终点 cspin 的
+        # "已对齐则跳过"分支直接放行, 压根不转。
+        # 起步 cspin 也随之改成对齐这个朝向(而非首段切线): 否则车会先转到切线跑, 进了窄道
+        # 才发现要改朝向, 而那里正是转不了的地方。
+        hold = self.hold_yaw.get(target)
+        held_from = None
+        if hold is not None and hold > 0.0:
+            held_from = self._rewrite_tail_orientations(path, hold, target_yaw)
+        if held_from == 0:
+            # 锁定段覆盖了整条路径 -> 全程保持目标朝向, 起步就转到它
+            first_heading = target_yaw
+        else:
+            first_heading = self._end_heading(xy, at_start=True)
+        last_heading = target_yaw if held_from is not None else \
+            self._end_heading(xy, at_start=False)
         goal_xy = (pts[-1][0], pts[-1][1])
         steps = [
             ('cspin', first_heading, self.start_yaw_tol, self.start_wz_max),
             ('drive', path, goal_xy, last_heading),
-            ('cspin', self.nodes[target][2], self.final_yaw_tol, self.cspin_wz_max),
+            ('cspin', target_yaw, self.final_yaw_tol, self.cspin_wz_max),
         ]
 
         # 可视化整条圆角路线

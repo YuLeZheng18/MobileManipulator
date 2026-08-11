@@ -5,20 +5,24 @@
 #
 # 字段含义与 mission.yaml 相同, 这里只记与仿真不同的取值理由.
 #
-# initial_pose: 真机在场地里的开机位姿, **必须按现场重标** —— 下面是占位的原点值.
-#   标法: 手推车到起点, RViz 里 2D Pose Estimate 拖到位, 读 /amcl_pose 填进来.
+# initial_pose: 真机开机位姿 = 建图起点(地面用 L 形胶带标出), 即 map 原点 (0,0,0).
+#   开机把车推回胶带处即可, 不需要每次重标. 该点净距实测 0.700m, 是全图最开阔处,
+#   起步自转全角度无碰撞. 若换场地/重建图, 才需要 RViz 2D Pose Estimate + 读 /amcl_pose.
+#
+# nav_target: 必须是 mm_navigation/config/lane_graph.yaml 里的节点名.
+#   取货 pick1..pick4 / 放货 place1(死头位, 靠 hold_yaw 倒着进) place2 / 原点 home.
 # timeouts: grasp 从 150 抬到 240 —— 真机一条 grasp 任务内部要连抓多个盒 (每盒 ①粗定位
 #   ②相机系精修闭环 ③下插 + 放托盘, 单盒几十秒), 而 unload_tray 一次调用要卸完整盘 2 个盒.
 #   超时是按"一次服务调用"算的, 不是整条任务.
 # nav 从 120 抬到 180: 真机 MPPI 遇障要绕, 比仿真慢.
 
-initial_pose: { x: 0.0, y: 0.0, yaw: 0.0 }   # TODO 现场重标 (读 /amcl_pose)
+initial_pose: { x: 0.0, y: 0.0, yaw: 0.0 }   # = 建图起点(地面 L 形胶带), 也是 lane_graph 的 home
 
 timeouts: { localize: 30.0, nav: 180.0, detect: 15.0, grasp: 240.0 }
 
 max_picks_per_shelf: 4
 
 tasks:
-  - { nav_target: p2, action: grasp }               # 货架前连抓, 抓空或两盘装满即走
-  - { nav_target: p4, action: unload, tray: 0 }     # 卸 0 号(右)托盘: 类别 3/4 的盒
-  - { nav_target: p4, action: unload, tray: 1 }     # 卸 1 号(左)托盘: 类别 1/2 的盒
+  - { nav_target: pick1, action: grasp }               # 货架前连抓, 抓空或两盘装满即走
+  - { nav_target: place2, action: unload, tray: 0 }     # 卸 0 号(右)托盘: 类别 3/4 的盒
+  - { nav_target: place1, action: unload, tray: 1 }     # 卸 1 号(左)托盘: 类别 1/2 的盒

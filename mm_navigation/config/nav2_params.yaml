@@ -158,9 +158,16 @@ controller_server:
       vx_std: 0.2
       vy_std: 0.2
       wz_std: 0.4
-      # 0.36->0.22: 卧室过道净宽实测仅 0.70m (中线净距 0.35), 放货点 (-1.25,2.27) 净距
-      # 0.255m, 车外接圆 0.20 -> 两侧只剩 5.5cm 富余。按固件斜坡 MAX_LIN_ACCEL=0.6 算,
-      # 0.22m/s 的刹车距离 v^2/2a = 0.04m 恰好落在这点富余内; 原 0.36 要 0.108m, 超两倍。
+      # 0.36->0.22: 全图瓶颈是去 place1 的南北通道, 精确欧氏距离变换实测净距 **0.300m**
+      # (旧注释写 0.350m 是当时用 4 连通 BFS 当净距场算的, 那给的是曼哈顿距离、系统性
+      #  高估最多 28%, 已换精确 EDT 修正)。
+      # 按固件斜坡 MAX_LIN_ACCEL=0.6 算, 0.22m/s 的刹车距离 v^2/2a = **4.0cm**,
+      # 恰好等于 robot_radius 0.26 在该通道里的单侧余量 (0.300-0.26)。原 0.36 要 10.8cm。
+      # ⚠️ 这两个 4.0cm 数值相等是巧合, 不是同一个失效模式: 刹车距离管"朝墙开能否刹住",
+      #    而单侧余量是 costmap 的 INSCRIBED 边界(通道内车沿走廊纵向走, MPPI 本就不往
+      #    横向瞄)。故 0.22 有余量、不必再降; 但也别往上调。
+      # (勘误: 早期注释写"门洞净距 0.200m"是错的 —— 那个 0.200m 窄口存在, 但不在任何
+      #  必经路线上, 车道图走的是更宽的绕行。)
       # ⚠️ 必须与下方 velocity_smoother.max_velocity 同改, 只改一处另一处成瓶颈。
       vx_max: 0.22
       vx_min: -0.22
@@ -201,6 +208,12 @@ controller_server:
       # repulsion_weight 决定"靠近软膨胀就减速躲"的强度: 太大 -> 沿墙正常行驶也被拽慢.
       # 调回小值让车不怕墙的软膨胀; 真碰撞由 critical_weight/collision_margin 兜底(保留).
       # 把路径推离障碍交给"全局 costmap 大膨胀", 不靠这里(两套 costmap 职责分离).
+      # ⚠️ 这里的 inflation_radius/cost_scaling_factor 不是独立参数, 必须与
+      #    local_costmap.inflation_layer **逐字一致** —— MPPI 用它们把代价值反算回
+      #    "离障碍多远", 对不上则整条轨迹的距离估计系统性偏移。随 R 同步 0.22 -> 0.26。
+      # consider_footprint 保持 false: 换成圆形口径后内切 == 外接 == 0.26, 该开关管的
+      #    "低于外接半径阈值就直接放过、否则做完整多边形检查"两级判定退化成一级,
+      #    开了只是白烧算力(batch 2000 x 56 步 = 11.2 万点), 拿不到任何额外精度。
       ObstaclesCritic:
         enabled: true
         cost_power: 1
@@ -210,7 +223,7 @@ controller_server:
         collision_cost: 10000.0
         collision_margin_distance: 0.08
         near_goal_distance: 0.5
-        inflation_radius: 0.22
+        inflation_radius: 0.26
         cost_scaling_factor: 8.0
       PathAlignCritic:
         enabled: true
@@ -260,32 +273,41 @@ local_costmap:
       width: 3
       height: 3
       resolution: 0.05
-      # ===== footprint 多边形 (2026-08-09 取代 robot_radius) =====
-      # 车是长方形且托盘只往**后**伸, 用圆半径描述必然按最远角画圆 -> 横向被凭空放大。
-      # STL 实测包络 (读顶点算, 非估): base_link 0.3614长 x 0.3745宽 (半宽 0.187);
-      # Link_11 托盘经 Joint_5 变换后 x∈[-0.2893,-0.1313] y∈[-0.1099,+0.1106]
-      # —— 托盘横向比底盘还窄, 一点没占。合并包络 0.470长 x 0.3745宽。
-      # 故取: 前 +0.19 / 后 -0.30 (含托盘) / 左右 ±0.195
-      #   -> 内切 0.190 (定 INSCRIBED 硬禁区)  外接 0.3578 (原地自转扫过的圆)
-      # ⚠️ 内切由**前边界 0.19** 定住, 不是侧边 0.195 —— 内切 = 各边到 base_link 原点
-      #    距离的最小值。故 y 放宽到 0.195 并不提升内切, 只是给横向多留 0.8cm 物理余量
-      #    (实际半宽 0.187)。这一步免费: 真机图欧氏距离变换实测 R=0.187/0.190/0.195/0.20
-      #    四档可通行面积**完全相同** (6922 格, 66.6%)。
-      # 与旧 robot_radius:0.22 相比 (只算 occupied 为障碍口径): 60.1% -> 66.6%,
-      # 主连通域 5851 -> 6411 格; 过道中线可用带宽 0.260m -> 0.320m。
-      # ⚠️ footprint 与 robot_radius 互斥, 后者必须删掉, 否则 footprint 不生效。
-      # ⚠️ 外接 0.355 > 放货点净距 0.255m(实测) -> 平移进去没问题(吃内切 0.195),
-      #    但在那儿**原地自转托盘后角会碰墙**。故路网里放货点的 yaw 必须设成"车开进去
-      #    时本来就对的朝向", 让 lane_navigator 终点 cspin 落在 final_yaw_tol 内直接
-      #    跳过、压根不转。这个约束在画 lane_graph.yaml 时兑现, 不在此处。
-      footprint: "[[0.19, 0.195], [0.19, -0.195], [-0.30, -0.195], [-0.30, 0.195]]"
+      # ===== robot_radius 圆形 (2026-08-10 取代 footprint 多边形, 用户决定) =====
+      # 车的真实几何(STL 实测顶点, 非估): base_link 0.3614长 x 0.3745宽(半宽 0.187),
+      # 托盘 Link_11 经 Joint_5 变换后 x∈[-0.2893,-0.1313] y∈[-0.1099,+0.1106]
+      # —— 托盘往**后**伸而横向比底盘还窄。合并包络 0.470长 x 0.3745宽。
+      #
+      # ⚠️ 为什么放弃 footprint 多边形: 上一版写的
+      #      "[[0.19,0.195],[0.19,-0.195],[-0.30,-0.195],[-0.30,0.195]]"
+      #    是**外包络长方形**, 它的后两角 (-0.30,±0.195) 实际是空的(托盘只到 y=±0.11)。
+      #    那两个幽灵角把外接圆撑到 0.3578, 于是所有校验都偏保守 4.8cm, 曾误判出
+      #    "南北通道不能自转 / place1 揉头只剩 2.5cm"这类结论 —— **全部作废**。
+      #    真外接圆 = sqrt(0.2893^2+0.1106^2) = **0.3097**。
+      #
+      # ===== 为什么取 0.26 (不是更大也不是更小) =====
+      # 瓶颈是去 place1 的南北通道: 精确欧氏距离变换实测净距 **0.300m**。
+      # robot_radius 定的是 INSCRIBED 硬禁区半径, 故通道里可用中线带宽 = 2*(0.300-R):
+      #   R=0.24 -> 12.0cm 带宽 / 托盘欠保护 6.9cm / 可站面积 67.6%
+      #   R=0.26 -> * 8.0cm 带宽 / 托盘欠保护 5.0cm / 可站面积 62.6%   <= 采用
+      #   R=0.28 ->  4.0cm 带宽 / 托盘欠保护 2.9cm / 可站面积 61.5%
+      #   R=0.30 ->  0.0cm 带宽 = 通道堵死, place1 直接不可达
+      # 取 0.26 的判据是 **8cm 带宽 > AMCL 实测落点误差 5~6cm**: R=0.28 只剩 4cm,
+      # 车会经常被判成已在 INSCRIBED 区内, NavFn 去 place1 会无故失败(而且不报有用的错)。
+      # ⚠️ 0.26 < 真外接圆 0.3097, 即托盘那 5.0cm 不受 costmap 保护。可接受的理由:
+      #    欠保护只在**原地自转**时才可能碰, 而 lane_navigator 只在路线起点/终点自转,
+      #    那都是路网节点, 十个节点净距 0.350~0.700 **全部 >= 0.3097**, 自转有 4.0cm 以上
+      #    真实余量。通道内净距 0.300 < 0.3097 确实不能自转, 但通道段内没有路网节点 ——
+      #    这是 lane_graph.yaml 里写明的设计不变量, 往通道加中间路点会破掉它。
+      robot_radius: 0.26
       plugins: ["obstacle_layer", "inflation_layer"]
-      # 局部膨胀只需 ≥ 内切半径(0.190) 防蹭即可; 大了会让沿墙行驶持续吃高代价而减速.
-      # (推离障碍由全局 costmap 大膨胀负责, 见下方 global_costmap)
+      # ⚠️ inflation_radius 必须 >= robot_radius, 否则代价地图允许路径贴到比车还近的地方
+      # -> 必然蹭障(这是曾经"蹭障"的元凶: 半径 0.20 配膨胀 0.18)。故随 R 同步改 0.22 -> 0.26。
+      # 不取更大: 大了会让沿墙行驶持续吃高代价而减速(推离障碍由全局 costmap 大膨胀负责)。
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 8.0
-        inflation_radius: 0.22
+        inflation_radius: 0.26
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -313,9 +335,10 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_link
       use_sim_time: false
-      # footprint 必须与 local_costmap **逐字一致** (依据见那边注释)。两处不一致的后果:
-      # 全局小了 NavFn 会规划出局部走不了的路 (局部判 INSCRIBED 直接卡住), 大了则过保守。
-      footprint: "[[0.19, 0.195], [0.19, -0.195], [-0.30, -0.195], [-0.30, 0.195]]"
+      # robot_radius 必须与 local_costmap **逐字一致** (取 0.26 的完整依据见那边注释)。
+      # 两处不一致的后果: 全局小了 NavFn 会规划出局部走不了的路 (局部判 INSCRIBED 直接
+      # 卡住), 大了则过保守。⚠️ 与 footprint 互斥, 换成 robot_radius 时前者必须删掉。
+      robot_radius: 0.26
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]

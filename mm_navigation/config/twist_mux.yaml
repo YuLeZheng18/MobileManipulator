@@ -5,8 +5,13 @@
 # 链路 (固件订阅的 /cmd_vel 名字不变, 只在它上游插一级):
 #   controller_server ┐
 #   behavior_server   ├SetRemap→ /cmd_vel_nav → cmd_vel_smoother → /cmd_vel_nav_out ┐
-#                     ┘                                                              ├→ twist_mux → /cmd_vel
+#                     ┘                                                              │
+#   lane_navigator cspin (起步/终点闭环转向) ─────────────────→ /cmd_vel_spin ───────├→ twist_mux → /cmd_vel
 #   joy_arm_teleop (仅 DRIVE 态转发) ─────────────────────────→ /cmd_vel_manual ─────┘
+#
+# ⚠️ 三路都不许直发 /cmd_vel: mux 的输出 remap 就在 /cmd_vel 上, 且它在所有输入都超时时
+# **持续发零**。任何一路绕过 mux 直发, 都会与那串零形成"两个发布者交替" -> 车抽搐。
+# (2026-08-09 实测: cspin 曾直发 /cmd_vel, 起步转向时 angular.z 采到 0.0/0.0/0.073/0.0。)
 #
 # **R1 死人开关就是接管键, 不需要额外按键**: teleop_ps2.yaml enable_button=5(R1),
 # teleop_twist_joy 只在按住时发(20Hz autorepeat), 松开发一帧零速后静默。于是
@@ -24,6 +29,14 @@ twist_mux:
         topic   : /cmd_vel_nav_out
         timeout : 0.5
         priority: 10
+      # lane_navigator 的 cspin 闭环转向 (起步对齐首段切线 / 终点对齐目标 yaw)。
+      # 优先级 50 夹在中间: cspin 期间 Nav2 无输出, nav 那路超时后 mux 持续发零,
+      # 若 cspin 与 nav 同级或更低就被零值冲成抽搐 —— 故必须高于 nav; 又必须低于手柄,
+      # 保证 R1 接管在转向过程中同样有效。
+      spin:
+        topic   : /cmd_vel_spin
+        timeout : 0.5
+        priority: 50
       # 手柄: joy_arm_teleop 仲裁后的输出(它自己只在 DRIVE 态发)。高优先级。
       joystick:
         topic   : /cmd_vel_manual
