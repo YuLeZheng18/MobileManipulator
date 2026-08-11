@@ -215,24 +215,28 @@ controller_server:
         cost_weight: 9.0
         threshold_to_consider: 0.8
       # repulsion_weight 决定"靠近软膨胀就减速躲"的强度: 太大 -> 沿墙正常行驶也被拽慢.
-      # 调回小值让车不怕墙的软膨胀; 真碰撞由 critical_weight/collision_margin 兜底(保留).
-      # 把路径推离障碍交给"全局 costmap 大膨胀", 不靠这里(两套 costmap 职责分离).
+      # 0.2 -> 0.1 (2026-08-11, "让车敢过点"的第三处): 窄走廊里车**必然**全程贴着软膨胀,
+      # 这个权重于是变成一路持续的刹车力, 正是"犹豫/蠕动"的直接来源。真碰撞仍由
+      # critical_weight 20.0 + collision_margin_distance 兜底, 那条线没动。
+      # collision_margin_distance 0.08 -> 0.05: 这是"离障碍多近开始算撞"的余量, 叠在
+      # robot_radius 之上。R 已从 0.26 收到 0.22, 若余量留 0.08 则实际禁区回到 0.30,
+      # 白收 —— 两个数要一起降才真的腾出通行带。
       # ⚠️ 这里的 inflation_radius/cost_scaling_factor 不是独立参数, 必须与
       #    local_costmap.inflation_layer **逐字一致** —— MPPI 用它们把代价值反算回
-      #    "离障碍多远", 对不上则整条轨迹的距离估计系统性偏移。随 R 同步 0.22 -> 0.26。
-      # consider_footprint 保持 false: 换成圆形口径后内切 == 外接 == 0.26, 该开关管的
+      #    "离障碍多远", 对不上则整条轨迹的距离估计系统性偏移。随 R 同步 0.26 -> 0.22。
+      # consider_footprint 保持 false: 圆形口径下内切 == 外接 == R, 该开关管的
       #    "低于外接半径阈值就直接放过、否则做完整多边形检查"两级判定退化成一级,
       #    开了只是白烧算力(batch 2000 x 56 步 = 11.2 万点), 拿不到任何额外精度。
       ObstaclesCritic:
         enabled: true
         cost_power: 1
-        repulsion_weight: 0.2
+        repulsion_weight: 0.1
         critical_weight: 20.0
         consider_footprint: false
         collision_cost: 10000.0
-        collision_margin_distance: 0.08
+        collision_margin_distance: 0.05
         near_goal_distance: 0.5
-        inflation_radius: 0.26
+        inflation_radius: 0.22
         cost_scaling_factor: 8.0
       # 贴路径主力。18->28 且 offset_from_furthest 20->6 (2026-08-11):
       # offset_from_furthest 是"从轨迹最远端往回数多少个点才开始算对齐代价", nav2 默认 20
@@ -312,38 +316,36 @@ local_costmap:
       # ===== robot_radius 圆形 (2026-08-10 取代 footprint 多边形, 用户决定) =====
       # 车的真实几何(STL 实测顶点, 非估): base_link 0.3614长 x 0.3745宽(半宽 0.187),
       # 托盘 Link_11 经 Joint_5 变换后 x∈[-0.2893,-0.1313] y∈[-0.1099,+0.1106]
-      # —— 托盘往**后**伸而横向比底盘还窄。合并包络 0.470长 x 0.3745宽。
+      # —— 托盘往**后**伸而横向比底盘还窄。真外接圆 = sqrt(0.2893^2+0.1106^2) = **0.3097**。
       #
       # ⚠️ 为什么放弃 footprint 多边形: 上一版写的
       #      "[[0.19,0.195],[0.19,-0.195],[-0.30,-0.195],[-0.30,0.195]]"
       #    是**外包络长方形**, 它的后两角 (-0.30,±0.195) 实际是空的(托盘只到 y=±0.11)。
-      #    那两个幽灵角把外接圆撑到 0.3578, 于是所有校验都偏保守 4.8cm, 曾误判出
-      #    "南北通道不能自转 / place1 揉头只剩 2.5cm"这类结论 —— **全部作废**。
-      #    真外接圆 = sqrt(0.2893^2+0.1106^2) = **0.3097**。
+      #    那两个幽灵角把外接圆撑到 0.3578, 所有校验都因此偏保守 4.8cm —— 结论全部作废。
       #
-      # ===== 为什么取 0.26 (不是更大也不是更小) =====
-      # 瓶颈是去 place1 的南北通道: 精确欧氏距离变换实测净距 **0.300m**。
-      # robot_radius 定的是 INSCRIBED 硬禁区半径, 故通道里可用中线带宽 = 2*(0.300-R):
-      #   R=0.24 -> 12.0cm 带宽 / 托盘欠保护 6.9cm / 可站面积 67.6%
-      #   R=0.26 -> * 8.0cm 带宽 / 托盘欠保护 5.0cm / 可站面积 62.6%   <= 采用
-      #   R=0.28 ->  4.0cm 带宽 / 托盘欠保护 2.9cm / 可站面积 61.5%
-      #   R=0.30 ->  0.0cm 带宽 = 通道堵死, place1 直接不可达
-      # 取 0.26 的判据是 **8cm 带宽 > AMCL 实测落点误差 5~6cm**: R=0.28 只剩 4cm,
-      # 车会经常被判成已在 INSCRIBED 区内, NavFn 去 place1 会无故失败(而且不报有用的错)。
-      # ⚠️ 0.26 < 真外接圆 0.3097, 即托盘那 5.0cm 不受 costmap 保护。可接受的理由:
-      #    欠保护只在**原地自转**时才可能碰, 而 lane_navigator 只在路线起点/终点自转,
-      #    那都是路网节点, 十个节点净距 0.350~0.700 **全部 >= 0.3097**, 自转有 4.0cm 以上
-      #    真实余量。通道内净距 0.300 < 0.3097 确实不能自转, 但通道段内没有路网节点 ——
-      #    这是 lane_graph.yaml 里写明的设计不变量, 往通道加中间路点会破掉它。
-      robot_radius: 0.26
+      # ===== 0.26 -> 0.22 (2026-08-11, 用户要求"车半径小一点, 让车敢过点") =====
+      # 症状: 去 place1 时车在走廊口犹豫半天。根因是那条走廊 EDT 实测净距只有 **0.300m**,
+      # 而 robot_radius 定的是 INSCRIBED 硬禁区半径, 走廊里可用中线带宽 = 2*(0.300-R):
+      #   R=0.26 ->  8.0cm 带宽   <- 与 AMCL 实测落点误差 5~6cm 同量级, 车一飘就判进禁区
+      #   R=0.22 -> 16.0cm 带宽   <= 采用, 是定位误差的约 3 倍, 才谈得上"敢过"
+      # 半宽 0.187 是底盘真实半宽, 故 0.22 仍比车身半宽大 3.3cm, 不是把车当质点。
+      # ⚠️ 代价: 0.22 距真外接圆 0.3097 差 9.0cm(原先差 5.0cm), 即托盘那一截更不受
+      #    costmap 保护。这个欠保护只在**原地自转**时会碰 —— 而 lane_navigator 只在路线
+      #    起点和终点自转, 那两处是标定过的停靠位, 净距 0.35~0.70 都 >= 0.3097。
+      #    真正的风险是"车在窄处被逼停后重规划、在走廊里自转", 靠 vy_max=0.05 + 切线锁头
+      #    使车在走廊内只能直行穿过来规避。若哪天看到托盘蹭墙, 第一个该回调的就是这里。
+      robot_radius: 0.22
+      # 显式 0.0: nav2 默认 0.01, 会悄悄把上面的半径再撑 1cm(0.22 -> 0.23)。
+      # 数值小但方向错 —— 这一版的整个意图是把禁区收紧到刚好够用, 留着默认值等于漏算。
+      footprint_padding: 0.0
       plugins: ["obstacle_layer", "inflation_layer"]
       # ⚠️ inflation_radius 必须 >= robot_radius, 否则代价地图允许路径贴到比车还近的地方
-      # -> 必然蹭障(这是曾经"蹭障"的元凶: 半径 0.20 配膨胀 0.18)。故随 R 同步改 0.22 -> 0.26。
-      # 不取更大: 大了会让沿墙行驶持续吃高代价而减速(推离障碍由全局 costmap 大膨胀负责)。
+      # -> 必然蹭障(这是曾经"蹭障"的元凶: 半径 0.20 配膨胀 0.18)。故随 R 同步 0.26 -> 0.22。
+      # 不取更大: 大了会让沿墙行驶持续吃高代价而减速(推离障碍由全局 costmap 膨胀负责)。
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 8.0
-        inflation_radius: 0.26
+        inflation_radius: 0.22
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -371,10 +373,11 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_link
       use_sim_time: false
-      # robot_radius 必须与 local_costmap **逐字一致** (取 0.26 的完整依据见那边注释)。
-      # 两处不一致的后果: 全局小了 NavFn 会规划出局部走不了的路 (局部判 INSCRIBED 直接
-      # 卡住), 大了则过保守。⚠️ 与 footprint 互斥, 换成 robot_radius 时前者必须删掉。
-      robot_radius: 0.26
+      # robot_radius 必须与 local_costmap **逐字一致** (取 0.22 的完整依据见那边注释)。
+      # 两处不一致的后果: 全局小了会规划出局部走不了的路 (局部判 INSCRIBED 直接卡住),
+      # 大了则过保守。⚠️ 与 footprint 互斥, 换成 robot_radius 时前者必须删掉。
+      robot_radius: 0.22
+      footprint_padding: 0.0
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -395,13 +398,17 @@ global_costmap:
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True
-      # 给 NavFn 用: 大半径 + 平缓梯度(cost_scaling 小=代价随距离衰减慢=高代价区更宽),
-      # 让低代价"谷底"落在走廊中线 -> NavFn 沿谷底走, 路径居中、离障碍远.
-      # (cost_scaling 越大梯度越陡, 障碍旁很快归零, 路径反而能贴障 -> 故这里调小)
+      # 给规划器用: 平缓梯度(cost_scaling 小 = 代价随距离衰减慢 = 高代价区更宽), 让低代价
+      # "谷底"落在走廊中线 -> 规划器沿谷底走, 路径居中、离障碍远。
+      # 0.45 -> 0.30 (2026-08-11, "让车敢过点"的另一半):
+      # 膨胀半径大于走廊半宽时, **整条走廊全是高代价**, 谷底被抹平 —— 去 place1 那条净距
+      # 0.300m 的走廊(半宽 0.15)在 0.45 膨胀下没有一格是低代价, 规划器于是在"进走廊"与
+      # "绕远路"之间反复横跳, 表现就是用户看到的"在路口犹豫半天"。
+      # 0.30 让走廊中线重新露出可分辨的谷底, 同时仍 > robot_radius 0.22, 宽处照样居中。
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 2.5
-        inflation_radius: 0.45
+        inflation_radius: 0.30
       always_send_full_costmap: True
 
 map_server:
@@ -422,14 +429,34 @@ planner_server:
     expected_planner_frequency: 20.0
     use_sim_time: false
     planner_plugins: ["GridBased"]
-    # 换 NavFn(Dijkstra): 沿代价场梯度走, 天然往低代价(走廊中间)靠 -> 路径离障碍远;
-    # 不像 Theta* 任意角切角贴障. 配合下方全局膨胀梯度调缓, 居中效果更明显.
-    # 保留 plugin id "GridBased" 不变, lane_navigator 的 planner_id='GridBased' 无需改.
+    # 2026-08-11 NavFn -> SmacPlanner2D。去掉固定车道图后, 规划器成了**唯一**路径来源,
+    # 路径质量直接就是行车质量, 故换成自带平滑器的那个。
+    # 差别只有一点但很关键: NavFn 输出的是逐格折线(方向量化到 45° 台阶), 而 lane_navigator
+    # 会把每个 pose 的朝向写成切线交给 MPPI 的 PathAlignCritic 锁车头 —— 台阶路径 = 命令
+    # 车头在直线上按 45° 来回扭。SmacPlanner2D 规划完自带梯度下降平滑(下面 smoother 段),
+    # 输出连续路径, 拐角是圆滑过渡而不是硬折角, 正好顶替掉手写的"顶点倒圆角"。
+    # (节点侧还有一道 heading_baseline=0.15m 的前视切线做二次去台阶, 两道叠着来。)
+    # ⚠️ plugin id 保持 "GridBased": lane_navigator 写死了 planner_id='GridBased'。
+    # ⚠️ 不用 SmacPlannerHybrid/Lattice: 那两个按车辆运动学(最小转弯半径)搜索, 会在
+    #    0.30m 净距的走廊里因转弯半径放不下而直接判无解 —— 全向底盘不需要那个约束。
     GridBased:
-      plugin: "nav2_navfn_planner/NavfnPlanner"
-      tolerance: 0.5
-      use_astar: false
+      plugin: "nav2_smac_planner/SmacPlanner2D"
+      tolerance: 0.25          # 目标格被占时可退让的距离; 目标空闲则路径精确落在目标上
       allow_unknown: true
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 2.0
+      # 代价惩罚权重: 越大越愿意绕远走低代价区(=走廊中线), 越小越贴近最短路。
+      # 2.0 是"明显居中但不至于为了躲膨胀绕大圈", 与下面全局膨胀 0.30/2.5 配套。
+      cost_travel_multiplier: 2.0
+      # false: 末点朝向用我们传进去的目标 yaw 而不是"最后一段路径方向"。
+      # 其实无所谓 —— lane_navigator 收到路径后会把**所有** pose 朝向按切线重写一遍。
+      use_final_approach_orientation: false
+      smoother:
+        max_iterations: 1000
+        w_smooth: 0.3          # 平滑权重: 抹掉栅格台阶
+        w_data: 0.2            # 贴原路径权重: 压住平滑把路径推进墙里
+        tolerance: 1.0e-10
 
 smoother_server:
   ros__parameters:

@@ -242,13 +242,11 @@ def generate_launch_description():
                     {'use_sim_time': use_sim_time}],
         remappings=[('cmd_vel_out', '/cmd_vel')],
     )
-    # corner_radius 必须显式传: 节点默认 0.8 是仿真值, 在真机图上会撞 —— 去 place1 要过
-    # x≈-2.6 那条净宽仅 0.65~0.70m 的南北通道, 半径 >=0.35 时倒出的圆弧被甩到通道内侧墙上
-    # (实测 r=0.4 撞 1 点 / r=0.5~0.8 撞 2 点, 撞点都在 (-2.56,+1.9) 附近)。<=0.3 全部通过。
+    # 2026-08-11 去固定路网后, lane_navigator 只做"查命名路点 -> 调 planner_server 规划 ->
+    # 先自转对齐再巡路"。原先必须显式传的 corner_radius 随倒圆角一起删了, 这里无参可传。
     lane_navigator = Node(
         package='mm_navigation', executable='lane_navigator.py', name='lane_navigator',
-        output='screen', parameters=[{'use_sim_time': use_sim_time,
-                                      'corner_radius': 0.3}])
+        output='screen', parameters=[{'use_sim_time': use_sim_time}])
     # use_nav2:=false 时整段跳过 (建图/纯遥操作场景)。⚠️ twist_mux 也在这一段里, 故关掉
     # Nav2 时手柄是**直连**固件的 —— joy_arm_teleop 得自己发 /cmd_vel 才能动车。若哪天想让
     # mux 常驻, 要把它挪出这个 GroupAction 并确认 joy_arm_teleop 的出口话题跟着改。

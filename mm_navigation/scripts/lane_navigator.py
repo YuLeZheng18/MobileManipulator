@@ -1,28 +1,36 @@
 #!/usr/bin/env python3
 """
-方案A 车道导航节点 — 固定路网 + Dijkstra + 圆角连续路径 (一次走完, 拐角不停)
+命名路点导航节点 — 全局规划器出路径 + "先转到路线方向再严格巡路"
 
-机器人在固定车道图上行走: 当前位置投影到最近车道边, Dijkstra 求到目标 node 的
-最短路, 得到一串顶点. 把顶点序列里每个 90° 直角拐角用半径 corner_radius 的圆弧
-倒成圆角, 直线段 + 圆弧串成一条连续 Path, 每个点朝向 = 该点行进切线方向.
+`/go_to <name>` -> 从 lane_graph.yaml 的 nodes 表查出目标位姿 -> 调 planner_server
+(ComputePathToPose, SmacPlanner2D) 从当前位姿规划一条路径 -> 把每个 pose 的朝向重写成
+路径切线 -> 三步跑完:
+    ① cspin 闭环自转对齐首段切线
+    ② FollowPath 一次跑完整条路径 (MPPI 锁车头跟切线, 拐角不停)
+    ③ cspin 闭环自转对齐节点目标 yaw
 
-整条路线 = [起步自转对齐首段切线, FollowPath 跑完整条圆角连续路径, 终点自转对齐目标 yaw].
+"严格巡路"靠两件事: 路径 pose 带切线朝向 + MPPI 的 PathAlignCritic(use_path_orientations)
+把车头锁在这个朝向上; 配合 vy_max 压到 0.05 禁掉横移, 车只能"先把头转到路线方向再纵向开",
+不会斜着平移抄近路。
 
-关键点(为何能拐角不停): 底盘全向(Omni). 过圆角时车头沿切线"边平移边缓转",
-不需要在拐点停车再自转. MPPI(Omni + PathAlignCritic use_path_orientations)锁车头
-跟随路径切线, 圆弧足够缓(默认 r=0.4)朝向变化平滑, 不会出现急转抖动. 段内遇障由
-MPPI 横移(vy)绕开; 真堵死则调 NavFn 重规划到终点节点、按切线朝向跟随绕行路径.
+===== 2026-08-11: 去掉固定路网 =====
+上一版走"车道图 + Dijkstra + 顶点倒圆角"。拓扑是纯正交方格网, 于是任何 A->B 都被拆成
+一串 90° 直角, 每个直角都要停下转头; 加上车道边是人工押的直线, 与真实空隙的中线并不重合,
+窄处(去 place1 那条走廊)常年贴着代价墙走 -> 车走走停停、"犹豫"。用户判定不够流畅, 改成
+纯规划: 让规划器读 costmap 自己找连续、居中、拐角平缓的路线。
 
-旧架构是"每个节点停+自转+直行"的离散分段: 副作用是每个拐角被 xy_goal_tolerance
-提前 25cm 判完成 -> 不到拐角就停下自转("提前停"). 改成连续圆角后, 拐角不再是 goal,
-容差只在最终节点生效 -> 拐角不停, 顺带消除提前停.
+保留的部分(用户硬需求, 一个都没动):
+  - 三步 cspin -> drive -> cspin 状态机与其全部时序纪律(沉降判定/抢占/重试/慢恢复)
+  - 切线朝向 + PathAlignCritic 锁头 = "严格巡路"
+  - hold_yaw(节点级"末段锁朝向", 见 load_graph)
+删掉的部分: nearest_edge / dijkstra / build_rounded_xy / corner_radius / merge_skip_dist,
+以及 lane_graph.yaml 的 edges(文件里留着但不再读)。nodes 表退化成纯"命名位姿查找表"。
 
-绕过 planner_server 与 BT(仅绕障重规划借用 NavFn). 触发与可视化:
-    ros2 topic pub --once /go_to std_msgs/msg/String "{data: p3}"
-    RViz 订阅 /lane_plan (nav_msgs/Path) 看整条圆角路线
+触发与可视化:
+    ros2 topic pub --once /go_to std_msgs/msg/String "{data: pick3}"
+    RViz 订阅 /lane_plan (nav_msgs/Path) 看规划出来的路线
 """
 import math
-import heapq
 
 import yaml
 
@@ -35,7 +43,7 @@ from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoS
 from action_msgs.msg import GoalStatus
 from nav2_msgs.action import FollowPath, ComputePathToPose
 from nav_msgs.msg import Path
-from geometry_msgs.msg import PoseStamped, Twist, Point
+from geometry_msgs.msg import PoseStamped, Twist
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -64,15 +72,12 @@ class LaneNavigator(Node):
         # 到位再走, 不再边跑边扭.
         self.declare_parameter('start_yaw_tol', 0.087)   # ~5°: 起步对齐到位阈值(同时作跳过门限)
         self.declare_parameter('start_wz_max', 0.5)      # 起步转速上限(rad/s): 比终点精对 0.4 略快, 大角度起步不肉但不甩
-        # 横向并入阈值(米): 车到车道横向距离小于此值视为已在道上, 跳过垂足 Q 直连
-        # 第一个车道节点 -> 一次转到位, 残余横移交 MPPI PathAlign 拉正(避免 90+90 折线掉头)
-        self.declare_parameter('merge_skip_dist', 0.25)
-        # 拐角圆角半径(米): 每个内部顶点处把直角倒成此半径的圆弧, 车沿圆弧边平移边缓转,
-        # 不在拐点停车. 越大越顺但越占走廊内侧空间; 机器人内切半径 0.19.
-        # 大半径的好处: 弯更缓, 进弯前 MPPI 高速样本不被甩出弯 -> 减速/重规划消失;
-        # 代价: 占走廊内侧空间. 上限由地图几何决定, 不是 nav2 参数 ——
-        # 真机卧室图(maps/room_real)实测 >=0.35 会把圆弧甩到南北通道内侧墙上, 故默认 0.3.
-        self.declare_parameter('corner_radius', 0.3)
+        # 切线朝向的前视基线(米): 每个 pose 的朝向 = 从它指向"前方至少这么远"的那个点,
+        # 而不是相邻两点差分。⚠️ 不能用相邻差分: 全局规划器是栅格搜索(5cm 格), 相邻两点的
+        # 方向被量化成 45° 的整数倍, 而这些朝向会被 MPPI 的 PathAlignCritic 当"该点车头指向"
+        # 照着锁 -> 车头在直线上也会按 45° 台阶来回扭。前视 0.15m(=3 个栅格)把台阶抹平成
+        # 连续切线场, 又远小于最短转弯半径, 不会把弯道方向平均掉。
+        self.declare_parameter('heading_baseline', 0.15)
         # 终点 yaw 闭环对齐参数(cspin): Nav2 Spin 是开环(到点停发命令), 底盘 cmd_vel 有加速度
         # 斜坡+惯性 -> 停发后滑过目标留残差. 改用本节点读 TF 真实 yaw 的 P 闭环, 过冲自动反向
         # 修回, 落在 final_yaw_tol 内. (位置精度交 MPPI drive 段的 xy_goal_tolerance, 不在此处)
@@ -94,10 +99,8 @@ class LaneNavigator(Node):
             'start_yaw_tol').get_parameter_value().double_value
         self.start_wz_max = self.get_parameter(
             'start_wz_max').get_parameter_value().double_value
-        self.merge_skip_dist = self.get_parameter(
-            'merge_skip_dist').get_parameter_value().double_value
-        self.corner_radius = self.get_parameter(
-            'corner_radius').get_parameter_value().double_value
+        self.heading_baseline = self.get_parameter(
+            'heading_baseline').get_parameter_value().double_value
         self.final_yaw_tol = self.get_parameter(
             'final_yaw_tol').get_parameter_value().double_value
         self.cspin_kp = self.get_parameter(
@@ -131,7 +134,7 @@ class LaneNavigator(Node):
             reliability=QoSReliabilityPolicy.RELIABLE,
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.plan_pub = self.create_publisher(Path, 'lane_plan', latched)
-        # 整张车道图的静态叠加(节点球+名字+边线): 起栈发一次, latched 让晚开的 RViz 也能拿到.
+        # 全部命名路点的静态叠加(节点球+名字+朝向箭头): 起栈发一次, latched 让晚开的 RViz 也能拿到.
         self.graph_pub = self.create_publisher(MarkerArray, 'lane_graph_markers', latched)
         # 路由终态回报(供 mm_task 状态机知悉 S1 完成/失败):
         #   "<seq> <target>:SUCCEEDED" / "<seq> <target>:FAILED"   seq 从 1 起单调递增
@@ -155,12 +158,13 @@ class LaneNavigator(Node):
         self.go_sub = self.create_subscription(String, 'go_to', self.on_go_to, 10)
 
         self._follow_client = ActionClient(self, FollowPath, 'follow_path')
-        # 堵死重规划用: 调 planner_server(Theta*) 算绕障路径
+        # 路线规划(去路网后这是**唯一**路径来源) + drive 段受阻时的绕障重规划, 同一个客户端。
         self._planner_client = ActionClient(self, ComputePathToPose, 'compute_path_to_pose')
 
         # 状态机状态:
         #   _active_target : 当前正在追的目标名(None = 空闲)
-        #   _steps         : [('spin', heading) | ('drive', p0, p1, heading), ...]
+        #   _steps         : [('cspin', yaw, tol, wz_max) | ('drive', path, goal_xy, heading)]
+        #                    规划是异步的, 故 _steps 在规划结果回调里才填上(此前为空列表)
         #   _step_idx      : 当前执行到第几步
         #   _goal_handle   : 当前在途 action goal 句柄(用于切目标时抢占)
         #   _epoch         : 路线代号; 每次新路线 +1, 旧步骤回调凭 epoch 失效, 防串线
@@ -179,15 +183,18 @@ class LaneNavigator(Node):
         self.publish_graph_markers()
 
         self.get_logger().info(
-            f'Lane graph loaded: {len(self.nodes)} nodes, {len(self.adj)} adjacency entries. '
+            f'Waypoints loaded: {len(self.nodes)} named poses (routing = global planner). '
             f'Trigger with: ros2 topic pub --once /go_to std_msgs/msg/String "{{data: <node>}}"')
 
     # ---------- graph ----------
     def load_graph(self, path):
+        """读 lane_graph.yaml 的 nodes 段当"命名位姿查找表"。
+
+        ⚠️ edges 段**不再读**(2026-08-11 去路网): 路线由 planner_server 读 costmap 现规划,
+        不走固定车道。yaml 里的 edges 保留只为存档/画图参考, 改它对行为没有任何影响。"""
         with open(path, 'r') as f:
             data = yaml.safe_load(f)
         self.frame_id = data.get('frame_id', 'map')
-        self.point_spacing = float(data.get('point_spacing', 0.05))
         self.nodes = {}
         # hold_yaw: 可选, 单位米。置了则该节点**最后 hold_yaw 米**的路径朝向全部写成节点
         # 目标 yaw, 而不是路径切线 —— 车保持这个朝向平移/倒行进去, 到点即已对齐。
@@ -198,40 +205,15 @@ class LaneNavigator(Node):
             self.nodes[name] = (float(v['x']), float(v['y']), float(v.get('yaw', 0.0)))
             hy = v.get('hold_yaw')
             self.hold_yaw[name] = None if hy is None else float(hy)
-        self.adj = {name: [] for name in self.nodes}
-        for a, b in data['edges']:
-            d = math.hypot(self.nodes[a][0] - self.nodes[b][0],
-                           self.nodes[a][1] - self.nodes[b][1])
-            self.adj[a].append((b, d))
-            self.adj[b].append((a, d))
 
     def publish_graph_markers(self):
-        """整张车道图 -> MarkerArray: 边线(灰) + 节点球 + 节点名+目标朝向箭头.
+        """所有命名路点 -> MarkerArray: 节点球 + 节点名 + 目标朝向箭头.
 
-        任务点(有实际停靠语义的)与转接点(w_*, 只是路过)用颜色区分; 带 hold_yaw 的画成
-        橙色以提示"该点末段锁朝向、不原地自转"."""
+        任务点(有实际停靠语义的)与转接点(w_*/j_*/c_*, 旧路网的过路点)用颜色区分; 带 hold_yaw
+        的画成橙色以提示"该点末段锁朝向、不原地自转"。
+        ⚠️ 去路网后不再画边线: 边已经不参与规划, 画出来会让人误以为车沿着它走。"""
         ma = MarkerArray()
         stamp = self.get_clock().now().to_msg()
-
-        edge_m = Marker()
-        edge_m.header.frame_id = self.frame_id
-        edge_m.header.stamp = stamp
-        edge_m.ns = 'lane_edges'
-        edge_m.id = 0
-        edge_m.type = Marker.LINE_LIST
-        edge_m.action = Marker.ADD
-        edge_m.scale.x = 0.02
-        edge_m.color.r, edge_m.color.g, edge_m.color.b, edge_m.color.a = 0.5, 0.5, 0.55, 0.8
-        edge_m.pose.orientation.w = 1.0
-        seen = set()
-        for a in self.adj:
-            for b, _ in self.adj[a]:
-                if (b, a) in seen:
-                    continue
-                seen.add((a, b))
-                for n in (a, b):
-                    edge_m.points.append(Point(x=self.nodes[n][0], y=self.nodes[n][1], z=0.01))
-        ma.markers.append(edge_m)
 
         for i, (name, (x, y, yaw)) in enumerate(sorted(self.nodes.items())):
             # 转接点前缀: w_(放货区入口) j_(home 行与南北列的交点) c_(东西廊道的交点).
@@ -293,52 +275,6 @@ class LaneNavigator(Node):
         self.graph_pub.publish(ma)
         self.get_logger().info(f'Published lane graph markers: {len(ma.markers)} markers')
 
-    def nearest_edge(self, px, py):
-        """车投影到最近车道边. 返回 (dist, qx, qy, node_a, node_b)."""
-        best = None
-        seen = set()
-        for a in self.adj:
-            for b, _ in self.adj[a]:
-                if (b, a) in seen:
-                    continue
-                seen.add((a, b))
-                ax, ay, _ = self.nodes[a]
-                bx, by, _ = self.nodes[b]
-                abx, aby = bx - ax, by - ay
-                ab2 = abx * abx + aby * aby
-                t = 0.0 if ab2 < 1e-9 else ((px - ax) * abx + (py - ay) * aby) / ab2
-                t = max(0.0, min(1.0, t))
-                qx, qy = ax + t * abx, ay + t * aby
-                d = math.hypot(px - qx, py - qy)
-                if best is None or d < best[0]:
-                    best = (d, qx, qy, a, b)
-        return best
-
-    def dijkstra(self, start, goal):
-        """返回 (route_list, total_dist); 不可达返回 (None, inf)."""
-        dist = {start: 0.0}
-        prev = {}
-        pq = [(0.0, start)]
-        while pq:
-            d, u = heapq.heappop(pq)
-            if u == goal:
-                break
-            if d > dist.get(u, float('inf')):
-                continue
-            for v, w in self.adj[u]:
-                nd = d + w
-                if nd < dist.get(v, float('inf')):
-                    dist[v] = nd
-                    prev[v] = u
-                    heapq.heappush(pq, (nd, v))
-        if goal not in dist:
-            return None, float('inf')
-        route = [goal]
-        while route[-1] != start:
-            route.append(prev[route[-1]])
-        route.reverse()
-        return route, dist[goal]
-
     # ---------- pose ----------
     def get_robot_pose(self):
         """返回 (x, y, yaw); 取不到返回 None."""
@@ -355,17 +291,16 @@ class LaneNavigator(Node):
         return t.transform.translation.x, t.transform.translation.y, yaw
 
     # ---------- path ----------
-    def _end_heading(self, xy, at_start, baseline=0.15):
+    def _end_heading(self, xy, at_start, baseline=None):
         """路径首端/末端的行进方向, 用"跨过 baseline 米的位移"算而非相邻两点差分。
 
-        ⚠️ 不能只取 xy[0]->xy[1]: 路径头尾常出现间距远小于 point_spacing 的近重合点
-        (车已在节点上时垂足与首节点几乎重合, 圆角化又会在接缝处再插点), 两点差分的方向
-        于是被浮点噪声主导。2026-08-10 跑 pick3 实测: 目标在正前方偏右 8°, 而 xy[0]->xy[1]
-        算出 -143deg, 起步 cspin 照着它把车掉头转了大半圈再倒着开过去 (路径 pose #2 往后
-        全是正确的 -8.4deg, 只有 #0/#1 是垃圾值)。
-        baseline 0.15m: 比 point_spacing(0.05) 大数倍以压掉噪声, 又远小于最短边, 不会
-        跨过第一个拐角而把方向算到下一段去。
+        ⚠️ 不能只取 xy[0]->xy[1]: 栅格规划器的相邻点方向被量化成 45° 整数倍, 且路径头尾
+        常出现间距近于零的重合点, 两点差分的方向于是被量化台阶和浮点噪声主导。
+        2026-08-10 跑 pick3 实测: 目标在正前方偏右 8°, 而 xy[0]->xy[1] 算出 -143deg,
+        起步 cspin 照着它把车掉头转了大半圈再倒着开过去。
         """
+        if baseline is None:
+            baseline = self.heading_baseline
         if len(xy) < 2:
             return 0.0
         if at_start:
@@ -383,117 +318,40 @@ class LaneNavigator(Node):
             return math.atan2(p1[1] - p0[1], p1[0] - p0[0])
         return math.atan2(p1[1] - p0[1], p1[0] - p0[0])
 
-    def _sample_line(self, xy, p0, p1):
-        """把线段 p0->p1 按 point_spacing 加密追加到 xy(不含 p0, 含 p1)."""
-        seg = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
-        n = max(1, int(seg / self.point_spacing))
-        for k in range(1, n + 1):
-            t = k / n
-            xy.append((p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t))
-
-    def build_rounded_xy(self, pts, r):
-        """顶点序列 pts -> 带圆角的连续加密点列 xy.
-        每个内部顶点 V(在 A-V-B 之间)用半径 r 的圆弧倒角: 在 V 前后各 T 处与两边相切,
-        T = r/tan(alpha/2) (alpha=两边夹角), 并裁剪到不超过相邻段一半防重叠. 起点/终点不倒角.
-        近共线/近掉头的顶点跳过倒角直接穿过."""
-        n = len(pts)
-        fillets = {}
-        for i in range(1, n - 1):
-            A, V, B = pts[i - 1], pts[i], pts[i + 1]
-            v1x, v1y = A[0] - V[0], A[1] - V[1]
-            v2x, v2y = B[0] - V[0], B[1] - V[1]
-            l1 = math.hypot(v1x, v1y)
-            l2 = math.hypot(v2x, v2y)
-            if l1 < 1e-6 or l2 < 1e-6:
-                continue
-            u1x, u1y = v1x / l1, v1y / l1
-            u2x, u2y = v2x / l2, v2y / l2
-            dot = max(-1.0, min(1.0, u1x * u2x + u1y * u2y))
-            alpha = math.acos(dot)
-            if alpha > math.pi - 0.05 or alpha < 0.05:
-                continue  # 近共线或近掉头, 不倒角
-            half = alpha / 2.0
-            T = min(r / math.tan(half), 0.45 * l1, 0.45 * l2)
-            r_eff = T * math.tan(half)
-            p1 = (V[0] + u1x * T, V[1] + u1y * T)
-            p2 = (V[0] + u2x * T, V[1] + u2y * T)
-            bx, by = u1x + u2x, u1y + u2y
-            bl = math.hypot(bx, by)
-            if bl < 1e-6:
-                continue
-            cdist = r_eff / math.sin(half)
-            cx, cy = V[0] + bx / bl * cdist, V[1] + by / bl * cdist
-            a1 = math.atan2(p1[1] - cy, p1[0] - cx)
-            a2 = math.atan2(p2[1] - cy, p2[0] - cx)
-            dtheta = norm_angle(a2 - a1)  # 取劣弧(偏转角 = pi-alpha < pi)
-            fillets[i] = (p1, p2, cx, cy, a1, dtheta, r_eff)
-
-        xy = [pts[0]]
-        cur = pts[0]
-        for i in range(1, n):
-            if i in fillets:
-                p1, p2, cx, cy, a1, dtheta, r_eff = fillets[i]
-                self._sample_line(xy, cur, p1)
-                arc_len = abs(dtheta) * r_eff
-                na = max(1, int(arc_len / self.point_spacing))
-                for k in range(1, na + 1):
-                    ang = a1 + dtheta * (k / na)
-                    xy.append((cx + r_eff * math.cos(ang), cy + r_eff * math.sin(ang)))
-                cur = p2
-            else:
-                self._sample_line(xy, cur, pts[i])
-                cur = pts[i]
-
-        # 去重阈值取 point_spacing 的 1/5 (默认 0.05/5=1cm) 而非 1e-4(0.1mm):
-        # 0.1mm 阈值会把接缝处间距 1mm 级的近重合点全留下, 而下游 path_from_xy 按相邻点
-        # 差分算朝向 -> 1mm 的位移里浮点噪声就能翻出几十度的方向误差。
-        # (2026-08-10 pick3 实测: 路径 #0/#1 朝向算成 -143deg/-75deg, 而真实方向是 -8.4deg。)
-        min_gap = max(1e-4, self.point_spacing / 5.0)
-        dedup = [xy[0]]
-        for p in xy[1:]:
-            if math.hypot(p[0] - dedup[-1][0], p[1] - dedup[-1][1]) > min_gap:
-                dedup.append(p)
-        return dedup
-
-    def path_from_xy(self, xy):
-        """加密点列 -> nav_msgs/Path, 每点朝向 = 到下一点的切线(末点沿用前一朝向).
-
-        ⚠️ 差分门槛用 point_spacing/5 而非 1e-6: 1 微米的位移里浮点噪声就足以翻出几十度
-        的假方向, 而这些朝向会被 MPPI 的 PathAlignCritic(use_path_orientations) 当成
-        "该段车头指向"照着锁。低于门槛时沿用前一朝向(方向没变才对), 不要信噪声。
-        """
-        path = Path()
-        path.header.frame_id = self.frame_id
-        path.header.stamp = self.get_clock().now().to_msg()
-        min_step = max(1e-6, self.point_spacing / 5.0)
-        prev_h = 0.0
-        for k in range(len(xy)):
-            if k < len(xy) - 1:
-                dx, dy = xy[k + 1][0] - xy[k][0], xy[k + 1][1] - xy[k][1]
-                h = math.atan2(dy, dx) if math.hypot(dx, dy) > min_step else prev_h
-            else:
-                h = prev_h
-            self.append_pose(path, xy[k][0], xy[k][1], h)
-            prev_h = h
-        return path
-
     def set_tangent_orientations(self, path):
-        """就地把一条 Path 的每个 pose 朝向重写成切线方向(用于 NavFn 绕障路径)."""
+        """就地把规划器路径的每个 pose 朝向重写成"前视 heading_baseline 米"的切线方向。
+
+        这些朝向就是 MPPI 的 PathAlignCritic(use_path_orientations) 锁车头用的目标 ——
+        即"严格巡路"里"车头必须对着路线方向"的那一半(另一半是 vy_max=0.05 禁横移)。
+
+        ⚠️ 用前视窗口而不是相邻两点差分: 全局规划器是 5cm 栅格搜索, 相邻两点的连线方向
+        只能取 45° 的整数倍, 照抄就等于命令车头在直线段上按 45° 台阶来回扭。前视 0.15m
+        (3 个格)把台阶平均成连续切线场, 又短于任何一个弯, 不会把弯道方向抹平。
+        尾部不足 baseline 的点沿用最后一个有效朝向 = 终点进场方向, 正确。
+        """
         poses = path.poses
-        prev_h = 0.0
-        for k in range(len(poses)):
-            if k < len(poses) - 1:
-                dx = poses[k + 1].pose.position.x - poses[k].pose.position.x
-                dy = poses[k + 1].pose.position.y - poses[k].pose.position.y
-                h = math.atan2(dy, dx) if math.hypot(dx, dy) > 1e-6 else prev_h
-            else:
-                h = prev_h
-            z, w = yaw_to_quat(h)
+        n = len(poses)
+        if n == 0:
+            return
+        xs = [p.pose.position.x for p in poses]
+        ys = [p.pose.position.y for p in poses]
+        # j 单调右移: 对每个 k 找第一个距 k 至少 baseline 的点(k 增大时 j 不回退)
+        heads = [0.0] * n
+        last = math.atan2(ys[-1] - ys[0], xs[-1] - xs[0]) if n > 1 else 0.0
+        j = 0
+        for k in range(n):
+            j = max(j, k + 1)
+            while j < n and math.hypot(xs[j] - xs[k], ys[j] - ys[k]) < self.heading_baseline:
+                j += 1
+            if j < n:
+                last = math.atan2(ys[j] - ys[k], xs[j] - xs[k])
+            heads[k] = last
+        for k in range(n):
+            z, w = yaw_to_quat(heads[k])
             poses[k].pose.orientation.x = 0.0
             poses[k].pose.orientation.y = 0.0
             poses[k].pose.orientation.z = z
             poses[k].pose.orientation.w = w
-            prev_h = h
 
     def _rewrite_tail_orientations(self, path, hold_meters, target_yaw):
         """把 path 末尾 hold_meters 米内所有 pose 的朝向改写成 target_yaw, 返回锁定段起始下标.
@@ -523,16 +381,6 @@ class LaneNavigator(Node):
             f'Hold yaw {math.degrees(target_yaw):.0f}deg over last {hold_meters:.2f}m '
             f'(poses {idx}..{len(poses) - 1} of {len(poses)})')
         return idx
-
-    def append_pose(self, path, x, y, yaw):
-        p = PoseStamped()
-        p.header.frame_id = self.frame_id
-        p.pose.position.x = x
-        p.pose.position.y = y
-        z, w = yaw_to_quat(yaw)
-        p.pose.orientation.z = z
-        p.pose.orientation.w = w
-        path.poses.append(p)
 
     # ---------- status ----------
     def publish_status(self, target, ok):
@@ -567,82 +415,75 @@ class LaneNavigator(Node):
             self.get_logger().info(f'Target "{target}" already in progress, ignoring duplicate')
             return
 
-        # 投影到最近车道边, 从投影点 Q 并入车道; 端点 a/b 选"经它到目标总程最短"那个,
-        # 避免 snap 到反方向 node 造成先倒退再折返的锐角.
-        ne = self.nearest_edge(px, py)
-        if ne is None:
-            self.get_logger().error('No edges in lane graph')
-            self.publish_status(target, False)
-            return
-        d_lat, qx, qy, a, b = ne
-        ra, da = self.dijkstra(a, target)
-        rb, db = self.dijkstra(b, target)
-        cost_a = math.hypot(qx - self.nodes[a][0], qy - self.nodes[a][1]) + da
-        cost_b = math.hypot(qx - self.nodes[b][0], qy - self.nodes[b][1]) + db
-        if cost_a <= cost_b and ra is not None:
-            route = ra
-        elif rb is not None:
-            route = rb
-        else:
-            self.get_logger().error(f'No route to {target}')
-            self.publish_status(target, False)
-            return
+        # 新路线: epoch+1 并立刻抢占在途的一切(旧回调凭旧 epoch 自动失效)。
+        # ⚠️ 抢占必须发生在**发规划请求之前**: 规划是异步的, 期间若不先把旧 goal/定时器
+        # 掐掉, 旧路线会继续开着车跑到新路径回来为止。
+        self._epoch += 1
+        ep = self._epoch
+        if self._goal_handle is not None:
+            self.get_logger().info(f'Preempting current route for new target "{target}"')
+            self._goal_handle.cancel_goal_async()
+            self._goal_handle = None
+        self._cancel_retry_timer()
+        if self._cspin_timer is not None:  # 抢占在途闭环对齐: 停转并清定时器
+            self._cancel_cspin_timer()
+            self.cmd_pub.publish(Twist())
+        self._retry_count = 0
+        self._active_target = target
+        self._steps = []       # 规划还没回来, 保持空; run_next_step 此刻不能调
+        self._step_idx = 0
+        self.request_route_plan(target, ep)
 
-        route_pts = [(self.nodes[n][0], self.nodes[n][1]) for n in route]
-        # 垂足 Q 到首节点的距离: Q 贴近首节点时, 插 Q 会制造一条 <2*corner_radius 的短边,
-        # 该短边两端各一个 90° 弯被防重叠裁剪压到极小半径 -> MPPI 车头跟不上急弯切线(转速
-        # 需求 > wz_max)而蠕动 -> 触发 progress 失败重规划. 故 Q 贴近首节点时丢弃 Q 直连.
-        q_to_first = math.hypot(qx - route_pts[0][0], qy - route_pts[0][1])
-        # 车已基本在车道上(横向距离小), 或垂足贴近首节点: 跳过垂足 Q 的折线并入, 从车位置
-        # 直连第一个车道节点 -> 转向一次到位; 否则保留垂直并入(车离车道远时需先回到车道).
-        if d_lat < self.merge_skip_dist or q_to_first < 2.0 * self.corner_radius:
-            self.get_logger().info(
-                f'Direct merge to {route[0]} (d_lat={d_lat:.2f} q_to_first={q_to_first:.2f}) '
-                f'-> route {" -> ".join(route)}')
-            waypoints = [(px, py)] + route_pts
-            # ⚠️ 车可能已经**越过**首节点一点点(如停在 home 前方 4cm): 那样首节点落在车后方,
-            # 路径遂以一段短促的倒退开头, 起步 cspin 照着这段算朝向就把车掉头转走。
-            # 判据: 首节点很近(< 2*corner_radius) 且 "车->首节点" 与 "首节点->次节点" 方向
-            # 基本相反(点积<0, 即夹角>90°) -> 说明它在身后, 丢掉它直奔次节点。
-            # (2026-08-10 pick3 实测: 车 (0.034,0.026) / home (0,0), 起步 cspin 转到 -143deg,
-            #  车掉头大半圈再倒着开过去; 落点虽准但白绕, 窄道里这么甩极危险。)
-            if len(waypoints) >= 3:
-                v0 = (waypoints[1][0] - px, waypoints[1][1] - py)          # 车 -> 首节点
-                v1 = (waypoints[2][0] - waypoints[1][0],
-                      waypoints[2][1] - waypoints[1][1])                    # 首节点 -> 次节点
-                if math.hypot(*v0) < 2.0 * self.corner_radius and \
-                        v0[0] * v1[0] + v0[1] * v1[1] < 0.0:
-                    self.get_logger().info(
-                        f'  first node {route[0]} is behind (d={math.hypot(*v0):.3f}m) -> skip it')
-                    waypoints.pop(1)
-        else:
-            self.get_logger().info(
-                f'Merge on edge {a}-{b} at ({qx:.2f},{qy:.2f}) -> {" -> ".join(route)}')
-            waypoints = [(px, py), (qx, qy)] + route_pts
-        self.start_route(target, waypoints)
+    def request_route_plan(self, target, ep):
+        """向 planner_server 要一条 当前位姿 -> 目标节点 的路径(去路网后的唯一路径来源)."""
+        if not self._planner_client.wait_for_server(timeout_sec=2.0):
+            self.fail_route(ep, 'compute_path_to_pose server not available')
+            return
+        tx, ty, tyaw = self.nodes[target]
+        goal = ComputePathToPose.Goal()
+        goal.goal = self._make_pose(tx, ty, tyaw)
+        goal.use_start = False        # 起点用机器人当前 TF
+        goal.planner_id = 'GridBased'
+        self.get_logger().info(f'Planning route -> "{target}" ({tx:.2f},{ty:.2f})')
+        fut = self._planner_client.send_goal_async(goal)
+        fut.add_done_callback(lambda f: self._on_route_plan_accept(f, ep, target))
+
+    def _on_route_plan_accept(self, fut, ep, target):
+        if ep != self._epoch:
+            return
+        handle = fut.result()
+        if not handle.accepted:
+            self.fail_route(ep, 'route plan goal rejected')
+            return
+        handle.get_result_async().add_done_callback(
+            lambda f: self._on_route_plan_result(f, ep, target))
+
+    def _on_route_plan_result(self, fut, ep, target):
+        if ep != self._epoch:
+            return
+        res = fut.result()
+        if res.status != GoalStatus.STATUS_SUCCEEDED or len(res.result.path.poses) < 2:
+            self.fail_route(ep, f'no path to "{target}" (planner status {res.status})')
+            return
+        self.start_route(target, res.result.path, ep)
 
     # ---------- 状态机 ----------
-    def start_route(self, target, waypoints):
-        # 去掉相邻重复点(投影点可能与端点/相邻 node 重合), 避免零长段
-        pts = [waypoints[0]]
-        for p in waypoints[1:]:
-            if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-3:
-                pts.append(p)
-        if len(pts) < 2:
-            self.get_logger().info('Already on target node, nothing to do')
-            return
+    def start_route(self, target, path, ep):
+        """规划器路径 -> 三步路线 [起步对齐切线, 跑完整条路径, 终点对齐目标 yaw].
 
-        # 圆角连续路径: 顶点序列倒圆角 -> 一条加密 Path(每点切线朝向). 整条当一个 drive 步骤, 拐角不停.
-        # 起步用闭环 cspin 对齐首段切线(start_yaw_tol~5°/start_wz_max~0.8): P 闭环转到切线并沉降
-        # (连续几拍零速落容差)再放行 drive -> 转停稳了才跑, 不会没转完就被 MPPI 前进抢走而起步甩头.
-        # 终点同样用闭环 cspin 对齐目标 yaw(final_yaw_tol~1°/cspin_wz_max 0.4, 紧而稳): 读 TF 真实
-        # yaw 做 P 控制直接发 /cmd_vel, 过冲自动反向修回(开环 Spin 会被底盘斜坡滑过). 位置精度交 MPPI
-        # drive 段的 xy_goal_tolerance(收紧它=更准, 代价是终点附近 MPPI 会蠕动收尾, 已接受).
-        xy = self.build_rounded_xy(pts, self.corner_radius)
-        if len(xy) < 2:
-            self.get_logger().info('Degenerate route, nothing to do')
+        起步用闭环 cspin 对齐首段切线(start_yaw_tol~5°): P 闭环转到位并"沉降"(连续几拍零速
+        且落容差内)再放行 drive -> 转停稳了才跑, 不会没转完就被 MPPI 前进抢走而起步甩头。
+        整条路径当**一个** drive 步骤, 故拐角不是 goal、不会被 xy_goal_tolerance 提前判完成
+        -> 拐角不停车。终点同样用闭环 cspin(final_yaw_tol~1°, 紧而稳): 读 TF 真实 yaw 做 P
+        控制, 过冲自动反向修回(Nav2 的开环 Spin 会被底盘加速度斜坡滑过)。位置精度交 MPPI
+        drive 段的 xy_goal_tolerance。"""
+        if ep != self._epoch:
             return
-        path = self.path_from_xy(xy)
+        path.header.frame_id = self.frame_id
+        # 规划器只给位置(其 pose 朝向对全向底盘无意义), 朝向由这里按前视切线重写 ——
+        # 这就是 MPPI 锁车头的依据, "严格巡路"由此成立。
+        self.set_tangent_orientations(path)
+        xy = [(p.pose.position.x, p.pose.position.y) for p in path.poses]
         target_yaw = self.nodes[target][2]
         # hold_yaw: 末段锁定朝向(见 load_graph 注释)。把最后 hold_yaw 米的 pose 朝向全部
         # 改写成目标 yaw, 于是 MPPI 的 PathAlignCritic(use_path_orientations) 把车头锁在
@@ -661,32 +502,19 @@ class LaneNavigator(Node):
             first_heading = self._end_heading(xy, at_start=True)
         last_heading = target_yaw if held_from is not None else \
             self._end_heading(xy, at_start=False)
-        goal_xy = (pts[-1][0], pts[-1][1])
-        steps = [
+        # drive 受阻重规划时的目标用**节点真值**而不是 path 末点: 规划器允许在 tolerance 内
+        # 收敛到附近格子, 拿它当重规划终点会让误差一轮轮累积着往外爬。
+        goal_xy = (self.nodes[target][0], self.nodes[target][1])
+        self._steps = [
             ('cspin', first_heading, self.start_yaw_tol, self.start_wz_max),
             ('drive', path, goal_xy, last_heading),
             ('cspin', target_yaw, self.final_yaw_tol, self.cspin_wz_max),
         ]
-
-        # 可视化整条圆角路线
-        self.plan_pub.publish(path)
-
-        # 新路线: epoch+1; 若有在途 goal 先抢占(其回调凭旧 epoch 自动失效)
-        self._epoch += 1
-        ep = self._epoch
-        if self._goal_handle is not None:
-            self.get_logger().info(f'Preempting current route for new target "{target}"')
-            self._goal_handle.cancel_goal_async()
-            self._goal_handle = None
-        self._cancel_retry_timer()
-        if self._cspin_timer is not None:  # 抢占在途终点闭环对齐: 停转并清定时器
-            self._cancel_cspin_timer()
-            self.cmd_pub.publish(Twist())
-        self._retry_count = 0
-        self._active_target = target
-        self._steps = steps
         self._step_idx = 0
-        self.get_logger().info(f'Route "{target}": {len(steps)} steps over {len(pts) - 1} legs')
+        self.plan_pub.publish(path)
+        self.get_logger().info(
+            f'Route "{target}": {len(path.poses)} poses, '
+            f'start heading {math.degrees(first_heading):.0f}deg')
         self.run_next_step(ep)
 
     def run_next_step(self, ep):
@@ -813,7 +641,7 @@ class LaneNavigator(Node):
             self._retry_count = 0
             self.advance_step(ep)
             return
-        # drive 段失败(动态障碍逼停等): 延时重试本段(重试时走 Theta* 重规划绕障)而非放弃
+        # drive 段失败(动态障碍逼停等): 延时重试本段(重取当前位姿重规划绕障)而非放弃
         if self._steps[self._step_idx][0] == 'drive':
             self._schedule_retry_or_fail(ep, f'status {status}')
         else:
@@ -847,8 +675,8 @@ class LaneNavigator(Node):
         self._cancel_retry_timer()
         if ep != self._epoch:
             return
-        # 本段被堵: 不再发死直线, 改调全局 planner(NavFn) 从当前位姿重规划一条避障路径到
-        # 本段终点(读 global_costmap 自动绕远), 障碍移动 / costmap 更新后每次重试都重算.
+        # 本段被堵: 从**当前**位姿向全局 planner 重新要一条到目标的路径(读 global_costmap
+        # 自动绕远)。障碍移动 / costmap 更新后每次重试都重算, 故障碍挪开就自动接着走。
         _, p1, heading = self._steps[self._step_idx][1:]
         self.do_replan_drive(p1, heading, ep)
 
@@ -861,7 +689,7 @@ class LaneNavigator(Node):
         goal.use_start = False  # 用机器人当前 TF 作起点
         goal.planner_id = 'GridBased'
         self.get_logger().info(
-            f'[step {self._step_idx}] Replan (NavFn) around obstacle '
+            f'[step {self._step_idx}] Replan around obstacle '
             f'-> ({p1[0]:.2f},{p1[1]:.2f})')
         fut = self._planner_client.send_goal_async(goal)
         fut.add_done_callback(lambda f: self.on_plan_accept(f, ep))
@@ -884,8 +712,7 @@ class LaneNavigator(Node):
             self._schedule_retry_or_fail(ep, f'replan failed (status {res.status})')
             return
         path = res.result.path
-        # 绕障路径取 NavFn 的位置, 把每个 pose 朝向重写成切线方向: 车头沿绕障路径行进方向,
-        # 边平移边缓转跟随(与圆角连续路径同一套朝向策略), 障碍过后自然回到车道.
+        # 与首次规划同一套处理: 位置用规划器的, 朝向按前视切线重写 -> 车头始终对着行进方向.
         self.set_tangent_orientations(path)
         self.get_logger().info(
             f'[step {self._step_idx}] Replan ok: {len(path.poses)} poses, following detour @ tangent')
