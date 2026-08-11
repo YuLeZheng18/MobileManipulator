@@ -156,7 +156,9 @@ controller_server:
       model_dt: 0.05
       batch_size: 2000
       vx_std: 0.2
-      vy_std: 0.2
+      # 0.2->0.05: 必须随 vy_max 同改。采样标准差远大于上限时大半 batch 被截断到 ±vy_max,
+      # 等于用 2000 条轨迹里的一小部分做优化, 白烧算力还降低有效样本数。
+      vy_std: 0.05
       wz_std: 0.4
       # 0.36->0.22: 全图瓶颈是去 place1 的南北通道, 精确欧氏距离变换实测净距 **0.300m**
       # (旧注释写 0.350m 是当时用 4 连通 BFS 当净距场算的, 那给的是曼哈顿距离、系统性
@@ -171,7 +173,14 @@ controller_server:
       # ⚠️ 必须与下方 velocity_smoother.max_velocity 同改, 只改一处另一处成瓶颈。
       vx_max: 0.22
       vx_min: -0.22
-      vy_max: 0.22
+      # 0.22->0.05 (2026-08-11 用户实机要求"严格按车道走, 车头循车道方向"):
+      # 全向底盘从 A 到 B 最省的运动是斜向平移, 故 vy 放开时 MPPI 必然抹掉车道图的
+      # 正交折线与 0.3m 圆角、走弦斜插过去 —— 首次真机跑 pick1 实测就是这个形态。
+      # 压到 0.05 只留"末端微调/贴墙微让"的余量, 迫使车必须先把头转到车道方向再纵向开。
+      # ⚠️ 代价: 放弃 MPPI 的横移绕障 (原注释"遇障要快靠提前横移"不再成立), 遇障退化为
+      #    减速/停下等全局重规划。这是用户明确接受的取舍。
+      # ⚠️ 不改成 motion_model: DiffDrive —— 那会彻底禁掉 vy, 末端连几 cm 的横向修正都做不了。
+      vy_max: 0.05
       wz_max: 1.0
       iteration_count: 1
       prune_distance: 1.7
@@ -225,14 +234,18 @@ controller_server:
         near_goal_distance: 0.5
         inflation_radius: 0.26
         cost_scaling_factor: 8.0
+      # 贴路径主力。18->28 且 offset_from_furthest 20->6 (2026-08-11):
+      # offset_from_furthest 是"从轨迹最远端往回数多少个点才开始算对齐代价", nav2 默认 20
+      # 在本车上等于只对齐 0.6m 视野的最前端 —— 圆角弧长才 ~0.47m, 整段弧都落在被忽略的
+      # 区间里, 于是弧线被抹平成弦。收到 6 让近端逐点都受罚, 车才会真正贴着弧走。
       PathAlignCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 18.0
+        cost_weight: 28.0
         max_path_occupancy_ratio: 0.05
         trajectory_point_step: 4
         threshold_to_consider: 0.5
-        offset_from_furthest: 20
+        offset_from_furthest: 6
         use_path_orientations: true
       # threshold_to_consider 必须 >= GoalCritic.threshold(0.6), 否则出现"死区":
       # 离终点 0.6~1.4m 时 PathFollow 已关、GoalCritic 还没开 -> 没有任何 critic 推前进,
@@ -248,13 +261,19 @@ controller_server:
       # 给"沿路径向目标前进"的承诺 -> 含后退段的路径也不会被优化器判成"原地不动最省".
       # max_angle_to_furthest 放大到 1.0(~57° 死区): 车头在 ±57° 内不罚 -> 横移绕障被容忍,
       # 只有偏太多才扳车头(锁头主力仍是 PathAlignCritic use_path_orientations).
+      # max_angle_to_furthest 1.0->0.35 (57°->20°), cost_weight 6->10 (2026-08-11):
+      # 这个死区就是"车头允许偏离行进方向多少度不受罚"。原先 57° 是为了容忍横移绕障而
+      # 刻意放大的, 但它同时也放行了"头不动、身子斜着挪"这种走法。收到 20° 后车头必须
+      # 大致对着行进方向, 与 PathAlignCritic 的 use_path_orientations 一起把头锁在车道方向。
+      # ⚠️ 别收到 0: mode 0 (FORWARD_PREFERRED) 的方向承诺是防"MPPI 把原地不动判成最优"
+      #    的那道保险, 死区太小会在起步瞬间(车头还没转过来)给出巨额代价而把车压死。
       PathAngleCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 6.0
+        cost_weight: 10.0
         offset_from_furthest: 4
         threshold_to_consider: 0.5
-        max_angle_to_furthest: 1.0
+        max_angle_to_furthest: 0.35
         mode: 0
       TwirlingCritic:
         enabled: true
