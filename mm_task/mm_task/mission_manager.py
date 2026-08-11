@@ -68,7 +68,9 @@ class MissionManager(Node):
             PoseWithCovarianceStamped, '/initialpose', latched)
         self.goto_pub = self.create_publisher(String, '/go_to', 10)
 
-        self._nav_status = None      # 最近一条 "<target>:SUCCEEDED|FAILED"
+        # 最近一条终态, 存成 (seq, "<target>:SUCCEEDED|FAILED"); seq 为 None = 对方无序号旧版
+        self._nav_status = None
+        self._seq_floor = 0          # stage_nav 下发目标前的 seq 门限, 用来滤掉上一轮旧终态
         self.create_subscription(
             String, '/lane_navigator/status', self.on_nav_status, 10,
             callback_group=cbg)
@@ -126,7 +128,16 @@ class MissionManager(Node):
 
     # ---- 订阅回调 ----
     def on_nav_status(self, msg):
-        self._nav_status = msg.data
+        """lane_navigator 终态回报: "<seq> <target>:SUCCEEDED|FAILED".
+
+        seq 单调递增, 只用来把"本轮新终态"与"上一轮的旧终态"区分开 —— 故这里只存,
+        由 stage_nav 比对。兼容无 seq 的旧格式(seq 记 None)。"""
+        raw = msg.data.strip()
+        seq, _, rest = raw.partition(' ')
+        if seq.isdigit() and rest:
+            self._nav_status = (int(seq), rest.strip())
+        else:
+            self._nav_status = (None, raw)
 
     def on_object(self, msg):
         # 存"收到时的 monotonic 墙钟时刻", 与 stage_detect 的 self.now() 同基准.
@@ -332,6 +343,12 @@ class MissionManager(Node):
     # ---- S1 NAV ----
     def stage_nav(self, target):
         self.get_logger().info(f'==== S1 导航到 {target} ====')
+        # 记下发目标**之前**已见的最大 seq: 只有 seq 比它大的终态才是本轮的回报。
+        # ⚠️ 这道判据不能省成"清 None 再等" —— 本节点若在 lane_navigator 之后启动,
+        # 且对方话题将来又被改回 latched, 一订上就会收到上一轮的旧终态, S1 会瞬间假成功
+        # (车压根没动就进 S3 抓取)。seq 让旧终态自然落在门限之下被忽略。
+        seen = self._nav_status[0] if self._nav_status else None
+        self._seq_floor = seen if seen is not None else 0
         self._nav_status = None
         self.goto_pub.publish(String(data=target))
         deadline = self.now() + self.t_nav
@@ -339,12 +356,16 @@ class MissionManager(Node):
         want_fail = f'{target}:FAILED'
         while rclpy.ok() and self.now() < deadline:
             st = self._nav_status
-            if st == want_ok:
-                self.get_logger().info(f'S1 到达 {target}')
-                return True
-            if st == want_fail:
-                self.get_logger().error(f'S1 导航失败: {target}')
-                return False
+            if st is not None:
+                seq, verdict = st
+                # seq 为 None = 对方是无序号旧版, 退回"只比字符串"(行为与改动前一致)
+                fresh = seq is None or seq > self._seq_floor
+                if fresh and verdict == want_ok:
+                    self.get_logger().info(f'S1 到达 {target}')
+                    return True
+                if fresh and verdict == want_fail:
+                    self.get_logger().error(f'S1 导航失败: {target}')
+                    return False
             self.sleep(0.1)
         self.get_logger().error(f'S1 导航超时 ({self.t_nav:.0f}s): {target}')
         return False

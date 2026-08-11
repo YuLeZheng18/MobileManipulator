@@ -411,6 +411,10 @@ Nano → 本机 (只读可视化 + 状态回报):
   /tf /tf_static /robot_description            → 本机 RViz
   /scan /map /global_costmap /local_costmap /odom /plan /arm_joint_states  → 本机 RViz
   /lane_navigator/status(String)   → 本机 mm_task(S1 完成回报)
+      格式 "<seq> <target>:SUCCEEDED|FAILED", seq 从 1 起单调递增。
+      ⚠️ 该话题**刻意不用 latched(TRANSIENT_LOCAL)**: 终态是事件不是状态, 锁存会把上一轮
+         终态重放给晚订阅者 -> 状态机重启后 S1 瞬间假成功、车没动就进 S3。订阅方必须按
+         seq 过滤"下发目标之前已见的终态", 不能只比字符串。
   /perception/object_pose(PoseStamped, 小)  → 本机 mm_task(S3 判新鲜可达)
 
 ⚠️ **图像一律不走 DDS 过网** (2026-08-04 定案)。三路画面走 Nano 上 web_video_server 的

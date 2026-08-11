@@ -105,17 +105,27 @@ class PlaceBoxHelper(Node):
                           np.array([o.x, o.y, o.z, o.w]))
 
     def on_nav_status(self, msg: String):
+        """终态格式 "<seq> <target>:SUCCEEDED|FAILED" (seq 单调递增, 兼容无 seq 的旧格式).
+
+        ⚠️ 去重必须按 seq 而不是整条字符串: 加了序号后同一个目标每次到位的字符串都不同,
+        照旧比字符串则连续两次到同一节点会被当成新事件重复摆盒。"""
         if not self.trigger_target:
             return
+        raw = msg.data.strip()
+        seq, _, rest = raw.partition(' ')
+        if seq.isdigit() and rest:
+            key, verdict = int(seq), rest.strip()
+        else:
+            key, verdict = raw, raw          # 旧格式: 退回按整条去重
         want = f'{self.trigger_target}:SUCCEEDED'
-        if msg.data != want or msg.data == self._last_handled:
+        if verdict != want or key == self._last_handled:
             return
         if self._base is None:
             self.get_logger().error(
-                f'收到 "{msg.data}" 但无 base_link 真值 (/gazebo/link_states 未到?), 不摆盒')
+                f'收到 "{raw}" 但无 base_link 真值 (/gazebo/link_states 未到?), 不摆盒')
             return
-        self._last_handled = msg.data
-        self.get_logger().info(f'收到 "{msg.data}" → 按到位实时 base_link 摆盒')
+        self._last_handled = key
+        self.get_logger().info(f'收到 "{raw}" → 按到位实时 base_link 摆盒')
         p_base, q_base = self._base
         world = p_base + q_rotate(q_base, self.off)
         ok, why = self.set_box(world, q_base)

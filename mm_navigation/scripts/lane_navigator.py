@@ -133,9 +133,18 @@ class LaneNavigator(Node):
         self.plan_pub = self.create_publisher(Path, 'lane_plan', latched)
         # 整张车道图的静态叠加(节点球+名字+边线): 起栈发一次, latched 让晚开的 RViz 也能拿到.
         self.graph_pub = self.create_publisher(MarkerArray, 'lane_graph_markers', latched)
-        # 路由终态回报(供 mm_task 状态机知悉 S1 完成/失败): "<target>:SUCCEEDED" / "<target>:FAILED".
-        # latched: 晚订阅者也能拿到最后一条终态.
-        self.status_pub = self.create_publisher(String, 'lane_navigator/status', latched)
+        # 路由终态回报(供 mm_task 状态机知悉 S1 完成/失败):
+        #   "<seq> <target>:SUCCEEDED" / "<seq> <target>:FAILED"   seq 从 1 起单调递增
+        #
+        # ⚠️ **刻意不 latched**(2026-08-11 改)。终态是**事件**不是状态, 锁存它是反模式:
+        # TRANSIENT_LOCAL 会把最后一条终态重放给任何晚订阅者 —— 状态机中途重启而本节点
+        # 没重启时, mm_task 一订上就立刻收到上一轮的 "pick1:SUCCEEDED", S1 瞬间假成功、
+        # 车压根没动就进 S3 抓取。(mission_manager.stage_nav 进来会清 _nav_status, 故正常
+        # 连跑不会踩; 只有"订阅时刻晚于上一次终态"这个窗口会踩。)
+        # 前缀 seq 是第二道防线: 订阅方比的是完整字符串, 序号让每次终态都唯一, 即便将来
+        # 有人把 QoS 改回 latched, 重放的旧序号也匹配不上本轮期望值。
+        self._status_seq = 0
+        self.status_pub = self.create_publisher(String, 'lane_navigator/status', 10)
         # cspin(起步/终点闭环对齐)的速度出口。⚠️ 必须发 /cmd_vel_spin 走 twist_mux, 不能直发
         # /cmd_vel: twist_mux 的输出就 remap 在 /cmd_vel 上, 且它在两路输入都超时时**持续发零**。
         # 直发会变成"cspin 的 wz"与"mux 的零"两个发布者在同一话题上交替 -> 固件收到
@@ -525,16 +534,23 @@ class LaneNavigator(Node):
         p.pose.orientation.w = w
         path.poses.append(p)
 
+    # ---------- status ----------
+    def publish_status(self, target, ok):
+        """发一条终态回报 "<seq> <target>:SUCCEEDED|FAILED" (seq 单调递增, 见构造函数注释)."""
+        self._status_seq += 1
+        verdict = 'SUCCEEDED' if ok else 'FAILED'
+        self.status_pub.publish(String(data=f'{self._status_seq} {target}:{verdict}'))
+
     # ---------- trigger ----------
     def on_go_to(self, msg):
         target = msg.data.strip()
         if target not in self.nodes:
             self.get_logger().error(f'Unknown node "{target}". Known: {list(self.nodes)}')
-            self.status_pub.publish(String(data=f'{target}:FAILED'))
+            self.publish_status(target, False)
             return
         pose = self.get_robot_pose()
         if pose is None:
-            self.status_pub.publish(String(data=f'{target}:FAILED'))
+            self.publish_status(target, False)
             return
         px, py, _ = pose
 
@@ -543,7 +559,7 @@ class LaneNavigator(Node):
         d_goal = math.hypot(px - tx, py - ty)
         if d_goal <= self.arrival_tol:
             self.get_logger().info(f'Already at "{target}" (dist={d_goal:.2f}m), ignoring')
-            self.status_pub.publish(String(data=f'{target}:SUCCEEDED'))
+            self.publish_status(target, True)
             return
 
         # 相同目标且仍在执行 -> 忽略重复触发(防 ros2 topic pub -r 连发抖动)
@@ -556,7 +572,7 @@ class LaneNavigator(Node):
         ne = self.nearest_edge(px, py)
         if ne is None:
             self.get_logger().error('No edges in lane graph')
-            self.status_pub.publish(String(data=f'{target}:FAILED'))
+            self.publish_status(target, False)
             return
         d_lat, qx, qy, a, b = ne
         ra, da = self.dijkstra(a, target)
@@ -569,7 +585,7 @@ class LaneNavigator(Node):
             route = rb
         else:
             self.get_logger().error(f'No route to {target}')
-            self.status_pub.publish(String(data=f'{target}:FAILED'))
+            self.publish_status(target, False)
             return
 
         route_pts = [(self.nodes[n][0], self.nodes[n][1]) for n in route]
@@ -678,7 +694,7 @@ class LaneNavigator(Node):
             return
         if self._step_idx >= len(self._steps):
             self.get_logger().info(f'Route to "{self._active_target}" complete')
-            self.status_pub.publish(String(data=f'{self._active_target}:SUCCEEDED'))
+            self.publish_status(self._active_target, True)
             self._active_target = None
             self._goal_handle = None
             self._steps = []
@@ -892,7 +908,7 @@ class LaneNavigator(Node):
         if ep != self._epoch:
             return
         self.get_logger().warn(f'Route to "{self._active_target}" failed: {why}')
-        self.status_pub.publish(String(data=f'{self._active_target}:FAILED'))
+        self.publish_status(self._active_target, False)
         self._cancel_retry_timer()
         self._cancel_cspin_timer()
         self.cmd_pub.publish(Twist())
