@@ -91,8 +91,9 @@ def generate_launch_description():
         DeclareLaunchArgument('lidar_serial_port', default_value='/dev/rplidar',
                               description='思岚 A3 雷达串口 (经 CP2102 USB-TTL; udev 软链 /dev/rplidar, 见 99-rplidar.rules; 波特 256000)'),
         DeclareLaunchArgument(
-            'map', default_value=os.path.join(mm_nav_share, 'maps', 'room.yaml'),
-            description='Nav2 地图 (默认复用仿真同图, 实机重建后替换)'),
+            'map', default_value=os.path.join(mm_nav_share, 'maps', 'room_real.yaml'),
+            description='Nav2 地图 (真机实测图, 2026-08-08 slam_toolbox 建于卧室; '
+                        '仿真图是 room.yaml, 本 launch 是 real-only 故不该拿它当默认)'),
         DeclareLaunchArgument(
             'params_file', default_value=os.path.join(mm_nav_share, 'config', 'nav2_params.yaml'),
             description='Nav2 参数 (sim/real 共用, 底盘运动学一致故可移植)'),
