@@ -424,7 +424,7 @@ global_costmap:
       # 0.30 让走廊中线重新露出可分辨的谷底, 同时仍 > robot_radius 0.22, 宽处照样居中。
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 2.5
+        cost_scaling_factor: 1.0
         inflation_radius: 0.30
       always_send_full_costmap: True
 
@@ -465,14 +465,14 @@ planner_server:
       max_planning_time: 2.0
       # 代价惩罚权重: 越大越愿意绕远走低代价区(=走廊中线), 越小越贴近最短路。
       # 2.0 是"明显居中但不至于为了躲膨胀绕大圈", 与下面全局膨胀 0.30/2.5 配套。
-      cost_travel_multiplier: 3.0
+      cost_travel_multiplier: 6.0
       # false: 末点朝向用我们传进去的目标 yaw 而不是"最后一段路径方向"。
       # 其实无所谓 —— lane_navigator 收到路径后会把**所有** pose 朝向按切线重写一遍。
       use_final_approach_orientation: false
       smoother:
         max_iterations: 1000
         w_smooth: 0.3          # 平滑权重: 抹掉栅格台阶
-        w_data: 0.3            # 贴原路径权重: 压住平滑把路径推进墙里
+        w_data: 0.1            # 贴原路径权重: 越小平滑器越能把路径推向低代价区(走廊中线)
         tolerance: 1.0e-10
 
 smoother_server:
