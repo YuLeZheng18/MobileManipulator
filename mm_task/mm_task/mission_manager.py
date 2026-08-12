@@ -77,6 +77,9 @@ class MissionManager(Node):
 
         self._last_trigger_msg = ''  # 最近一次 call_trigger 的 resp.message
         self._last_obj = None        # (stamp_sec, PoseStamped)
+        # 2026-08-12: 抓满即跳 unload. stage_grasp_shelf 抓到 tray_free=0 时置 True,
+        # run_mission 据此跳过后续 grasp task 直接到第一个 unload.
+        self._tray_full = False
         self.create_subscription(
             PoseStamped, '/perception/object_pose', self.on_object, 10,
             callback_group=cbg)
@@ -149,16 +152,27 @@ class MissionManager(Node):
         if not self.stage_init():
             self.get_logger().error('S0 初始化定位失败, 任务中止')
             return
-        for i, task in enumerate(self.tasks):
+        idx = 0
+        while idx < len(self.tasks):
+            task = self.tasks[idx]
             target = task.get('nav_target')
             action = task.get('action', 'none')
             tray = int(task.get('tray', 0))
+            # 抓满跳 unload: 托盘已满时跳过后续 grasp 任务, 直接到第一个 unload.
+            # 不在这里清 _tray_full —— unload 任务本身不被这条跳过, 跑完两个 unload 自然 DONE.
+            if self._tray_full and action == 'grasp':
+                self.get_logger().info(
+                    f'==== 任务 {idx + 1}/{len(self.tasks)}: nav={target} action=grasp '
+                    f'跳过 (托盘已满, 直接去卸货) ====')
+                idx += 1
+                continue
             self.get_logger().info(
-                f'==== 任务 {i + 1}/{len(self.tasks)}: nav={target} action={action}'
+                f'==== 任务 {idx + 1}/{len(self.tasks)}: nav={target} action={action}'
                 f'{f" tray={tray}" if action == "unload" else ""} ====')
             if not self.run_task(target, action, tray):
-                self.get_logger().error(f'任务 {i + 1} 失败, 任务序列中止')
+                self.get_logger().error(f'任务 {idx + 1} 失败, 任务序列中止')
                 return
+            idx += 1
         self.get_logger().info('==== 全部任务完成 DONE ====')
 
     def run_task(self, target, action, tray):
@@ -243,6 +257,7 @@ class MissionManager(Node):
             ok, msg = self.stage_grasp_msg(self.grasp_cli, '/grasp/execute')
             if not ok:
                 if 'TRAY_FULL' in msg:
+                    self._tray_full = True
                     self.get_logger().warn(
                         f'S4 托盘已满, 停止本货架抓取 (已抓 {picked} 个), 去卸货: {msg}')
                     break
@@ -256,6 +271,7 @@ class MissionManager(Node):
                 self.get_logger().info(f'本货架抓空 (共 {picked} 个)')
                 break
             if free_slots == 0:
+                self._tray_full = True
                 self.get_logger().warn(f'托盘已无余位 (已抓 {picked} 个), 去卸货')
                 break
         else:

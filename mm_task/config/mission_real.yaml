@@ -22,7 +22,14 @@ timeouts: { localize: 30.0, nav: 180.0, detect: 15.0, grasp: 240.0 }
 
 max_picks_per_shelf: 4
 
+# ===== 2026-08-12 任务流程调整 =====
+# 4 个 pick 一字排开抓, 任一货架抓满 (tray_free=0) 即跳过后续 grasp 直接进 unload.
+# 卸货永远先左(tray=1)后右(tray=0); place1=新 cw 位朝南, place2=东端朝北.
+# 抓满跳卸靠 mission_manager 的 self._tray_full 标志 + run_mission while-idx 跳过 grasp.
 tasks:
   - { nav_target: pick1, action: grasp }               # 货架前连抓, 抓空或两盘装满即走
-  - { nav_target: place2, action: unload, tray: 0 }     # 卸 0 号(右)托盘: 类别 3/4 的盒
-  - { nav_target: place1, action: unload, tray: 1 }     # 卸 1 号(左)托盘: 类别 1/2 的盒
+  - { nav_target: pick2, action: grasp }
+  - { nav_target: pick3, action: grasp }
+  - { nav_target: pick4, action: grasp }
+  - { nav_target: place1, action: unload, tray: 1 }     # 卸 1 号(左)托盘, 永远先卸左
+  - { nav_target: place2, action: unload, tray: 0 }     # 卸 0 号(右)托盘
