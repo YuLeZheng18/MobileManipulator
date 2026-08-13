@@ -17,11 +17,31 @@
 整机自主 = 裸起一条, 不再需要任何参数 (2026-08-13 起默认值就是整机自主):
   ros2 launch mm_bringup real_bringup.launch.py
 
+⚠️⚠️ **调试期推荐改用"人工 go"四步, 别裸起一条** (2026-08-13 定案):
+  ① Nano  ros2 launch mm_bringup real_bringup.launch.py run_mission:=false   # 全栈起, 车不动
+  ② Nano  ros2 launch mm_bringup monitor.launch.py        # 监视 (相机话题此时已在, 页面直接有画面)
+  ③ 本机  ros2 launch mm_bringup dev_bringup.launch.py    # RViz 导航视图 + 自动跳浏览器
+  --- 人工确认: AMCL 位姿收敛没 / 车在 L 胶带上没 / 三路画面都在没 ---
+  ④ 任一侧 ros2 launch mm_task mission.launch.py use_sim_time:=false \
+             mission_file:=$(ros2 pkg prefix --share mm_task)/config/mission_real.yaml
+两个理由, 都不是洁癖:
+  - **状态机一起来车就开动, 没有 go 信号** —— mission_manager 的 __init__ 里直接
+    `self._worker.start()` 拉起跑任务线程 (mission_manager.py:115). 裸起一条的实际表现是
+    "敲完命令 25 秒后车自己走", 调试期这是隐患。摘出来单起, 那条命令本身就是 go。
+  - **能省掉那笔 115s "首连税"**。stage7 的 t=25s 正撞在 move_group 的冷启动静默洞里
+    (Nano 实测 `Listening to planning_scene_world` -> `Loading planning pipeline 'ompl'`
+    静默 119s: dlopen OMPL/kinematics + 整车 URDF 建碰撞, 同时 nav2/RealSense/两路 USB
+    相机在抢核), 而 grasp_node 的 initMoveGroup() 排在 executor.spin() **之前**
+    (grasp_node.cpp:3041 vs :3043), 于是 S0 的 reset_stack 请求排队 115s 才被处理
+    (超时 240s 只是兜底, 详见 mission_manager.py 那处注释)。第 ④ 步时 move_group 早暖了,
+    reset_stack 立刻返回 —— 顺带监视全程开着也不再有争抢风险, 因为没有任何东西在掐表。
+run_mission 默认值**仍是 true** 不动: 演示/正式跑那条"一条到底"的用法要留着。
+
 抓取相关的三个开关是连带的 (少一个抓取就跑不了, 故默认一起开):
   use_cameras:=true      -> 车体两路 USB + 手眼 D435i (align_depth 必开, 在 cameras.launch.py 里)
   use_perception:=true   -> yolo_box_detector 吃 D435i 出 /perception/object_pose 等
   run_mission:=true      -> mm_task 串起 S0-S5 (mission_file 默认已指到 mission_real.yaml)
-要只起栈不动车: run_mission:=false; 建图: use_nav2:=false use_perception:=false run_mission:=false
+要只起栈不动车: run_mission:=false (即上面第 ① 步); 建图: use_nav2:=false use_perception:=false run_mission:=false
 
 ⚠️ 运行前置 (目标机 Nano 上现装/现 source, 不进本 colcon ws):
   - micro_ros_agent: 需先 `source ~/microros_ws/install/setup.bash` 再起本 launch,

@@ -15,7 +15,11 @@
   nav2_container/RealSense/两路 USB 相机在抢核), grasp_node 的 MoveGroupInterface 死等
   这一段, 连带 S0 的 reset_stack 排队 115s (原超时 120s 只剩 5s 余量)。
   看画面是"人要看才开"的事, 独立一条就不会在那个窗口里跟 move_group 抢核。
-  **起栈头两分钟别开浏览器。**
+  **裸起 real_bringup (run_mission 默认 true) 时: 起栈头两分钟别开浏览器。**
+  走 real_bringup 那边推荐的"人工 go"四步则**没有这条限制** —— 状态机是最后单起的,
+  冷启动期间没有任何东西在掐表, 慢一点也不会失败, 监视可以全程开着。
+  (顺带: 本 launch 空跑几乎不花钱 —— web_video_server 空闲时 0% CPU, 真正开始编码是
+   **浏览器连上 8080 那一刻**。所以"别开浏览器"这条约束的对象是页面, 不是这条 launch。)
 
 为什么不走 ROS 跨机订阅 (2026-08-04 定案, 折腾一整晚的结论):
   ROS/DDS 不是为跨 WiFi 传视频设计的 —— 可靠传输 + 每订阅者一份独立拷贝 + 全网发现,
