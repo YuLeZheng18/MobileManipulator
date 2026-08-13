@@ -334,8 +334,9 @@ public:
     // 落进托盘沉多少), 与它摞在第几层无关.
     // 2026-07-30 实跑标定: 先全取 -0.010, 0 号盘两盒观察到类别3(12mm) 压多了要抬 2mm ->
     //   -0.008, 类别4(15mm) 还要再压 2mm -> -0.012. 类别 1/2 尚无观察, 暂留 -0.010.
+    // 2026-08-13 实跑观察: 卸货取盒下插普遍不够, 吸不到盒子, 四类统一再下压 5mm.
     unload_pick_shortfall_ = getOrDeclare<std::vector<double>>(
-      "unload_pick_shortfall", {-0.010, -0.010, -0.008, -0.012});
+      "unload_pick_shortfall", {-0.015, -0.015, -0.013, -0.017});
 
     // 卸货点释放朝向 (吸盘朝下, yaw≈-90°), 2026-07-30 RViz 实标两点读得且两点一致.
     // 必须与托盘释放朝向 (tray_q*, yaw≈-175°) 区分: 后者为对齐托盘围栏左旋过, 沿用它
@@ -766,6 +767,10 @@ public:
         for (auto & poses : placed_poses_) poses.clear();
         for (auto & rel : placed_release_) rel.clear();   // 卸货取回用的吸盘位姿
         for (auto & th : placed_th_) th.clear();
+        // 下面的命名规则盲扫 + removePlacedViaService 已经把 placed_unloaded_* 清了,
+        // 自知清单也一并清空, 否则下一次 unloadTray 会拿着已经不存在的 id 去删,
+        // 白白多打一次(无害但吵)日志.
+        ground_placed_ids_.clear();
         // 兜底: 即便 placed_ids_ 空(计数漏追踪), 也按命名规则扫一遍清残留.
         // placed_unloaded_* 也要扫: 它是卸到**地面**的盒, 从不进 placed_ids_(那是托盘的账),
         // 所以上面那圈 placed_ids_ 完全覆盖不到它, 只能靠这里按命名清。
@@ -963,6 +968,15 @@ private:
       return;
     }
 
+    // 取本轮开工前(仍在上一轮收尾的 look 位)已知的候选数: 这一帧是本轮 pickCycle 挑
+    // 目标盒时相机看到的现状, 已经包含"即将被吸走的这一个". 若当时就只看到 1 个,
+    // 吸走后剩 0 个是必然结论, 不需要再摆回 look 拍一帧去确认同一件事.
+    int pre_pick_left = 0;
+    {
+      std::lock_guard<std::mutex> lk(poses_mtx_);
+      pre_pick_left = last_pick_count_;
+    }
+
     std::string err;
     // 盒 attach 后豁免与托盘接触: 放到位时盒底本就落在托盘面(标定 tray_z 比 Link_11 网格
     // 顶面低几 mm), 不豁免则直下段被判碰撞截断. 侧蹭边框的顾虑已由"正上方->垂直直下"
@@ -974,6 +988,20 @@ private:
     }
     // 放置成功才计入堆叠: 层数+1, 累计厚度 += 本层厚度, 并留持久碰撞体.
     pushLayer(tray, thickness, target);
+
+    // 货架取前就只看到这一个 -> 吸走后必然剩 0, 直接报完工, 不摆 look (2026-08-13 改):
+    // 状态机只等 pickable=0 就会转去下一步(离开货架前它自己会调 /grasp/ready), 回 look
+    // 只是白走一趟空行程, 且不产生任何新信息.
+    if (pre_pick_left <= 1) {
+      const int free_slots = trayFreeTotal();
+      RCLCPP_INFO(logger_,
+                  "==== 抓放一轮完成 (%s, 累计高 %.1fmm), 取前候选数 %d -> 货架已空, 不回 look ====",
+                  what, trayStackH(tray) * 1000, pre_pick_left);
+      res->success = true;
+      res->message = std::string("grasp cycle done: ") + what +
+                     ", shelf empty, skip look, pickable=0, tray_free=" + std::to_string(free_slots);
+      return;
+    }
 
     // 收尾摆到 look 而非 ready (2026-07-31 改): 下一轮开工需要的姿态是 look 不是 ready ——
     // pickCycle 第一步就取 object_pose, 前提是相机已经对着货物. 原先回 ready 使得同一货架
@@ -1233,6 +1261,43 @@ private:
     return true;
   }
 
+  // 清掉 ground_placed_ids_ 里记录的地面卸货碰撞体 (unloadTray 每次进入时调, 清上一趟残留).
+  // ⚠️ 不走 listSceneObjects() 现查现场再筛: 那条查询用的是 get_planning_scene 服务,
+  // 2026-08-13 实测在 move_group 负载高时会卡住/超时, 而 if(查询失败) 分支当时被写成
+  // "静默跳过、不打日志" —— 结果就是清理代码确实跑了、但因服务没响应啥也没删,
+  // RViz 上上一趟卸的盒子还挂在原地, 且日志里完全看不出发生过这次失败(2026-08-13 实跑,
+  // 卸 1 号盘的两个盒残留到卸 0 号盘还在场景里, 挡直下段).
+  // 改成直接删"我们自己记的 id" —— 加盒时 push 进 ground_placed_ids_(见 addPlacedBox
+  // 调用处), 这里直接对着这份自知清单发 REMOVE, 不需要先问 move_group "现在有哪些".
+  // REMOVE 的通道用 apply_planning_scene 同步服务(与 removePlacedViaService 同一套):
+  // PSI/话题直发都是异步、生效时机不定, 只有这个服务的返回才是"删没删掉"的权威判据.
+  bool removeGroundBoxesViaService()
+  {
+    if (ground_placed_ids_.empty()) return true;
+    if (!apply_scene_cli_->wait_for_service(2s)) {
+      RCLCPP_WARN(logger_, "清上一趟卸货点残留: apply_planning_scene 服务不可用, 留着下次再试");
+      return false;
+    }
+    auto req = std::make_shared<moveit_msgs::srv::ApplyPlanningScene::Request>();
+    req->scene.is_diff = true;
+    req->scene.robot_state.is_diff = true;
+    for (const auto & id : ground_placed_ids_) {
+      moveit_msgs::msg::CollisionObject co;
+      co.id = id;
+      co.header.frame_id = base_frame_;
+      co.operation = co.REMOVE;
+      req->scene.world.collision_objects.push_back(co);
+    }
+    auto fut = apply_scene_cli_->async_send_request(req);
+    if (fut.wait_for(5s) != std::future_status::ready) {
+      RCLCPP_WARN(logger_, "清上一趟卸货点残留: apply_planning_scene 无响应, 留着下次再试");
+      return false;
+    }
+    RCLCPP_INFO(logger_, "清掉上一趟卸货点残留 %zu 个碰撞体", ground_placed_ids_.size());
+    ground_placed_ids_.clear();
+    return true;
+  }
+
   // 临时移出某托盘的所有已落盒 (放同盘下一层时它们正是落点, 不能当障碍挡住直下段).
   //
   // ⚠️ 必须走 apply_planning_scene 同步等回执, 不能用 psi_->removeCollisionObjects():
@@ -1353,6 +1418,14 @@ private:
                 single ? "单个" : "整盘", tray, n, rounds,
                 unload_base_x_, unload_base_y_, unload_x_offset_ * 1000, unload_z_);
 
+    // 卸货点碰撞体用 base_link 系记录 (机身系), 车挪到下一个卸货位后上一趟登记的
+    // placed_unloaded_* 相当于"跟着机身瞬移"到了新位置附近, 变成幽灵碰撞体挡住这里的
+    // 直下段 (2026-08-13 实跑: RViz 里 place1 卸的两个盒一直没消失, 疑似此前卡在覆盖
+    // 93-96% 的放置失败与其有关, 未 100% 确认因果, 但清掉总没有坏处). 每次进 unloadTray
+    // 先清一遍上一趟的残留 —— 此刻本盘还没放任何新盒, ground_placed_ids_ 里的必然都是
+    // "上一趟"的, 清了不会误删本趟的. single 模式本来就不登记(见下), 不需要清.
+    if (!single) removeGroundBoxesViaService();
+
     for (int i = 0; i < rounds; ++i) {
       // seq 单调递增(到 reset_stack 归零), 落点 k = seq % 点数. 碰撞体 id 用 seq 而不是 k:
       // k 会绕回, 复用 id 等于把上一个盒的碰撞体挪走 —— 地上那个盒就此脱管, 下次规划不避它。
@@ -1427,8 +1500,10 @@ private:
       // 从它头上过, 规划直接判碰撞. 整盘模式(mm_task 自动跑)没人取盒, 盒确实还在地上,
       // 那里必须登记.
       if (!single) {
-        addPlacedBox("placed_unloaded_" + std::to_string(tray) + "_" + std::to_string(seq),
-                     boxCenterFromRelease(dest, thickness));
+        const std::string ground_id =
+          "placed_unloaded_" + std::to_string(tray) + "_" + std::to_string(seq);
+        addPlacedBox(ground_id, boxCenterFromRelease(dest, thickness));
+        ground_placed_ids_.push_back(ground_id);
       }
       // 这一个确实落地了才推进 slot: 上面任一步失败都 return, 计数器不动, 重试仍用同一点.
       unload_seq_ += 1;
@@ -2846,6 +2921,10 @@ private:
   std::vector<double> unload_transit_candidates_;  // 卸货 transit 高度候选, 从低到高试
   std::vector<double> transit_candidates_;         // 装货(放托盘) transit 高度候选, 同上
   std::vector<double> unload_pick_shortfall_;    // 按 category_ids 顺序的取盒下压量
+  // 卸到地面的盒 id (placed_unloaded_*), 只在真机整盘模式登记. 不进 placed_ids_(那是
+  // 托盘的账), 单独一份供下一次 unloadTray 开头精确清理 —— 直接删自知清单, 不问
+  // move_group "现在有哪些"(那条查询用的服务不稳定, 见 removeGroundBoxesViaService).
+  std::vector<std::string> ground_placed_ids_;
   geometry_msgs::msg::Quaternion unload_quat_;   // 卸货点释放朝向 (实标, 非托盘朝向)
   double plan_velocity_scaling_, rotate_velocity_scaling_;
 
