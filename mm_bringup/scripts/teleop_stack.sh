@@ -3,8 +3,9 @@
 #   ssh dong@<nano> 'bash ~/Desktop/moveit/install/mm_bringup/share/mm_bringup/scripts/teleop_stack.sh restart'
 #
 #   start    起栈 (nohup 到 logs_d29/, 立即返回)
-#   stop     清栈 (含孤儿), 打印残留
-#   check    核实单实例 + 关键参数 + CAN + 臂反馈频率
+#   stop     清整机全栈(臂+导航, 含孤儿), 打印残留, 残留为 0 时顺手删 /dev/shm 孤儿段
+#   shm      单独跑一次 /dev/shm 孤儿段清理 (手动杀过进程之后用)
+#   check    核实单实例 + 关键参数 + CAN + 臂反馈频率 + /dev/shm 段数
 #   restart  stop -> start -> 等 50s -> check
 #
 # ⚠️ 为什么这些动作必须写成脚本文件, 不能内联进 ssh 命令:
@@ -31,9 +32,25 @@ SESSION=mmstack
 #   terminate called after throwing an instance of 'char*'  -> exit code -6
 # 而 cam_b **照样有画面**(旧进程还在发), cam_a 没有旧进程就彻底黑掉 ——
 # 于是"两路相机一路好一路坏"看着像设备问题, 其实是清栈没清净。
+#
+# ⚠️ 2026-08-13 补入**导航那半边**。此前 PATS 只有机械臂一半, 于是 `stop` 完 nav2 / amcl /
+# ekf_node / lane_navigator / rplidar 全都还活着变成孤儿。后果不只是"新旧混跑":
+# 它们每个都是一个 DDS participant, 各自占着 /dev/shm/fastrtps_* 段, 被下一轮 pkill -9
+# 收掉时**跳过析构**, 段就永久留在那 —— 这就是"总是泄漏、来回折腾"的直接来源
+# (段涨到几十个后服务 response 投不出去, 表现成假死锁, 见记忆 dev_shm_fastrtps_leak)。
+# 所以本脚本的 stop 是**停整机全栈**(臂 + 导航), 不是只停 teleop 那几个。
 PATS="grasp_node joy_arm_teleop move_group ros2_control_node robot_state_publisher \
 micro_ros_agent servo_node yolo_box_detector realsense2_camera joy_node teleop_node \
-teleop_twist_joy can_bridge republish ros2launch usb_cam_node_exe image_rotator"
+teleop_twist_joy can_bridge republish ros2launch usb_cam_node_exe image_rotator \
+lane_navigator mission_manager aruco_localizer chassis_diag_logger \
+controller_server planner_server bt_navigator behavior_server smoother_server \
+waypoint_follower velocity_smoother lifecycle_manager map_server amcl \
+scan_to_scan_filter_chain twist_mux ekf_node rplidar_composition"
+
+# 残留核实用的匹配式。除了点名的进程, 还兜一层"凡是从 ros 安装空间起来的东西",
+# 这样连没点名的节点(临时手起的、rviz2)也会被算进残留 —— 删 /dev/shm 段前必须确认
+# 一个 participant 都不剩, 漏算一个就会把活着的进程打断。
+RESIDUAL_RE='grasp_node|joy_arm|move_group|ros2_control|state_publisher|micro_ros|realsense|yolo_box|can_bridge|servo_node|teleop|usb_cam|image_rotator|lane_navigator|mission_manager|aruco|nav2_|amcl|ekf_node|twist_mux|rplidar|scan_to_scan|/opt/ros/humble/lib/'
 
 # check 用的进程清单 (期望各 1 个)
 SINGLETONS="can_bridge grasp_node joy_arm_teleop move_group ros2_control_node \
@@ -47,18 +64,51 @@ _src() {
   export ROS_DOMAIN_ID=42
 }
 
+_residual() {
+  ps -eo pid,ppid,etimes,cmd --no-headers 2>/dev/null \
+    | grep -Ei "$RESIDUAL_RE" | grep -v grep | grep -v teleop_stack.sh
+}
+
+# 删 Fast-DDS 共享内存段。**只在残留为 0 时执行**。
+# 这些段由每个 participant 在构造时创建、在**析构**时删除; kill -9 与节点崩溃都跳过析构,
+# 段就成了孤儿留在 /dev/shm。反复起停栈 = 每次留一批, 攒到几十个之后服务的 response
+# 投不出去(服务端回调明明跑完了, 客户端 future 永不完成, 干等到超时), 看着像死锁。
+# 处置就是删段, **不用重启整机**。
+# ⚠️ 必须先确认没有活着的 participant: 删掉活进程正在用的段, 会当场打断它。
+do_shmclean() {
+  local before after left
+  before=$(ls /dev/shm 2>/dev/null | grep -c fastrtps)
+  left=$(_residual | wc -l)
+  if [ "$left" -ne 0 ]; then
+    echo "!!! 仍有 $left 个 ROS 进程活着, 跳过 /dev/shm 清理 (当前 fastrtps 段 $before 个)"
+    echo "    删掉活进程正在用的段会当场打断它。先关掉上面列出的进程(rviz2 也算), 再跑: $0 shm"
+    return 1
+  fi
+  rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* 2>/dev/null
+  after=$(ls /dev/shm 2>/dev/null | grep -c fastrtps)
+  echo "=== /dev/shm fastrtps 段: $before -> $after (健康是 0; 起栈后个位数正常) ==="
+}
+
 do_stop() {
-  # 连 tmux 会话一起收掉, 否则会话空转着, 下次 tmux 子命令会报"已存在"而拒起。
-  tmux kill-session -t "$SESSION" 2>/dev/null
-  pkill -f "ros2 launch" 2>/dev/null
-  sleep 2
-  for p in $PATS; do pkill -f "$p" 2>/dev/null; done
-  sleep 3
+  # tmux 会话: 先往里送 Ctrl-C 走正常 shutdown, 等它自己收完再 kill-session。
+  # 直接 kill-session 等于抽掉进程组, launch 里的节点全部跳过析构 —— 段就是这么漏的。
+  if tmux has-session -t "$SESSION" 2>/dev/null; then
+    tmux send-keys -t "$SESSION" C-c 2>/dev/null
+    sleep 5
+    tmux kill-session -t "$SESSION" 2>/dev/null
+  fi
+  # SIGINT 而非默认 SIGTERM: rclcpp/rclpy 把 SIGINT 接成"优雅退出", 会跑完析构
+  # (DDS participant 析构才会删掉自己的 /dev/shm 段)。SIGTERM 走的是不保证的路径。
+  pkill -INT -f "ros2 launch" 2>/dev/null
+  sleep 4                                   # 给 launch 时间把 SIGINT 传下去并等子进程收尾
+  for p in $PATS; do pkill -INT -f "$p" 2>/dev/null; done
+  sleep 4
+  # 到这一步还赖着不走的才动 -9。顺序不能反: 一上来 pkill -9 就是漏段的元凶。
   for p in $PATS; do pkill -9 -f "$p" 2>/dev/null; done
   sleep 2
   echo "=== 残留 (应为空) ==="
-  ps -eo pid,ppid,etimes,cmd | grep -Ei 'grasp_node|joy_arm|move_group|ros2_control|state_publisher|micro_ros|realsense|yolo_box|can_bridge|servo_node|teleop|usb_cam|image_rotator' \
-    | grep -v grep | grep -v teleop_stack.sh | cut -c1-95
+  _residual | cut -c1-95
+  do_shmclean
   echo "=== STOPPED ==="
 }
 
@@ -95,6 +145,10 @@ do_tmux() {
 
 do_check() {
   _src
+  # 段数放最前面: 服务超时/假死锁时这是第一个该看的数, 不是节点代码。
+  # 起栈后个位数正常; 几十个 = 前几轮没杀干净, 服务 response 随时会投不出去。
+  echo "=== /dev/shm fastrtps 段数 (个位数正常, 几十个=该 stop 一次) ==="
+  ls /dev/shm 2>/dev/null | grep -c fastrtps
   echo "=== 单实例 (应全为 1) ==="
   for p in $SINGLETONS; do
     n=$(ps -eo cmd | grep -F "$p" | grep -v grep | grep -v teleop_stack.sh | wc -l)
@@ -116,8 +170,9 @@ case "${1:-check}" in
   start)   do_start ;;
   tmux)    do_tmux ;;
   stop)    do_stop ;;
+  shm)     do_shmclean ;;
   check)   do_check ;;
   restart) do_stop; do_start; sleep 50; do_check ;;
   retmux)  do_stop; do_tmux; sleep 50; do_check ;;
-  *) echo "用法: $0 {start|tmux|stop|check|restart|retmux}"; exit 1 ;;
+  *) echo "用法: $0 {start|tmux|stop|shm|check|restart|retmux}"; exit 1 ;;
 esac
