@@ -282,8 +282,14 @@ controller_server:
       ObstaclesCritic:
         enabled: true
         cost_power: 1
-        repulsion_weight: 0.03
-        critical_weight: 12.0
+        # 2026-08-14 再放宽 0.03/12.0 -> 0.01/8.0 ("路径靠墙就不敢走"):
+        # place1->place2 那趟实测 25 次恢复里有两次**规划是成功的**(75/68 poses),
+        # 却在 0.7s 内 FollowPath abort —— 即路有, 是 MPPI 自己判贴墙轨迹代价过高而放弃。
+        # repulsion 管"靠近软膨胀就减速躲", critical 管"临近硬禁区的陡罚";
+        # 走廊净距只有 0.300m, 贴墙是常态不是异常, 这两条压低才谈得上敢过。
+        # 真正的硬保护仍是 robot_radius(下方 0.20) + collision_margin_distance(0.02), 没动。
+        repulsion_weight: 0.01
+        critical_weight: 8.0
         consider_footprint: false
         collision_cost: 10000.0
         collision_margin_distance: 0.02
@@ -386,8 +392,17 @@ local_costmap:
       #    起点和终点自转, 那两处是标定过的停靠位, 净距 0.35~0.70 都 >= 0.3097。
       #    真正的风险是"车在窄处被逼停后重规划、在走廊里自转", 靠 vy_max=0.05 + 切线锁头
       #    使车在走廊内只能直行穿过来规避。若哪天看到托盘蹭墙, 第一个该回调的就是这里。
-      robot_radius: 0.22
-      # 显式 0.0: nav2 默认 0.01, 会悄悄把上面的半径再撑 1cm(0.22 -> 0.23)。
+      # ===== 0.22 -> 0.20 (2026-08-14, 同一句诉求的第二轮: "路径靠墙他不敢走") =====
+      # 这是**硬禁区**半径, 也是 place2 那 100s 卡死的直接原因: 25 次恢复里 23 次报
+      # `replan failed (status 6)` —— SmacPlanner2D 判**起点**落在 >=253 的内切禁区内就
+      # 拒绝出路, 无论目标多空旷。倒车脱困(0.20m x 5 次)全试过无效, 说明那个坑比 20cm 宽,
+      # 收禁区比加大倒车更对症。
+      #   R=0.22 -> 中线带宽 16.0cm    R=0.20 -> 20.0cm (定位误差 5~6cm 的 3.3 倍)
+      # 真实半宽 0.187, 故 0.20 仍留 1.3cm 余量, 车身本体不会真蹭。
+      # ⚠️ 但托盘那一截(真外接圆 0.3097)欠保护从 9.0cm 扩大到 11.0cm。原注释那条纪律不变:
+      #   **看到托盘蹭墙, 第一个回调的就是这里**, 回 0.22 而不是去动别的。
+      robot_radius: 0.20
+      # 显式 0.0: nav2 默认 0.01, 会悄悄把上面的半径再撑 1cm(0.20 -> 0.21)。
       # 数值小但方向错 —— 这一版的整个意图是把禁区收紧到刚好够用, 留着默认值等于漏算。
       footprint_padding: 0.0
       plugins: ["obstacle_layer", "inflation_layer"]
@@ -428,10 +443,10 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_link
       use_sim_time: false
-      # robot_radius 必须与 local_costmap **逐字一致** (取 0.22 的完整依据见那边注释)。
+      # robot_radius 必须与 local_costmap **逐字一致** (取 0.20 的完整依据见那边注释)。
       # 两处不一致的后果: 全局小了会规划出局部走不了的路 (局部判 INSCRIBED 直接卡住),
       # 大了则过保守。⚠️ 与 footprint 互斥, 换成 robot_radius 时前者必须删掉。
-      robot_radius: 0.22
+      robot_radius: 0.20
       footprint_padding: 0.0
       resolution: 0.05
       track_unknown_space: true
