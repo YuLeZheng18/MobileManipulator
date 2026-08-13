@@ -42,7 +42,7 @@ from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoS
 
 from action_msgs.msg import GoalStatus
 from nav2_msgs.action import FollowPath, ComputePathToPose
-from nav2_msgs.srv import ClearEntireCostmap
+from nav2_msgs.srv import ClearEntireCostmap, IsPathValid
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped, Twist
 from std_msgs.msg import String
@@ -94,6 +94,39 @@ class LaneNavigator(Node):
         # 快重试用尽后进入"慢恢复"的重试周期(秒): 不放弃路线, 持续重规划等障碍移开
         # -> 障碍没了就自动接着往目标走(不永久死停). 设大一点避免堵死时狂刷规划.
         self.declare_parameter('recovery_retry_delay', 2.0)
+        # ===== 卡住看门狗(2026-08-13 新增) =====
+        # 背景: drive 段受阻只能靠 FollowPath 的 action 结果不是 SUCCEEDED 来触发上面的
+        # 快重试/慢恢复, 而这个结果由 controller_server 的 progress_checker 判定 ——
+        # 它的 movement_time_allowance 之前从 3.0 调到 10.0(为了让到点前的低速蠕动不被
+        # 误判 ABORT, 见 nav2_params.yaml), 副作用是人往车前一站, 车要在原地"愣" 10s
+        # 才等到那个 ABORT, 用户观感是"等待犹豫"。旧路网时代靠 vy 横移绕障"反应快",
+        # 现在纯规划 + vy_max 压到 0.1(用户已接受的取舍), 横移躲不动, 只能靠重规划,
+        # 而重规划的触发本身太慢。
+        # 做法: 不碰 movement_time_allowance(它仍保护到点蠕动这个原用途), 而是在本节点
+        # 自己独立监视 drive 段的位移 —— 短时间窗口内几乎没挪动就直接 cancel 当前
+        # FollowPath goal。取消后 on_goal_result 收到非 SUCCEEDED, 走的还是原有那套
+        # "drive 段失败 -> 快重试 -> 慢恢复"逻辑, 只是触发信号从"等 10s"变成"1s 出头"。
+        self.declare_parameter('stuck_check_interval', 0.3)   # 看门狗采样周期(秒)
+        self.declare_parameter('stuck_window', 1.2)           # 判定窗口(秒): 这段时间内的位移
+        self.declare_parameter('stuck_radius', 0.04)          # 窗口内位移小于它(米)才算"卡住"
+        self.declare_parameter('stuck_grace', 1.0)            # drive 起步宽限期(秒): 刚起步加速
+                                                               # 阶段位移天然小, 不算卡住
+        # 快到目标时豁免看门狗: 交给 nav2 自己的到点判定收尾, 不要在最后蠕动阶段被误判
+        # "卡住"抢着 cancel, 那样反而打断即将成功的到点。
+        self.declare_parameter('near_goal_skip_radius', 0.15)
+        # ===== 路径失效巡检(2026-08-13 新增): "遇见障碍马上规划新路径" =====
+        # 上面那个卡住看门狗是**事后**判据 —— 必须先等车真的停住 stuck_window(1.2s) 才反应,
+        # 观感仍是"先愣一下再绕"。本巡检是**事前**判据: 直接问 planner_server 当前这条路
+        # 还通不通, 人一站进路径就立刻触发重规划, 车不必先被逼停。
+        # 单开 Nav2(bt_navigator)时之所以"人一站路径立刻绕开", 正是因为它的行为树里挂着
+        # 1Hz 的重规划; lane_navigator 绕过 bt_navigator 直调 planner_server, 就没有这一环,
+        # 本节补的就是它。
+        # ⚠️ 服务由 planner_server 提供, 名字是相对名解析出来的 /is_path_valid (不是
+        #    /planner_server/is_path_valid —— 相对名按**命名空间**解析, 与节点名无关)。
+        #    拿不到服务时本巡检自动降级为不启用, 由卡住看门狗兜底, 不影响原有行为。
+        self.declare_parameter('path_check_enabled', True)
+        self.declare_parameter('path_check_interval', 0.5)   # 巡检周期(秒)
+        self.declare_parameter('is_path_valid_service', '/is_path_valid')
         self.arrival_tol = self.get_parameter(
             'arrival_tolerance').get_parameter_value().double_value
         self.start_yaw_tol = self.get_parameter(
@@ -118,6 +151,22 @@ class LaneNavigator(Node):
             'drive_retry_delay').get_parameter_value().double_value
         self.recovery_retry_delay = self.get_parameter(
             'recovery_retry_delay').get_parameter_value().double_value
+        self.stuck_check_interval = self.get_parameter(
+            'stuck_check_interval').get_parameter_value().double_value
+        self.stuck_window = self.get_parameter(
+            'stuck_window').get_parameter_value().double_value
+        self.stuck_radius = self.get_parameter(
+            'stuck_radius').get_parameter_value().double_value
+        self.stuck_grace = self.get_parameter(
+            'stuck_grace').get_parameter_value().double_value
+        self.near_goal_skip_radius = self.get_parameter(
+            'near_goal_skip_radius').get_parameter_value().double_value
+        self.path_check_enabled = self.get_parameter(
+            'path_check_enabled').get_parameter_value().bool_value
+        self.path_check_interval = self.get_parameter(
+            'path_check_interval').get_parameter_value().double_value
+        self.is_path_valid_service = self.get_parameter(
+            'is_path_valid_service').get_parameter_value().string_value
         graph_path = self.get_parameter('lane_graph').get_parameter_value().string_value
         if not graph_path:
             from ament_index_python.packages import get_package_share_directory
@@ -163,6 +212,9 @@ class LaneNavigator(Node):
         self._planner_client = ActionClient(self, ComputePathToPose, 'compute_path_to_pose')
         self._clear_costmap_client = self.create_client(
             ClearEntireCostmap, '/global_costmap/clear_entirely_global_costmap')
+        # 路径失效巡检: planner_server 拿当前 global_costmap 校验整条路径是否仍无碰撞
+        self._path_valid_client = self.create_client(
+            IsPathValid, self.is_path_valid_service)
 
         # 状态机状态:
         #   _active_target : 当前正在追的目标名(None = 空闲)
@@ -182,6 +234,22 @@ class LaneNavigator(Node):
         self._retry_timer = None
         #   _cspin_timer   : 终点闭环对齐控制定时器(20Hz); 抢占/失败/完成时取消并停车
         self._cspin_timer = None
+        #   _stuck_timer/_stuck_hist/_drive_start_t : 卡住看门狗(见上面参数注释),
+        #   只在 drive 步骤在途时跑, goal 结束/抢占时随其他定时器一起清.
+        self._stuck_timer = None
+        self._stuck_hist = []
+        self._drive_start_t = None
+        #   _path_timer    : 路径失效巡检定时器, 与卡住看门狗同生命周期(drive 在途时跑)
+        #   _cur_path      : 当前正在跟随的路径, 巡检拿它去问 planner 还通不通
+        #   _path_check_busy: 上一次 IsPathValid 还没回来时跳过本拍, 防止请求堆积
+        #   _proactive_replan: 本次 goal 的终止是"巡检主动 cancel"而非真失败。
+        #                    on_goal_result 据此立刻重规划且**不计入重试次数** ——
+        #                    动态障碍频繁触发时不该把 drive_max_retries 烧光而掉进慢恢复。
+        self._path_timer = None
+        self._cur_path = None
+        self._path_check_busy = False
+        self._proactive_replan = False
+        self._path_valid_warned = False
 
         self.publish_graph_markers()
 
@@ -428,6 +496,9 @@ class LaneNavigator(Node):
             self._goal_handle.cancel_goal_async()
             self._goal_handle = None
         self._cancel_retry_timer()
+        self._cancel_stuck_timer()
+        self._cancel_path_timer()
+        self._proactive_replan = False   # 抢占后旧旗作废, 否则会污染新路线的首个结果
         if self._cspin_timer is not None:  # 抢占在途闭环对齐: 停转并清定时器
             self._cancel_cspin_timer()
             self.cmd_pub.publish(Twist())
@@ -613,6 +684,7 @@ class LaneNavigator(Node):
         goal.path = path
         goal.controller_id = 'FollowPath'
         goal.goal_checker_id = 'general_goal_checker'
+        self._cur_path = path          # 供路径失效巡检使用
         fut = self._follow_client.send_goal_async(goal)
         fut.add_done_callback(lambda f: self.on_goal_accept(f, ep))
 
@@ -635,9 +707,15 @@ class LaneNavigator(Node):
             self.fail_route(ep, f'step {self._step_idx} goal rejected')
             return
         self._goal_handle = handle
+        # 只有 drive 步骤会走到这里且需要看门狗(cspin 靠自己的定时器控速, 不发 FollowPath).
+        if self._steps[self._step_idx][0] == 'drive':
+            self._start_stuck_watchdog(ep)
+            self._start_path_watchdog(ep)
         handle.get_result_async().add_done_callback(lambda f: self.on_goal_result(f, ep))
 
     def on_goal_result(self, fut, ep):
+        self._cancel_stuck_timer()  # goal 已终结(成功/取消/中止), 看门狗跟着下岗
+        self._cancel_path_timer()
         if ep != self._epoch:
             return  # 旧路线(被抢占)的结果, 不推进新路线
         self._goal_handle = None
@@ -646,6 +724,14 @@ class LaneNavigator(Node):
             self._retry_count = 0
             self.advance_step(ep)
             return
+        # 巡检发现路径被挡而主动 cancel: 立刻重规划绕行, 不走延时重试、不计重试次数。
+        # (真失败才该消耗重试预算; 主动重规划是正常绕障, 消耗它会让人在旁边走动几次就
+        #  掉进 2s 一次的慢恢复, 车变得很迟钝。)
+        if self._proactive_replan:
+            self._proactive_replan = False
+            if self._steps[self._step_idx][0] == 'drive':
+                self._retry_drive(ep)
+                return
         # drive 段失败(动态障碍逼停等): 延时重试本段(重取当前位姿重规划绕障)而非放弃
         if self._steps[self._step_idx][0] == 'drive':
             self._schedule_retry_or_fail(ep, f'status {status}')
@@ -729,6 +815,143 @@ class LaneNavigator(Node):
             self.destroy_timer(self._retry_timer)
             self._retry_timer = None
 
+    def _start_stuck_watchdog(self, ep):
+        """drive 段 goal 一被接受就起这个表, 独立于 nav2 自己的 progress_checker
+        判定"卡住"并主动 cancel, 让重规划不必等 controller 内部 10s 才反应.
+        cancel 之后走的还是 on_goal_result 里原有的失败分支(快重试/慢恢复), 这里
+        不重复那套逻辑, 只负责"更快地产生一次失败结果"。"""
+        self._cancel_stuck_timer()
+        self._stuck_hist = []
+        self._drive_start_t = self.get_clock().now()
+        self._stuck_timer = self.create_timer(
+            self.stuck_check_interval, lambda: self._stuck_tick(ep))
+
+    def _stuck_tick(self, ep):
+        if ep != self._epoch or self._goal_handle is None:
+            self._cancel_stuck_timer()
+            return
+        pose = self.get_robot_pose()
+        if pose is None:
+            return
+        now = self.get_clock().now()
+        px, py, _ = pose
+        # drive 步骤存的是 ('drive', path, goal_xy, last_heading)
+        goal_xy = self._steps[self._step_idx][2]
+        if math.hypot(px - goal_xy[0], py - goal_xy[1]) < self.near_goal_skip_radius:
+            self._stuck_hist = []  # 快到目标: 交给 nav2 自己的到点判定, 不掺和
+            return
+        if (now - self._drive_start_t).nanoseconds / 1e9 < self.stuck_grace:
+            return  # 起步加速阶段, 位移天然小, 还在宽限期内
+        self._stuck_hist.append((now, px, py))
+        while self._stuck_hist and \
+                (now - self._stuck_hist[0][0]).nanoseconds / 1e9 > self.stuck_window:
+            self._stuck_hist.pop(0)
+        if len(self._stuck_hist) < 2:
+            return
+        t0, x0, y0 = self._stuck_hist[0]
+        span = (now - t0).nanoseconds / 1e9
+        if span < self.stuck_window * 0.8:
+            return  # 窗口还没攒够, 再等几拍
+        if math.hypot(px - x0, py - y0) < self.stuck_radius:
+            self.get_logger().warn(
+                f'[step {self._step_idx}] Blocked (moved <{self.stuck_radius * 100:.0f}cm '
+                f'in {span:.1f}s) -> cancel now & replan, not waiting for nav2 progress_checker')
+            self._cancel_stuck_timer()
+            handle = self._goal_handle
+            if handle is not None:
+                handle.cancel_goal_async()
+
+    def _cancel_stuck_timer(self):
+        if self._stuck_timer is not None:
+            self._stuck_timer.cancel()
+            self.destroy_timer(self._stuck_timer)
+            self._stuck_timer = None
+
+    # ---------- 路径失效巡检(事前判据, 见 __init__ 里 path_check_* 参数注释) ----------
+    def _start_path_watchdog(self, ep):
+        """drive goal 被接受后起表, 周期性问 planner_server 当前这条路还通不通。
+        服务不可用时静默降级(只 warn 一次), 由卡住看门狗兜底 —— 宁可慢一点, 不要因为
+        少一个可选服务就让整条路线走不了。"""
+        self._cancel_path_timer()
+        if not self.path_check_enabled:
+            return
+        if not self._path_valid_client.service_is_ready():
+            if not self._path_valid_warned:
+                self._path_valid_warned = True
+                self.get_logger().warn(
+                    f'{self.is_path_valid_service} 不可用 -> 主动绕障重规划关闭, '
+                    f'退化为仅靠卡住看门狗(反应慢约 1.2s)')
+            return
+        self._path_timer = self.create_timer(
+            self.path_check_interval, lambda: self._path_check_tick(ep))
+
+    def _path_check_tick(self, ep):
+        if ep != self._epoch or self._goal_handle is None:
+            self._cancel_path_timer()
+            return
+        # 上一次请求还没回来就跳过本拍: 服务偶发变慢时不堆积请求
+        if self._path_check_busy or self._cur_path is None or not self._cur_path.poses:
+            return
+        pose = self.get_robot_pose()
+        if pose is None:
+            return
+        px, py, _ = pose
+        # drive 步骤存的是 ('drive', path, goal_xy, last_heading)
+        goal_xy = self._steps[self._step_idx][2]
+        if math.hypot(px - goal_xy[0], py - goal_xy[1]) < self.near_goal_skip_radius:
+            return  # 与卡住看门狗同一纪律: 末段交给 nav2 自己的到点判定收尾
+        ahead = self._path_ahead(px, py)
+        if len(ahead.poses) < 2:
+            return
+        self._path_check_busy = True
+        req = IsPathValid.Request()
+        req.path = ahead
+        self._path_valid_client.call_async(req).add_done_callback(
+            lambda f: self._on_path_valid(f, ep))
+
+    def _path_ahead(self, px, py):
+        """截出机器人**前方**那一段路径。
+        ⚠️ 必须截: IsPathValid 校验的是传进去的整条路径, 若把已走过的那段也带上, 人站到
+        车**身后**的路径上同样会判无效 -> 车为身后的障碍反复重规划, 永远走不到目标。"""
+        poses = self._cur_path.poses
+        best_i, best_d = 0, float('inf')
+        for i, ps in enumerate(poses):
+            d = math.hypot(ps.pose.position.x - px, ps.pose.position.y - py)
+            if d < best_d:
+                best_d, best_i = d, i
+        ahead = Path()
+        ahead.header = self._cur_path.header
+        ahead.poses = poses[best_i:]
+        return ahead
+
+    def _on_path_valid(self, fut, ep):
+        self._path_check_busy = False
+        if ep != self._epoch or self._goal_handle is None:
+            return
+        try:
+            valid = fut.result().is_valid
+        except Exception as e:  # 服务异常不该拖垮路线, 交给卡住看门狗
+            self.get_logger().warn(f'is_path_valid 调用失败: {e}')
+            return
+        if valid:
+            return
+        self.get_logger().warn(
+            f'[step {self._step_idx}] 路径被挡(is_path_valid=false) -> 立即重规划绕行')
+        # 先立旗再 cancel: on_goal_result 靠它区分"主动绕障"与"真失败"
+        self._proactive_replan = True
+        self._cancel_path_timer()
+        self._cancel_stuck_timer()
+        handle = self._goal_handle
+        if handle is not None:
+            handle.cancel_goal_async()
+
+    def _cancel_path_timer(self):
+        if self._path_timer is not None:
+            self._path_timer.cancel()
+            self.destroy_timer(self._path_timer)
+            self._path_timer = None
+        self._path_check_busy = False
+
     def advance_step(self, ep):
         if ep != self._epoch:
             return
@@ -742,9 +965,12 @@ class LaneNavigator(Node):
         self.get_logger().warn(f'Route to "{self._active_target}" failed: {why}')
         self.publish_status(self._active_target, False)
         self._cancel_retry_timer()
+        self._cancel_stuck_timer()
+        self._cancel_path_timer()
         self._cancel_cspin_timer()
         self.cmd_pub.publish(Twist())
         self._retry_count = 0
+        self._proactive_replan = False
         self._active_target = None
         self._goal_handle = None
         self._steps = []

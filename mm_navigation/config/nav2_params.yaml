@@ -144,11 +144,15 @@ controller_server:
     # 代价是终点附近 MPPI 会低速蠕动收尾(已接受), 故上面 progress_checker 时间窗放宽到 10s
     # 防蠕动被误判 ABORT. yaw 容差留 0.1 但终点朝向实际由 lane_navigator 的 cspin 闭环精对(~1°),
     # 这里只作 MPPI drive 段的退出条件. 更高精定位仍与 ArUco 伺服互补.
+    # 2026-08-12: 以下 stateful/xy/yaw 三项及本文件内多处 ⚠️ 标记参数, 原先靠真机跑起来后
+    # ros2 param set 动态调, 未落盘 —— 每次栈重启都要照 task_handoff 记忆里的清单重设一遍,
+    # 太容易漏。现按已验证实机效果(路径不贴墙/车不顿/到位2-3cm/速度0.4m/s)直接写死。
+    # stateful True->false: 到点后再被推离容差不再判"已完成", 避免误判成功后又被撞偏还不重纠.
     general_goal_checker:
-      stateful: True
+      stateful: false
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.10
-      yaw_goal_tolerance: 0.1
+      xy_goal_tolerance: 0.02
+      yaw_goal_tolerance: 0.03
     # MPPI 全向局部控制器: 保留横移避障, 软约束车头朝向路径方向(雷达 180° 需求)
     FollowPath:
       plugin: "nav2_mppi_controller::MPPIController"
@@ -178,8 +182,10 @@ controller_server:
       # (勘误: 早期注释写"门洞净距 0.200m"是错的 —— 那个 0.200m 窄口存在, 但不在任何
       #  必经路线上, 车道图走的是更宽的绕行。)
       # ⚠️ 必须与下方 velocity_smoother.max_velocity 同改, 只改一处另一处成瓶颈。
-      vx_max: 0.22
-      vx_min: -0.22
+      # 2026-08-12 实机验证后提到 0.4 (原 0.22 derivation 见上, 已被更宽的膨胀带配置取代,
+      # 走廊犹豫改靠 inflation_radius/cost_travel_multiplier 等下方同批调整解决, 不再靠限速兜底):
+      vx_max: 0.4
+      vx_min: -0.3
       # 0.22->0.05 (2026-08-11 用户实机要求"严格按车道走, 车头循车道方向"):
       # 全向底盘从 A 到 B 最省的运动是斜向平移, 故 vy 放开时 MPPI 必然抹掉车道图的
       # 正交折线与 0.3m 圆角、走弦斜插过去 —— 首次真机跑 pick1 实测就是这个形态。
@@ -187,8 +193,11 @@ controller_server:
       # ⚠️ 代价: 放弃 MPPI 的横移绕障 (原注释"遇障要快靠提前横移"不再成立), 遇障退化为
       #    减速/停下等全局重规划。这是用户明确接受的取舍。
       # ⚠️ 不改成 motion_model: DiffDrive —— 那会彻底禁掉 vy, 末端连几 cm 的横向修正都做不了。
-      vy_max: 0.05
-      wz_max: 1.0
+      # 2026-08-12 实机验证后提到 0.1 (原 0.05 太紧, 末端横向修正余量不够); wz_max 1.0->1.5
+      # 同批 (90° 弯转速余量, 见下方 TwirlingCritic 段 08-11 实测冻转记录, 那次是权重问题
+      # 不是限速问题, 但顺带把限速也放宽留够转弯裕度):
+      vy_max: 0.1
+      wz_max: 1.5
       iteration_count: 1
       prune_distance: 1.7
       transform_tolerance: 0.2
@@ -214,15 +223,17 @@ controller_server:
         enabled: true
         cost_power: 1
         cost_weight: 4.0
+      # 2026-08-12 实机验证后提到 20.0/1.5 (原 5.0/0.6 收尾推力不够, 终点前蠕动).
       GoalCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 5.0
-        threshold_to_consider: 0.6
+        cost_weight: 20.0
+        threshold_to_consider: 1.5
+      # 2026-08-12 实机验证后提到 15.0 (原 9.0):
       GoalAngleCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 9.0
+        cost_weight: 15.0
         threshold_to_consider: 0.8
       # repulsion_weight 决定"靠近软膨胀就减速躲"的强度: 太大 -> 沿墙正常行驶也被拽慢.
       # 0.2 -> 0.1 (2026-08-11, "让车敢过点"的第三处): 窄走廊里车**必然**全程贴着软膨胀,
@@ -249,16 +260,20 @@ controller_server:
       # consider_footprint 保持 false: 圆形口径下内切 == 外接 == R, 该开关管的
       #    "低于外接半径阈值就直接放过、否则做完整多边形检查"两级判定退化成一级,
       #    开了只是白烧算力(batch 2000 x 56 步 = 11.2 万点), 拿不到任何额外精度。
+      # 2026-08-12 实机验证后 repulsion_weight/critical_weight/inflation_radius 提到
+      # 0.03/12.0/0.45 (原 0.1/20.0/0.35): inflation_radius 必须与下方
+      # local_costmap.inflation_layer 及 global_costmap.inflation_layer **逐字一致**,
+      # 三处已同批改到 0.45 (见各自位置的对应改动).
       ObstaclesCritic:
         enabled: true
         cost_power: 1
-        repulsion_weight: 0.1
-        critical_weight: 20.0
+        repulsion_weight: 0.03
+        critical_weight: 12.0
         consider_footprint: false
         collision_cost: 10000.0
         collision_margin_distance: 0.02
         near_goal_distance: 0.5
-        inflation_radius: 0.35
+        inflation_radius: 0.45
         cost_scaling_factor: 8.0
       # 贴路径主力。18->28 且 offset_from_furthest 20->6 (2026-08-11):
       # offset_from_furthest 是"从轨迹最远端往回数多少个点才开始算对齐代价", nav2 默认 20
@@ -365,10 +380,12 @@ local_costmap:
       # local costmap 必须与 ObstaclesCritic 的 inflation_radius 保持一致。
       # 两者相等时意味着 MPPI 的距离反算与 costmap 实际代价分布吻合。
       # 理由见 ObstaclesCritic 注释: 0.22==robot_radius → 软衰减带宽为零 → 无梯度 → 犹豫。
+      # 2026-08-12 实机验证后再提到 0.45 (与 ObstaclesCritic/global_costmap 同批同改, 三处
+      # 逐字一致的纪律不变).
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 8.0
-        inflation_radius: 0.35
+        inflation_radius: 0.45
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -403,18 +420,45 @@ global_costmap:
       footprint_padding: 0.0
       resolution: 0.05
       track_unknown_space: true
-      # 2026-08-11 去掉 obstacle_layer (根治"越跑越堵"):
-      # 全局规划只信静态地图——真实新增障碍靠 local costmap + MPPI 现场绕, local 是
-      # rolling window 会自清, 不会累积。保留 obstacle_layer 的后果已实测:
-      # 南北通道净距 0.350m, 车经过时 AMCL 5~6cm 落点误差导致同一堵墙在连续帧里被打到
-      # 略微不同位置, marking 层层叠加把墙"加厚" -> 通道被标成 253 -> 规划失败、车被困。
-      # raytrace 清除只沿当前视线生效, 车一旦驶离就再也清不掉。
-      # lane_navigator 绕过 bt_navigator 直调 planner_server, Nav2 自带恢复行为不触发,
-      # 规划失败直接原地卡死。lane_navigator 侧已加每次 /go_to 前主动清 costmap 兜底。
-      plugins: ["static_layer", "inflation_layer"]
+      # ===== 2026-08-13 加回 obstacle_layer (34db89f 删掉它是"车不会绕障"的根因) =====
+      # 删掉后的实机症状: 人往车前一站, 车停在人面前不动, 永远规划不出绕行路径。
+      # 机制: lane_navigator 的绕障重规划调 planner_server, 而 planner **只读本图**。
+      # 本图里没有 obstacle_layer ⇒ 人根本不存在 ⇒ 每次重规划都返回同一条穿过人的路
+      # ⇒ 车再开过去、再被 local costmap 挡停, 死循环。lane_navigator.py 的重规划注释
+      # 写着"读 global_costmap 自动绕远", 那个前提在 08-11 之后就不成立了, 两边矛盾。
+      # (旁证: 用户实测 08-11 之前单开导航时, 人一站路径立刻绕开。)
+      #
+      # 当初删它的理由(南北通道净距 0.300m, AMCL 5~6cm 落点误差让同一堵墙在连续帧被打到
+      # 不同位置, marking 层层叠加把墙加厚 -> 通道标成 253 -> 规划失败车被困)是真的,
+      # 但那是"标记累积"问题, 不该用"全局对动态障碍全盲"来治 —— 代价是把绕障能力整个砍掉。
+      # 现在的抑制手段是让**清除跑赢标记**: raytrace_max_range 3.5 > obstacle_max_range 2.0,
+      # 即凡是 2.0m 内标下的点, 车走到 3.5m 视线内就会被射线清掉; 雷达滤波后仍有 310° 视野,
+      # 车身后方也在扫描范围内, 不存在"驶离就再也清不掉"。
+      # ⚠️ 若幻影墙再现(表现: 明明空的通道规划不出路), **只调 obstacle_max_range**
+      #    (2.0 往下压到 1.5), 别再整层删掉 —— 删掉就回到本次这个 bug。
+      # ⚠️ 故意不做"规划失败就清 global costmap": 清掉的同时人也没了, 规划器立刻给出一条
+      #    穿人的路, 车开过去再被局部挡停, 来回震荡, 比幻影墙更危险。
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan
+        scan:
+          # 必须是 /scan_filtered 而非 /scan: 原始扫描含车尾机械臂自遮挡, 会把臂建成
+          # 跟着车走的幻影墙(见 config/scan_filter.yaml)。
+          topic: /scan_filtered
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          # 清除范围 > 标记范围, 是本层不累积的唯一保证, 两者的大小关系别倒过来。
+          raytrace_max_range: 3.5
+          raytrace_min_range: 0.2
+          obstacle_max_range: 2.0
+          obstacle_min_range: 0.2
       # 给规划器用: 平缓梯度(cost_scaling 小 = 代价随距离衰减慢 = 高代价区更宽), 让低代价
       # "谷底"落在走廊中线 -> 规划器沿谷底走, 路径居中、离障碍远。
       # 0.45 -> 0.30 (2026-08-11, "让车敢过点"的另一半):
@@ -422,10 +466,17 @@ global_costmap:
       # 0.300m 的走廊(半宽 0.15)在 0.45 膨胀下没有一格是低代价, 规划器于是在"进走廊"与
       # "绕远路"之间反复横跳, 表现就是用户看到的"在路口犹豫半天"。
       # 0.30 让走廊中线重新露出可分辨的谷底, 同时仍 > robot_radius 0.22, 宽处照样居中。
+      # 2026-08-12 实机验证后再提到 0.45 (与 local_costmap/ObstaclesCritic 同批同改;
+      # 走廊犹豫改靠上面 cost_scaling_factor 1.0 的平缓梯度 + planner 的
+      # cost_travel_multiplier 一起兜, 不再单靠压小 inflation_radius 硬开洞).
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 1.0
-        inflation_radius: 0.30
+        # 1.0 -> 2.5 (2026-08-12 实机验证后写死, 此前只在 Nano 上 ros2 param set 过没落盘):
+        # 配合 inflation_radius 0.45 用更陡的梯度收窄高代价区宽度, 否则 0.45 半径下
+        # 1.0 的平缓梯度会让谷底在窄走廊里被抹平 (与上面 planner cost_travel_multiplier
+        # 15.0 是同一批"更宽膨胀带需要更强居中力"的配套调整)。
+        cost_scaling_factor: 2.5
+        inflation_radius: 0.45
       always_send_full_costmap: True
 
 map_server:
@@ -465,14 +516,17 @@ planner_server:
       max_planning_time: 2.0
       # 代价惩罚权重: 越大越愿意绕远走低代价区(=走廊中线), 越小越贴近最短路。
       # 2.0 是"明显居中但不至于为了躲膨胀绕大圈", 与下面全局膨胀 0.30/2.5 配套。
-      cost_travel_multiplier: 6.0
+      # 2026-08-12 实机验证后提到 15.0 (全局膨胀半径同批提到 0.45 更宽, 需要更强的居中
+      # 权重才能在更宽的软衰减带里仍然把路径推向中线, 否则贴着一侧走).
+      cost_travel_multiplier: 15.0
       # false: 末点朝向用我们传进去的目标 yaw 而不是"最后一段路径方向"。
       # 其实无所谓 —— lane_navigator 收到路径后会把**所有** pose 朝向按切线重写一遍。
       use_final_approach_orientation: false
       smoother:
         max_iterations: 1000
         w_smooth: 0.3          # 平滑权重: 抹掉栅格台阶
-        w_data: 0.1            # 贴原路径权重: 越小平滑器越能把路径推向低代价区(走廊中线)
+        # 0.1 -> 0.05 (2026-08-12 实机验证后写死, 此前只在 Nano 上 ros2 param set 过没落盘):
+        w_data: 0.05           # 贴原路径权重: 越小平滑器越能把路径推向低代价区(走廊中线)
         tolerance: 1.0e-10
 
 smoother_server:
@@ -524,18 +578,20 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    # 与 MPPI vx_max/vy_max 同为 0.22 (窄过道限速, 理由见上面 FollowPath 处注释)。
-    # 这一级是最后的硬限幅: MPPI 即使算出更大值也会被这里削掉, 故两处必须一致 ——
-    # 若这里留 0.36 而 MPPI 给 0.22, 限速生效但白留余量; 反之则 MPPI 的规划被截断,
-    # 实际轨迹与它预测的不符, 避障判断随之失准。
-    max_velocity: [0.22, 0.22, 1.0]
-    min_velocity: [-0.22, -0.22, -1.0]
+    # 必须与 MPPI vx_max/vx_min/vy_max/wz_max 逐字一致 (理由见上面 FollowPath 处注释) ——
+    # 这一级是最后的硬限幅, MPPI 即使算出更大值也会被这里削掉。
+    # 2026-08-12 随 FollowPath.vx_max/vx_min/vy_max/wz_max 同批提到 0.4/-0.3/0.1/1.5,
+    # 这里必须跟着改, 否则 MPPI 的新限速被这一级悄悄削回 0.22 (旧值), 白改一场。
+    max_velocity: [0.4, 0.1, 1.5]
+    min_velocity: [-0.3, -0.1, -1.5]
     # 2.5 -> 0.6 对齐固件真实斜坡 (config.h MAX_LIN_ACCEL=0.6, MAX_ANG_ACCEL=3.0)。
     # 原先上位机允许 2.5 而固件只执行 0.6, 差 4 倍: MPPI 按"车能 2.5 加速"预测轨迹,
     # 实车跟不上 -> 预测与现实不符, 避障时机随之失准。宽场地看不出, 0.255m 净距的
     # 窄过道里这个偏差就是撞墙。角向 2.0 -> 3.0 同理(固件角加速度其实更宽松)。
-    max_accel: [0.6, 0.6, 3.0]
-    max_decel: [-0.6, -0.6, -3.0]
+    # 2026-08-12 实机验证后再收到 [0.5,0.5,2.0]/[-0.5,-0.5,-2.0] (仍低于固件斜坡 0.6/3.0,
+    # 留了余量, 车不顿):
+    max_accel: [0.5, 0.5, 2.0]
+    max_decel: [-0.5, -0.5, -2.0]
     odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
@@ -550,4 +606,6 @@ waypoint_follower:
     wait_at_waypoint:
       plugin: "nav2_waypoint_follower::WaitAtWaypoint"
       enabled: True
-      waypoint_pause_duration: 200
+      # 200 -> 0 (2026-08-12 实机验证后写死): lane_navigator 不用 waypoint_follower 的
+      # 多点连续巡航, 每次只发单点 /go_to, 这个停顿从没派上用场, 留着也不影响, 清零对齐现状.
+      waypoint_pause_duration: 0
