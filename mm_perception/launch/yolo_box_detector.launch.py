@@ -38,7 +38,9 @@ def _setup(context, *args, **kwargs):
     #   留空 -> 不覆盖, 由 params_file(yaml) 的 model_path 决定, 但相对名需拼成 share 路径.
     #   默认 yaml 用 best_ncnn_model (NCNN 目录, ARM CPU 加速 ~4.8x).
     model = LaunchConfiguration('model').perform(context)
-    overrides = {}
+    overrides = {
+        'enabled': LaunchConfiguration('enabled').perform(context).lower() == 'true',
+    }
     if not model:
         # 读 yaml 里的 model_path (相对名), 拼成 share/models/ 下绝对路径
         import yaml as _yaml
@@ -98,5 +100,10 @@ def generate_launch_description():
             'with_jsp', default_value='true',
             description='true(默认)=with_rsp 时附带 joint_state_publisher 发默认关节值, '
                         '让含活动关节的臂链连通; 接真机(有真实 /joint_states)时设 false'),
+        DeclareLaunchArgument(
+            'enabled', default_value='true',
+            description='起时是否立即推理; false=起后静默待命, 靠 ~/enable(SetBool) 服务'
+                        '按需开关 (真机 bringup 传 false, mission_manager 只在抓取段打开, '
+                        '让出 CPU 给 Nano 上的 AMCL/Nav2)'),
         OpaqueFunction(function=_setup),
     ])

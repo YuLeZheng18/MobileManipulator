@@ -31,7 +31,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
 
 from std_msgs.msg import String
-from std_srvs.srv import Trigger
+from std_srvs.srv import Trigger, SetBool
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
@@ -99,6 +99,10 @@ class MissionManager(Node):
         # S0 底盘行进前摆臂 ready; grasp 任务识别前摆看货姿势 (ready+J1+90°, 供视觉看见)
         self.ready_cli = self.create_client(Trigger, '/grasp/ready', callback_group=cbg)
         self.look_cli = self.create_client(Trigger, '/grasp/look', callback_group=cbg)
+        # 2026-08-12: yolo 只在抓取段推理, 平时静默让出 CPU 给 Nano 上的 AMCL/Nav2
+        # (真机 bringup 里 yolo enabled:=false 起, 需靠这个服务按需开关).
+        self.yolo_enable_cli = self.create_client(
+            SetBool, '/yolo_box_detector/enable', callback_group=cbg)
 
         # 等 AMCL 收敛用: S0 发完 initialpose 后阻塞等 map->base_link 出现再进 S1
         self.tf_buffer = Buffer()
@@ -235,49 +239,65 @@ class MissionManager(Node):
     # /grasp/execute 收尾已经把臂停在 look 位 (2026-07-31 改), 下一轮直接就能识别.
     # 离开货架前才显式调 /grasp/ready —— 臂收回身前底盘才好走, 而这是"要不要走"这件事,
     # 只有状态机知道.
-    def stage_grasp_shelf(self):
-        if not self.stage_look():
-            return False
-        n = self._pickable_from(self._last_trigger_msg)
-        if n == 0:
-            self.get_logger().warn('S3a look 报可抓 0 个: 这个货架没有可抓的盒, 跳过抓取')
-            return self.leave_shelf()
-        self.get_logger().info(f'==== 本货架识别到 {n} 个可抓盒, 开始连抓 ====')
+    # 2026-08-12: yolo 平时静默 (真机 bringup enabled:=false 起), 只在本阶段临时打开,
+    # 离开货架 (无论正常收工还是提前 return) 都要关掉让出 CPU —— try/finally 保证覆盖
+    # 所有出口 (n==0 跳过 / TRAY_FULL / 抓空 / 单货架上限 / stage_detect 失败). 用
+    # fire-and-forget 服务调用不阻塞抓取流程, 服务不在(use_perception:=false)时告警跳过.
+    def set_yolo_enabled(self, enabled):
+        if not self.yolo_enable_cli.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn('/yolo_box_detector/enable 不可用 (use_perception:=false 时正常), 跳过')
+            return
+        req = SetBool.Request()
+        req.data = enabled
+        self.yolo_enable_cli.call_async(req)
 
-        picked = 0
-        for _ in range(self.max_picks_per_shelf):
-            if not self.stage_detect():
-                # 识别不到新鲜可达帧: 上一轮已抓空是最常见的原因 (execute 报的 pickable 已归 0
-                # 时压根不会走到这里, 但感知侧偶发丢帧也会落到这条). 抓过至少一个就算这个货架
-                # 做完了, 一个都没抓到才是真失败.
-                if picked > 0:
-                    self.get_logger().info(f'S3 没有更多可抓盒, 本货架收工 (已抓 {picked} 个)')
-                    break
+    def stage_grasp_shelf(self):
+        self.set_yolo_enabled(True)
+        try:
+            if not self.stage_look():
                 return False
-            ok, msg = self.stage_grasp_msg(self.grasp_cli, '/grasp/execute')
-            if not ok:
-                if 'TRAY_FULL' in msg:
+            n = self._pickable_from(self._last_trigger_msg)
+            if n == 0:
+                self.get_logger().warn('S3a look 报可抓 0 个: 这个货架没有可抓的盒, 跳过抓取')
+                return self.leave_shelf()
+            self.get_logger().info(f'==== 本货架识别到 {n} 个可抓盒, 开始连抓 ====')
+
+            picked = 0
+            for _ in range(self.max_picks_per_shelf):
+                if not self.stage_detect():
+                    # 识别不到新鲜可达帧: 上一轮已抓空是最常见的原因 (execute 报的 pickable 已归 0
+                    # 时压根不会走到这里, 但感知侧偶发丢帧也会落到这条). 抓过至少一个就算这个货架
+                    # 做完了, 一个都没抓到才是真失败.
+                    if picked > 0:
+                        self.get_logger().info(f'S3 没有更多可抓盒, 本货架收工 (已抓 {picked} 个)')
+                        break
+                    return False
+                ok, msg = self.stage_grasp_msg(self.grasp_cli, '/grasp/execute')
+                if not ok:
+                    if 'TRAY_FULL' in msg:
+                        self._tray_full = True
+                        self.get_logger().warn(
+                            f'S4 托盘已满, 停止本货架抓取 (已抓 {picked} 个), 去卸货: {msg}')
+                        break
+                    return False
+                picked += 1
+                left = self._pickable_from(msg)
+                free_slots = self._tray_free_from(msg)
+                self.get_logger().info(
+                    f'S4 本货架已抓 {picked} 个, 还剩 {left} 个可抓, 托盘余位 {free_slots}')
+                if left == 0:
+                    self.get_logger().info(f'本货架抓空 (共 {picked} 个)')
+                    break
+                if free_slots == 0:
                     self._tray_full = True
-                    self.get_logger().warn(
-                        f'S4 托盘已满, 停止本货架抓取 (已抓 {picked} 个), 去卸货: {msg}')
+                    self.get_logger().warn(f'托盘已无余位 (已抓 {picked} 个), 去卸货')
                     break
-                return False
-            picked += 1
-            left = self._pickable_from(msg)
-            free_slots = self._tray_free_from(msg)
-            self.get_logger().info(
-                f'S4 本货架已抓 {picked} 个, 还剩 {left} 个可抓, 托盘余位 {free_slots}')
-            if left == 0:
-                self.get_logger().info(f'本货架抓空 (共 {picked} 个)')
-                break
-            if free_slots == 0:
-                self._tray_full = True
-                self.get_logger().warn(f'托盘已无余位 (已抓 {picked} 个), 去卸货')
-                break
-        else:
-            self.get_logger().warn(
-                f'达到单货架抓取上限 {self.max_picks_per_shelf}, 停止本货架')
-        return self.leave_shelf()
+            else:
+                self.get_logger().warn(
+                    f'达到单货架抓取上限 {self.max_picks_per_shelf}, 停止本货架')
+            return self.leave_shelf()
+        finally:
+            self.set_yolo_enabled(False)
 
     # 离开货架前把臂摆回 ready: 底盘不拖着伸出的臂走. grasp_node 的 execute 收尾停在 look,
     # 那是为了下一轮少走一趟空行程, 收身这件事由状态机在真要走时才做.
@@ -327,12 +347,20 @@ class MissionManager(Node):
         # 清 grasp_node 的堆叠状态与残留 placed_* 碰撞体: 不清则上一轮记的"盒还在托盘上"
         # 会让本轮一开抓就 TRAY_FULL, 场景里的残留碰撞体还会挡住放置直下段.
         # 失败不中止: 首次启动本来就是干净的, reset 只是保险 (服务没起也不该拦住整条任务).
+        # ⚠️ 超时给够 120s/90s (原 15s/30s 太紧): grasp_node 内部 MoveGroupInterface
+        # 是懒连接, 真正建立连接发生在**第一次实际服务调用**里, 不是节点"就绪"日志那一刻。
+        # 冷启动时 Nav2/AMCL/相机同时在抢 Nano 的 CPU, 这次首连能拖到 100+ 秒 —— 2026-08-13
+        # 实测: grasp_node "就绪"在 t=146, 但内部日志 "MoveGroup planning_frame=..."
+        # (首次真连上) 迟到 t=258, reset_stack/ready 都排在这条连接后面, 在 t≈266 才完成,
+        # 而原 15s/30s 超时早在 t≈174/204 就已判超时中止整条任务 —— 车其实没坏, 只是慢。
+        # 这笔"首连税"每次 run_mission 只在 S0 交一次, 后续 stage_grasp_shelf 里同样的
+        # ready/look/execute 调用早已过了冷启动窗口, 故不需要跟着放大 (那些仍用各自原超时)。
         self.get_logger().info('S0 清抓取堆叠状态 (/grasp/reset_stack)')
-        if not self.call_trigger(self.reset_cli, '/grasp/reset_stack', 15.0):
+        if not self.call_trigger(self.reset_cli, '/grasp/reset_stack', 120.0):
             self.get_logger().warn('S0 reset_stack 失败, 继续 (若上一轮有残留可能影响放置)')
         # 底盘行进前先把机械臂摆回 ready 位 (臂收身前, 底盘不拖着伸出的臂走)
         self.get_logger().info('S0 定位就绪, 底盘行进前摆臂回 ready')
-        if not self.call_trigger(self.ready_cli, '/grasp/ready', 30.0):
+        if not self.call_trigger(self.ready_cli, '/grasp/ready', 90.0):
             self.get_logger().error('S0 机械臂回 ready 失败, 任务中止')
             return False
         return True

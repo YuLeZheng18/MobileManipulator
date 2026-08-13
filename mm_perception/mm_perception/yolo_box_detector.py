@@ -53,6 +53,7 @@ import cv2
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped, Pose, PoseArray, PointStamped
 from std_msgs.msg import Int32, Float32
+from std_srvs.srv import SetBool
 import tf2_ros
 
 # 必须在 import ultralytics 前注入 torchvision 兜底 (Jetson 系统 GPU torch 无匹配
@@ -173,6 +174,12 @@ class YoloBoxDetector(Node):
         # ---- 可视化 ----
         self.declare_parameter('show_window', True)
 
+        # 2026-08-12 抓取段专用启停开关: 默认起就推理(True), 真机 bringup 传 false 起时静默,
+        # 由 mission_manager 在进入抓取阶段前用 SetBool 服务 (~/enable) 打开、离开时关闭,
+        # 让 yolo 平时不占 CPU (Nano 上与 AMCL/Nav2 抢算力导致定位漂). 用服务不用参数:
+        # rclpy 参数只在 __init__ 读一次进 self.enabled, ros2 param set 不会自动生效.
+        self.declare_parameter('enabled', True)
+
         gp = self.get_parameter
         self.conf = float(gp('conf').value)
         self.imgsz = int(gp('imgsz').value)
@@ -201,6 +208,7 @@ class YoloBoxDetector(Node):
         self.cam_track_timeout = float(gp('cam_track_timeout').value)
         self.cam_track_max_jump = float(gp('cam_track_max_jump').value)
         self.tf_wait_sec = float(gp('tf_wait_sec').value)
+        self.enabled = bool(gp('enabled').value)
         self._last_cam_pt = None        # 上一帧发出的 p_cam (numpy 3,), 多候选跟踪锚点
         self._last_cam_ns = 0
 
@@ -260,6 +268,12 @@ class YoloBoxDetector(Node):
                 CameraInfo, gp('depth_info_topic').value, self._on_depth_info, info_qos,
                 callback_group=img_group)
 
+        # 启停开关服务 (独立回调组, 不进 img_group): 就算一帧推理正卡在 0.25s 里,
+        # 切换请求也不用排在它后面 —— mission_manager 关闭时要立刻生效, 不能等一帧.
+        self._enable_srv = self.create_service(
+            SetBool, '~/enable', self._on_enable,
+            callback_group=MutuallyExclusiveCallbackGroup())
+
         # ---- TF ----
         # TransformListener 内部把 /tf /tf_static 订阅放进自己的 ReentrantCallbackGroup,
         # 配合 main() 的 MultiThreadedExecutor, /tf 就能与彩色回调并发处理 —— 这是时刻对齐
@@ -308,12 +322,14 @@ class YoloBoxDetector(Node):
     def _on_info(self, msg: CameraInfo):
         K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
         if np.all(np.isfinite(K)) and K[0, 0] > 0:
+            # ⚠️ 别在回调里 destroy_subscription(self) —— 本节点是 MultiThreadedExecutor
+            # (图像回调与 TF 监听分处不同线程, 时刻对齐要求见 yaml 注释), 另一线程可能正在
+            # 为下一轮 spin 构建 wait set 并遍历到这个订阅的 QoSEvent, 自毁会与之竞态,
+            # 炸 rclpy InvalidHandle (2026-08-12 实测复现)。内参回调开销很小, 留着常驻不重订即可。
+            if self._camera_matrix is None:
+                self.get_logger().info('已获取相机内参 (fx=%.1f fy=%.1f).'
+                                       % (K[0, 0], K[1, 1]))
             self._camera_matrix = K
-            self.get_logger().info('已获取相机内参 (fx=%.1f fy=%.1f).'
-                                   % (K[0, 0], K[1, 1]))
-            if self._info_sub is not None:      # 内参有效即退订
-                self.destroy_subscription(self._info_sub)
-                self._info_sub = None
         elif self.use_fallback_on_nan and self._camera_matrix is None:
             cx = (msg.width or 1280) / 2.0
             cy = (msg.height or 720) / 2.0
@@ -328,12 +344,12 @@ class YoloBoxDetector(Node):
     def _on_depth_info(self, msg: CameraInfo):
         K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
         if np.all(np.isfinite(K)) and K[0, 0] > 0:
+            # 同上 _on_info: 不在回调里自毁订阅, 避免与 MultiThreadedExecutor 另一线程的
+            # wait set 构建竞态 (InvalidHandle)。
+            if self._depth_matrix is None:
+                self.get_logger().info('已获取深度内参 (fx=%.1f fy=%.1f cx=%.1f cy=%.1f).'
+                                       % (K[0, 0], K[1, 1], K[0, 2], K[1, 2]))
             self._depth_matrix = K
-            self.get_logger().info('已获取深度内参 (fx=%.1f fy=%.1f cx=%.1f cy=%.1f).'
-                                   % (K[0, 0], K[1, 1], K[0, 2], K[1, 2]))
-            if self._depth_info_sub is not None:    # 有效即退订
-                self.destroy_subscription(self._depth_info_sub)
-                self._depth_info_sub = None
 
     def _on_depth(self, msg: Image):
         try:
@@ -363,7 +379,18 @@ class YoloBoxDetector(Node):
         v = Kc[1, 1] * yn + Kc[1, 2]
         return int(round(u)), int(round(v))
 
+    def _on_enable(self, req, resp):
+        self.enabled = bool(req.data)
+        self.get_logger().info(
+            'yolo_box_detector %s' % ('已启用(进入抓取段)' if self.enabled
+                                      else '已静默(让出算力, 只在抓取段推理)'))
+        resp.success = True
+        resp.message = 'enabled=%s' % self.enabled
+        return resp
+
     def _on_color(self, msg: Image):
+        if not self.enabled:
+            return
         if self._camera_matrix is None:
             self._warn_throttle('等待 camera_info, 暂不处理...')
             return

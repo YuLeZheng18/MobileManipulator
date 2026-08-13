@@ -273,8 +273,18 @@ def generate_launch_description():
     #   with_rsp:=false —— 整车 TF 由阶段1 的臂 RSP 发, 别再起第二个 rsp 抢 /robot_description。
     # ArUco: aruco_localizer -> /tf 广播 aruco_<id> (parent base_link), 吃 cam_a 转正流。
     # 两者都吃相机, 故需连带 use_cameras:=true。
+    # ⚠️ 必须显式传 params_file:='' (同 scan_filter 的坑, 见上方 scan_filter 注释):
+    # 本 launch 顶层已声明 params_file(默认 nav2_params.yaml, 给 Nav2 用), 若不覆盖,
+    # yolo_box_detector.launch.py 自己的 DeclareLaunchArgument('params_file','') 会被
+    # 上层已设的值"穿透"继承, 导致 yolo 节点吃到 nav2_params.yaml 而不是
+    # yolo_box_detector.yaml —— model_task 拿不到 'obb', YOLO 退化成 detect 分支解析
+    # OBB 结果, 类别索引越界直接崩 (KeyError, 2026-08-12 实测复现)。
+    # enabled:='false' — 起时先静默, 不推理不占 CPU; mission_manager 只在进入抓取阶段
+    # 前用 ~/enable(SetBool) 打开, 离开时关掉, 让出算力给 Nano 上的 AMCL/Nav2
+    # (2026-08-12: 定位漂移根因排查到 nav2_container+yolo 抢 CPU, 见交接记忆).
     yolo = _include('mm_perception', 'yolo_box_detector.launch.py',
-                    launch_arguments={'with_rsp': 'false'}.items(),
+                    launch_arguments={'with_rsp': 'false', 'params_file': '',
+                                       'enabled': 'false'}.items(),
                     condition=IfCondition(use_perception))
     aruco_localizer = Node(
         package='mm_perception', executable='aruco_localizer', name='aruco_localizer',
