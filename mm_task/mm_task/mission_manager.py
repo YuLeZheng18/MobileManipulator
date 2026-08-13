@@ -352,16 +352,21 @@ class MissionManager(Node):
         # 清 grasp_node 的堆叠状态与残留 placed_* 碰撞体: 不清则上一轮记的"盒还在托盘上"
         # 会让本轮一开抓就 TRAY_FULL, 场景里的残留碰撞体还会挡住放置直下段.
         # 失败不中止: 首次启动本来就是干净的, reset 只是保险 (服务没起也不该拦住整条任务).
-        # ⚠️ 超时给够 120s/90s (原 15s/30s 太紧): grasp_node 内部 MoveGroupInterface
-        # 是懒连接, 真正建立连接发生在**第一次实际服务调用**里, 不是节点"就绪"日志那一刻。
-        # 冷启动时 Nav2/AMCL/相机同时在抢 Nano 的 CPU, 这次首连能拖到 100+ 秒 —— 2026-08-13
-        # 实测: grasp_node "就绪"在 t=146, 但内部日志 "MoveGroup planning_frame=..."
-        # (首次真连上) 迟到 t=258, reset_stack/ready 都排在这条连接后面, 在 t≈266 才完成,
-        # 而原 15s/30s 超时早在 t≈174/204 就已判超时中止整条任务 —— 车其实没坏, 只是慢。
-        # 这笔"首连税"每次 run_mission 只在 S0 交一次, 后续 stage_grasp_shelf 里同样的
+        # ⚠️ 超时给够 240s/90s (原 15s/30s 太紧, 后放到 120s 仍险): 这是一笔"首连税",
+        # 不是 reset_stack 自己慢 —— 2026-08-13 读日志定案, 机制如下:
+        #   grasp_node 的 main() 里 initMoveGroup() 排在 executor.spin() **之前**
+        #   (grasp_node.cpp:3041 vs :3043), 而 MoveGroupInterface 构造函数会无限等
+        #   move_group 的 action server。服务却是在 GraspNode 构造函数里就注册好的(更早),
+        #   于是形成"服务名字在、但没人 spin 去处理"的形态: wait_for_service 立刻通过,
+        #   请求发出去就在队列里躺着, 等 spin 起来才一口气处理完 (那一下只花 30ms)。
+        #   等的是 move_group 自己启动里的一个洞: 打完 "Listening to planning_scene_world"
+        #   到 "Loading planning pipeline 'ompl'" 之间零日志静默 119s (Nano 4 核上 dlopen
+        #   kinematics/OMPL + 给整车 URDF 建碰撞结构, 同时 nav2_container/RealSense/两路
+        #   USB 相机在抢 CPU)。实测 reset_stack 用掉 115s, 原 120s 只剩 5s 余量。
+        # 这笔税每次 run_mission 只在 S0 交一次, 后续 stage_grasp_shelf 里同样的
         # ready/look/execute 调用早已过了冷启动窗口, 故不需要跟着放大 (那些仍用各自原超时)。
         self.get_logger().info('S0 清抓取堆叠状态 (/grasp/reset_stack)')
-        if not self.call_trigger(self.reset_cli, '/grasp/reset_stack', 120.0):
+        if not self.call_trigger(self.reset_cli, '/grasp/reset_stack', 240.0):
             self.get_logger().warn('S0 reset_stack 失败, 继续 (若上一轮有残留可能影响放置)')
         # 底盘行进前先把机械臂摆回 ready 位 (臂收身前, 底盘不拖着伸出的臂走)
         self.get_logger().info('S0 定位就绪, 底盘行进前摆臂回 ready')
