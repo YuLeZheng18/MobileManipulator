@@ -11,16 +11,17 @@
   t=10  Nav2 (无 RViz, 自带 velocity_smoother 限幅) + twist_mux 仲裁 + lane_navigator
   t=14  MoveIt move_group
   t=18  moveit_servo + grasp_node
-  t=20  mm_perception 真感知 (yolo_box_detector + aruco_localizer; 默认关)
-  t=25  mm_task 状态机 (默认关; run_mission:=true 自动跑 S0->S5)
+  t=20  mm_perception 真感知 (yolo_box_detector + aruco_localizer; 默认开)
+  t=25  mm_task 状态机 (默认开, 自动跑 S0->S5, 吃 mission_real.yaml)
 
-抓取相关的开关连带关系 (三者要一起开, 少一个抓取跑不了):
+整机自主 = 裸起一条, 不再需要任何参数 (2026-08-13 起默认值就是整机自主):
+  ros2 launch mm_bringup real_bringup.launch.py
+
+抓取相关的三个开关是连带的 (少一个抓取就跑不了, 故默认一起开):
   use_cameras:=true      -> 车体两路 USB + 手眼 D435i (align_depth 必开, 在 cameras.launch.py 里)
   use_perception:=true   -> yolo_box_detector 吃 D435i 出 /perception/object_pose 等
-  run_mission:=true      -> mm_task 串起 S0-S5 (真机记得配 mission_file:=.../mission_real.yaml)
-整机自主一条命令:
-  ros2 launch mm_bringup real_bringup.launch.py use_cameras:=true use_perception:=true \
-      run_mission:=true mission_file:=<mm_task share>/config/mission_real.yaml
+  run_mission:=true      -> mm_task 串起 S0-S5 (mission_file 默认已指到 mission_real.yaml)
+要只起栈不动车: run_mission:=false; 建图: use_nav2:=false use_perception:=false run_mission:=false
 
 ⚠️ 运行前置 (目标机 Nano 上现装/现 source, 不进本 colcon ws):
   - micro_ros_agent: 需先 `source ~/microros_ws/install/setup.bash` 再起本 launch,
@@ -63,13 +64,22 @@ def generate_launch_description():
     nav2_params = LaunchConfiguration('params_file')
 
     mm_nav_share = get_package_share_directory('mm_navigation')
+    mm_task_share = get_package_share_directory('mm_task')
     nav2_bringup_share = get_package_share_directory('nav2_bringup')
 
     args = [
         DeclareLaunchArgument('use_sim_time', default_value='false',
                               description='实机无 /clock, 恒 false'),
-        DeclareLaunchArgument('run_mission', default_value='false',
-                              description='true=起栈后自动跑 mm_task 状态机; false=只起栈'),
+        # 2026-08-13: run_mission/use_cameras/use_perception 三个默认由 false 翻成 true。
+        # 理由: 真机自主跑一轮必须三个全开, 少一个就是**静默空跑** —— 裸起一条
+        # real_bringup 会让相机和 yolo 都不起, 4 个货架全报"可抓 0 个", 车照常走完全程
+        # 空手回来 (2026-08-13 实测白跑一轮)。本 launch 是 real-only 的整机入口, 默认值
+        # 就该是"整机自主"这个主用法; 建图/只起栈等场景显式关掉即可:
+        #   建图:   use_nav2:=false use_perception:=false run_mission:=false
+        #   只起栈: run_mission:=false
+        DeclareLaunchArgument('run_mission', default_value='true',
+                              description='true(默认)=起栈后自动跑 mm_task 状态机; '
+                                          'false=只起栈不动车'),
         DeclareLaunchArgument('use_lidar', default_value='true',
                               description='起 rplidar_ros (思岚 A3 -> /scan, frame laser_link) '
                                           '+ scan_filter (-> /scan_filtered)'),
@@ -77,15 +87,17 @@ def generate_launch_description():
                               description='起 Nav2 全套 (map_server/AMCL/controller/...). '
                                           '建图时必须 false: AMCL 与 slam_toolbox 会抢发 '
                                           'map->odom TF, 两个源同时发 TF 树跳变, 地图必乱'),
-        DeclareLaunchArgument('use_cameras', default_value='false',
+        DeclareLaunchArgument('use_cameras', default_value='true',
                               description='起相机驱动: 车体两路 USB (cam_a/cam_b) + 手眼 D435i'),
-        DeclareLaunchArgument('use_perception', default_value='false',
+        DeclareLaunchArgument('use_perception', default_value='true',
                               description='起 mm_perception 真感知 (yolo_box_detector + aruco); '
                                           '需连带 use_cameras:=true'),
+        # 默认直接指到 mission_real.yaml: 本 launch 是 real-only, 留空会回退到包内
+        # mission.yaml(仿真值), 真机跑那份是错的。仿真侧走 sim_bringup, 不受影响。
         DeclareLaunchArgument(
-            'mission_file', default_value='',
-            description='mm_task 任务列表 (留空用包内 mission.yaml=仿真值; '
-                        '真机传 config/mission_real.yaml)'),
+            'mission_file',
+            default_value=os.path.join(mm_task_share, 'config', 'mission_real.yaml'),
+            description='mm_task 任务列表 (默认真机 mission_real.yaml: 4 pick + 两盘卸货 + 回 home)'),
         DeclareLaunchArgument('agent_serial_dev', default_value='/dev/ttyACM0',
                               description='micro-ROS 代理串口 (ESP32-S3 native USB)'),
         DeclareLaunchArgument('lidar_serial_port', default_value='/dev/rplidar',

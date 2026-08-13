@@ -243,9 +243,14 @@ class MissionManager(Node):
     # 离开货架 (无论正常收工还是提前 return) 都要关掉让出 CPU —— try/finally 保证覆盖
     # 所有出口 (n==0 跳过 / TRAY_FULL / 抓空 / 单货架上限 / stage_detect 失败). 用
     # fire-and-forget 服务调用不阻塞抓取流程, 服务不在(use_perception:=false)时告警跳过.
+    # 2026-08-13: 超时 2.0 -> 15.0。yolo 起时要加载 NCNN 模型, Nano 上比 mission_manager
+    # 就绪晚得多, 2s 等不到。且原提示写"use_perception:=false 时正常"会把真故障伪装成正常
+    # —— 实测因此白跑一整轮 (4 次 look 全报可抓 0 个, 空手回来才发现 yolo 根本没起)。
     def set_yolo_enabled(self, enabled):
-        if not self.yolo_enable_cli.wait_for_service(timeout_sec=2.0):
-            self.get_logger().warn('/yolo_box_detector/enable 不可用 (use_perception:=false 时正常), 跳过')
+        if not self.yolo_enable_cli.wait_for_service(timeout_sec=15.0):
+            self.get_logger().error(
+                '/yolo_box_detector/enable 等不到! yolo 未起或未就绪 -> 本轮识别不到任何盒子, '
+                '会空手跑完。检查 real_bringup 是否带 use_cameras:=true use_perception:=true')
             return
         req = SetBool.Request()
         req.data = enabled

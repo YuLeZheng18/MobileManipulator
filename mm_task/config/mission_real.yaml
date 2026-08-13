@@ -1,7 +1,9 @@
 # ===== mm_task 真机任务列表 (仿真用 mission.yaml) =====
-# 用法: ros2 launch mm_task mission.launch.py use_sim_time:=false \
+# 用法: 正常就一条 `ros2 launch mm_bringup real_bringup.launch.py` —— 2026-08-13 起
+#   real_bringup 的 mission_file 默认就指到本文件, run_mission/use_cameras/use_perception
+#   也默认全开, 不用再传任何参数。
+# 单独只跑状态机 (栈已经在跑时): ros2 launch mm_task mission.launch.py use_sim_time:=false \
 #         mission_file:=$(ros2 pkg prefix mm_task)/share/mm_task/config/mission_real.yaml
-# (real_bringup/dev_bringup 的 run_mission:=true 走默认 mission.yaml, 真机需显式传本文件.)
 #
 # 字段含义与 mission.yaml 相同, 这里只记与仿真不同的取值理由.
 #
@@ -33,3 +35,4 @@ tasks:
   - { nav_target: pick4, action: grasp }
   - { nav_target: place1, action: unload, tray: 1 }     # 卸 1 号(左)托盘, 永远先卸左
   - { nav_target: place2, action: unload, tray: 0 }     # 卸 0 号(右)托盘
+  - { nav_target: home, action: none }                  # 收工回建图起点(胶带处), 下轮开机即就位
