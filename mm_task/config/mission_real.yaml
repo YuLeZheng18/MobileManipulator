@@ -17,10 +17,14 @@
 #   ②相机系精修闭环 ③下插 + 放托盘, 单盒几十秒), 而 unload_tray 一次调用要卸完整盘 2 个盒.
 #   超时是按"一次服务调用"算的, 不是整条任务.
 # nav 从 120 抬到 180: 真机 MPPI 遇障要绕, 比仿真慢.
+# nav 再从 180 抬到 300 (2026-08-13): place1->place2 那趟车楔在墙角, lane_navigator 的慢恢复
+#   连报 75 次 replan failed 空转 150s, 第 76 次成功并在 12s 后真到了 place2 —— 但 180s 超时
+#   已经先判了任务失败。⚠️ 这条**单独改是掩盖不是修**: 真修在 lane_navigator 的"清 costmap
+#   + 倒车脱困"(同日新增), 这里只是给那套恢复留出施展时间, 免得脱困刚见效就被掐表。
 
 initial_pose: { x: 0.0, y: 0.0, yaw: 0.0 }   # = 建图起点(地面 L 形胶带), 也是 lane_graph 的 home
 
-timeouts: { localize: 30.0, nav: 180.0, detect: 15.0, grasp: 240.0 }
+timeouts: { localize: 30.0, nav: 300.0, detect: 15.0, grasp: 240.0 }
 
 max_picks_per_shelf: 4
 

@@ -94,6 +94,24 @@ class LaneNavigator(Node):
         # 快重试用尽后进入"慢恢复"的重试周期(秒): 不放弃路线, 持续重规划等障碍移开
         # -> 障碍没了就自动接着往目标走(不永久死停). 设大一点避免堵死时狂刷规划.
         self.declare_parameter('recovery_retry_delay', 2.0)
+        # ===== 倒车脱困(2026-08-13 新增) =====
+        # 慢恢复原先**只重新要路径, 从不动车** —— 车楔在墙角时这是个死循环: robot_radius
+        # 划出的内切圆压在致命格上, SmacPlanner2D 判起点被占, 同一个注定失败的问题问一万遍
+        # 也没用。2026-08-13 实测 place1->place2 那趟连报 75 次 replan failed (status 6),
+        # 空转 150s, 第 76 次才因 costmap 自己衰减而突然成功 —— 但已比 S1 的 180s 超时晚
+        # 12s, 整条任务序列被判失败。既然唯一失败模式是"起点被占", 唯一解法就是把起点挪出去。
+        # 每 escape_after_recovery 次慢恢复插一次"清 costmap + 倒车", 倒完接着走原恢复循环。
+        # 倒 -x 是因为那是**车刚开过来的方向**, 按构造必然是空的 (车后方被机械臂挡住,
+        # scan_filter 把那一扇滤掉了, 所以这里不可能有观测依据, 只能靠"来路是空的"这个先验)。
+        #
+        # ⚠️ 为什么不用 Nav2 现成的 BackUp action (behavior_server 就在栈里跑着):
+        # nav2_behaviors 每拍都拿 CostmapTopicCollisionChecker::isCollisionFree 校验前方位姿,
+        # 而它的判据是 footprint 代价 >= 253 (INSCRIBED_INFLATED_OBSTACLE) 即算碰撞 ——
+        # 车已经楔住时 footprint 本来就压着 253 的格子, BackUp 会当场 abort ("Collision
+        # Ahead")。**恰恰在最需要它的场景下它拒绝动**, 故这里自己开环倒。
+        self.declare_parameter('escape_after_recovery', 3)  # 每几次慢恢复插一次脱困; 0=关
+        self.declare_parameter('escape_dist', 0.20)         # 倒车距离(米)
+        self.declare_parameter('escape_speed', 0.08)        # 倒车速度(米/秒, 取正值)
         # ===== 卡住看门狗(2026-08-13 新增) =====
         # 背景: drive 段受阻只能靠 FollowPath 的 action 结果不是 SUCCEEDED 来触发上面的
         # 快重试/慢恢复, 而这个结果由 controller_server 的 progress_checker 判定 ——
@@ -151,6 +169,12 @@ class LaneNavigator(Node):
             'drive_retry_delay').get_parameter_value().double_value
         self.recovery_retry_delay = self.get_parameter(
             'recovery_retry_delay').get_parameter_value().double_value
+        self.escape_after_recovery = self.get_parameter(
+            'escape_after_recovery').get_parameter_value().integer_value
+        self.escape_dist = self.get_parameter(
+            'escape_dist').get_parameter_value().double_value
+        self.escape_speed = self.get_parameter(
+            'escape_speed').get_parameter_value().double_value
         self.stuck_check_interval = self.get_parameter(
             'stuck_check_interval').get_parameter_value().double_value
         self.stuck_window = self.get_parameter(
@@ -212,6 +236,10 @@ class LaneNavigator(Node):
         self._planner_client = ActionClient(self, ComputePathToPose, 'compute_path_to_pose')
         self._clear_costmap_client = self.create_client(
             ClearEntireCostmap, '/global_costmap/clear_entirely_global_costmap')
+        # local 那张也要能清: 慢恢复里堵路的常常是 local costmap 上一帧没衰减掉的残影
+        # (2026-08-13 那趟第 76 次重规划突然成功, 就是等它自己衰减等来的)。
+        self._clear_local_costmap_client = self.create_client(
+            ClearEntireCostmap, '/local_costmap/clear_entirely_local_costmap')
         # 路径失效巡检: planner_server 拿当前 global_costmap 校验整条路径是否仍无碰撞
         self._path_valid_client = self.create_client(
             IsPathValid, self.is_path_valid_service)
@@ -234,6 +262,9 @@ class LaneNavigator(Node):
         self._retry_timer = None
         #   _cspin_timer   : 终点闭环对齐控制定时器(20Hz); 抢占/失败/完成时取消并停车
         self._cspin_timer = None
+        #   _escape_timer  : 倒车脱困控制定时器(20Hz); 与 _cspin_timer 同一套停车约定
+        self._escape_timer = None
+        self._escape_deadline = None
         #   _stuck_timer/_stuck_hist/_drive_start_t : 卡住看门狗(见上面参数注释),
         #   只在 drive 步骤在途时跑, goal 结束/抢占时随其他定时器一起清.
         self._stuck_timer = None
@@ -502,6 +533,9 @@ class LaneNavigator(Node):
         if self._cspin_timer is not None:  # 抢占在途闭环对齐: 停转并清定时器
             self._cancel_cspin_timer()
             self.cmd_pub.publish(Twist())
+        if self._escape_timer is not None:  # 抢占在途倒车: 同上, 停车再清
+            self._cancel_escape_timer()
+            self.cmd_pub.publish(Twist())
         self._retry_count = 0
         self._active_target = target
         self._steps = []       # 规划还没回来, 保持空; run_next_step 此刻不能调
@@ -519,8 +553,7 @@ class LaneNavigator(Node):
         goal.use_start = False        # 起点用机器人当前 TF
         goal.planner_id = 'GridBased'
         self.get_logger().info(f'Planning route -> "{target}" ({tx:.2f},{ty:.2f})')
-        if self._clear_costmap_client.service_is_ready():
-            self._clear_costmap_client.call_async(ClearEntireCostmap.Request())
+        self._clear_costmaps()
         fut = self._planner_client.send_goal_async(goal)
         fut.add_done_callback(lambda f: self._on_route_plan_accept(f, ep, target))
 
@@ -750,16 +783,64 @@ class LaneNavigator(Node):
                 f'{self._retry_count}/{self.drive_max_retries} in {delay:.1f}s')
         else:
             delay = self.recovery_retry_delay
+            rec_n = self._retry_count - self.drive_max_retries
             if self._retry_count == self.drive_max_retries + 1:
                 self.get_logger().warn(
                     f'step {self._step_idx} {why}: fast retries exhausted -> recovery '
                     f'(replan every {delay:.0f}s until clear, route kept alive)')
             else:
                 self.get_logger().warn(
-                    f'step {self._step_idx} still blocked ({why}), recovery replan '
-                    f'#{self._retry_count - self.drive_max_retries}')
+                    f'step {self._step_idx} still blocked ({why}), recovery replan #{rec_n}')
+            # 恢复到第 N 的整数倍次仍不通 -> 不再干问, 清 costmap + 倒车把起点挪出致命区
+            if self.escape_after_recovery > 0 and rec_n % self.escape_after_recovery == 0:
+                self._cancel_retry_timer()
+                self._retry_timer = self.create_timer(
+                    delay, lambda: self._escape_then_retry(ep))
+                return
         self._cancel_retry_timer()
         self._retry_timer = self.create_timer(delay, lambda: self._retry_drive(ep))
+
+    def _clear_costmaps(self):
+        """两张 costmap 一起清. 服务没就绪就跳过(不阻塞恢复循环)."""
+        for cli in (self._clear_costmap_client, self._clear_local_costmap_client):
+            if cli.service_is_ready():
+                cli.call_async(ClearEntireCostmap.Request())
+
+    def _escape_then_retry(self, ep):
+        """脱困: 清两张 costmap, 再开环倒 escape_dist 米, 倒完接回原恢复循环重规划.
+        开环(按时长积分)而不是闭环查位移: 楔住时轮子可能在打滑, 位移判据会永远不满足;
+        倒车本身有 escape_dist/escape_speed 的硬时长上限, 不会跑飞."""
+        self._cancel_retry_timer()
+        if ep != self._epoch:
+            return
+        self._clear_costmaps()
+        dur = self.escape_dist / max(self.escape_speed, 1e-3)
+        self.get_logger().warn(
+            f'[step {self._step_idx}] 恢复无进展 -> 清 costmap + 倒车 '
+            f'{self.escape_dist:.2f}m 脱困 ({dur:.1f}s)')
+        self._escape_deadline = self.get_clock().now() + Duration(seconds=dur)
+        self._cancel_escape_timer()
+        self._escape_timer = self.create_timer(0.05, lambda: self._escape_tick(ep))
+
+    def _escape_tick(self, ep):
+        if ep != self._epoch:
+            self._cancel_escape_timer()
+            self.cmd_pub.publish(Twist())
+            return
+        if self.get_clock().now() >= self._escape_deadline:
+            self._cancel_escape_timer()
+            self.cmd_pub.publish(Twist())
+            self._retry_drive(ep)
+            return
+        cmd = Twist()
+        cmd.linear.x = -abs(self.escape_speed)
+        self.cmd_pub.publish(cmd)
+
+    def _cancel_escape_timer(self):
+        if self._escape_timer is not None:
+            self._escape_timer.cancel()
+            self.destroy_timer(self._escape_timer)
+            self._escape_timer = None
 
     def _retry_drive(self, ep):
         # create_timer 是周期定时器, 进回调先取消防重复触发
@@ -779,6 +860,10 @@ class LaneNavigator(Node):
         goal.goal = self._make_pose(p1[0], p1[1], heading)
         goal.use_start = False  # 用机器人当前 TF 作起点
         goal.planner_id = 'GridBased'
+        # 每次绕障重规划前清一次 costmap (原先只有首次规划 request_route_plan 里清)。
+        # 慢恢复里堵路的常是残影 —— 人走过留下的痕迹、AMCL 跳变把墙抹粗一圈、机械臂/货箱
+        # 的回波。不清就只能干等它自己衰减 (2026-08-13 那趟等了 150s)。
+        self._clear_costmaps()
         self.get_logger().info(
             f'[step {self._step_idx}] Replan around obstacle '
             f'-> ({p1[0]:.2f},{p1[1]:.2f})')
@@ -968,6 +1053,7 @@ class LaneNavigator(Node):
         self._cancel_stuck_timer()
         self._cancel_path_timer()
         self._cancel_cspin_timer()
+        self._cancel_escape_timer()
         self.cmd_pub.publish(Twist())
         self._retry_count = 0
         self._proactive_replan = False

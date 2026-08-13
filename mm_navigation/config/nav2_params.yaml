@@ -41,6 +41,21 @@ amcl:
     z_rand: 0.5
     z_short: 0.05
     scan_topic: /scan_filtered
+    # ===== 自初始化位姿 (2026-08-13 新增) =====
+    # 不给这两行时 AMCL 起来是"未初始化"态: 不发 map->odom TF -> map 帧不存在 ->
+    # global_costmap 的 activate() 死等 map->base_link -> nav2 的 lifecycle 永远停在
+    # "Activating planner_server"。原先靠 mission_manager 的 S0 发 /initialpose 解开
+    # (mission_manager.py:334, 值取自 mission_real.yaml 的 initial_pose), 但"人工 go"
+    # 四步里状态机是**最后**起的, 中间那段就得人在 RViz 点一次 2D Pose Estimate 才能
+    # 让 nav2 激活完 —— 这两行就是为了免掉那一步。
+    # 值必须与 mm_task/config/mission_real.yaml 的 initial_pose 一致 (都是建图起点,
+    # 地面 L 形胶带处 = map 原点)。S0 之后照样会补发同一个值, 幂等不冲突;
+    # RViz 的 2D Pose Estimate 也仍随时可覆盖。
+    # ⚠️ 代价: "开机前把车推回胶带"从软约定变成硬前提 —— 车不在那儿时 AMCL 会**静默**地
+    # 从错位姿起算, 而不是像以前那样卡在 activating 等人。起栈后先看一眼 RViz 里雷达点
+    # 与地图墙线对不对得上。
+    set_initial_pose: true
+    initial_pose: {x: 0.0, y: 0.0, z: 0.0, yaw: 0.0}
 
 bt_navigator:
   ros__parameters:
