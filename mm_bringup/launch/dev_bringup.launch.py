@@ -1,12 +1,14 @@
 """本机 (笔记本) bringup — 分布式调试的"上半场" (架构 §7.4)。
 
 只跑给人看的可视化 + 粗粒度调度, 不碰任何硬件、不产任何 TF:
-  - RViz (MoveIt 视图: 机器人模型 + 规划场景 + TF; 可手动加 Nav2 的 map/costmap/path 显示)。
-  - 三路相机监视 (默认开): xdg-open 拉浏览器开 web/monitor.html, 见下。
+  - RViz (**导航视图** nav_real.rviz: 地图 + 双 costmap + 车模 + TF + 滤后雷达 + 全局/车道
+    规划 + AMCL 位姿, 带 SetInitialPose/SetGoal 工具)。臂的规划场景不在这份里, 要看单独起
+    `ros2 launch arm_moveit_config moveit_rviz.launch.py`。
+  - 三路相机监视 (默认开): xdg-open 拉浏览器开 Orin 的 monitor.html, 见下。
   - mm_task 状态机 (默认关): 发 /go_to /initialpose、调 /grasp/* 服务, 都是小消息粗指令。
 
 ⚠️⚠️ 相机画面走浏览器, **不经 ROS** (2026-08-04 定案, 这是折腾一整晚的结论)。
-  Nano 上 teleop_stack 起了 web_video_server (HTTP/MJPEG); 本机这边 view_cameras:=true
+  Nano 上 monitor.launch.py 起了 web_video_server (HTTP/MJPEG); 本机这边 view_cameras:=true
   (默认) 只是 xdg-open 一个本地 html, 页面里三个 <img> 直连 Orin。
   三路地址/分辨率/invert 全写在 mm_bringup/web/monitor.html 里, 连同实测数据和
   "为什么不能把分辨率调大"的判据 —— 要改画面就改那个 html, 不用碰本文件。
@@ -56,6 +58,7 @@ from launch.actions import (DeclareLaunchArgument, ExecuteProcess,
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
 
 
 def generate_launch_description():
@@ -77,13 +80,24 @@ def generate_launch_description():
                                           '只是开个网页, 不起任何 ROS 图像节点'),
     ]
 
-    # RViz: MoveIt 视图 (use_sim_time=false 实机时钟)。robot_state_publisher 在 Nano,
-    # 本机 RViz 只消费 /robot_description + /tf + 规划场景, 不另起 rsp。
-    rviz = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(get_package_share_directory('arm_moveit_config'),
-                         'launch', 'moveit_rviz.launch.py')),
-        launch_arguments={'use_sim_time': 'false'}.items(),
+    # RViz: **导航视图** (mm_navigation/config/rviz/nav_real.rviz)。
+    # 2026-08-13 从 MoveIt 视图 (arm_moveit_config/launch/moveit_rviz.launch.py) 换过来:
+    # 本机这一侧看的是"车在地图哪、往哪走", 不是臂的规划场景 —— 真机跑整轮时要盯的是
+    # AMCL 位姿收敛 / 全局与车道规划 / 双 costmap / 滤后雷达, 这些 moveit.rviz 里一个都没有。
+    # 这份 config 含: Map + GlobalCostmap + LocalCostmap + RobotModel + TF + ScanFiltered
+    #   + Footprint + GlobalPlan + LaneGraph + LanePlan + AmclPose, Fixed Frame=map,
+    #   并带 SetInitialPose / SetGoal 工具 (手动补一次初始位姿或派个点时直接用).
+    # 不再 include moveit_rviz.launch.py 而是直接起 rviz2, 是因为那条 include 的全部价值
+    # 在于喂 robot_description_semantic / kinematics 给 MotionPlanning 插件, 而这份 config
+    # 没有 MotionPlanning; RobotModel 的 Description Source 是 Topic, 直接吃 Nano 发的
+    # /robot_description 就够。robot_state_publisher 在 Nano, 本机不另起 rsp。
+    # 要看臂的规划场景就单独起: ros2 launch arm_moveit_config moveit_rviz.launch.py
+    rviz = Node(
+        package='rviz2', executable='rviz2', name='rviz2', output='screen',
+        arguments=['-d', os.path.join(
+            get_package_share_directory('mm_navigation'),
+            'config', 'rviz', 'nav_real.rviz')],
+        parameters=[{'use_sim_time': False}],
     )
 
     # 三路监视画面: 只是拉浏览器开一个本地 HTML, **不起任何 ROS 图像节点** (本文件头的铁律)。
@@ -92,7 +106,7 @@ def generate_launch_description():
     # 延后 3s 是为了让 RViz 先抢到前台, 否则浏览器窗口会盖在它上面。
     # 失败不阻塞 (|| true): 没装浏览器/无 DISPLAY 时不该因此起不来 RViz。
     # ⚠️ 开的是 **Orin 上的 http 地址**, 不是本机 file:// —— 页面由 Orin 的
-    # teleop_stack.launch.py 里那个 http.server(8081) 发出, 本仓库只存源文件。
+    # monitor.launch.py 里那个 http.server(8081) 发出, 本仓库只存源文件。
     # 为什么不能开本地文件 (2026-08-04 实测): 本机 `text/html` 的 mimetype 关联被代理
     # 客户端 mihomo-party.desktop 抢走了 (`xdg-mime query default text/html` 可复现),
     # 于是 xdg-open 任何本地 html 都拉起那个代理软件而**永远不进浏览器** —— 退出码照样
@@ -104,8 +118,11 @@ def generate_launch_description():
     # 而且代理软件下次更新可能再抢回去。
     # 主机名用 ubuntu.local: Orin 的 wlP1p1s0 是 DHCP, IP 会变; 两机都跑 avahi-daemon。
     #
-    # ⚠️ **先探测 8081 通了再开浏览器, 不能起来就开** —— 页面在 Orin 上, 而它是
-    # teleop_stack 的 **t=18s** 才起的。2026-08-04 踩过: 本机固定等 3s 就 xdg-open,
+    # ⚠️ **先探测 8081 通了再开浏览器, 不能起来就开** —— 页面在 Orin 上, 由那边的
+    # monitor.launch.py 发出, 而 **real_bringup 不会带起它** (2026-08-13 拆分, 理由见
+    # monitor.launch.py 的 docstring: 冷启动那两分钟三路编码会跟 move_group 抢核)。
+    # 所以这个轮询等的是"人有没有在 Orin 上另起一条 monitor"。
+    # 2026-08-04 踩过: 本机固定等 3s 就 xdg-open,
     # 浏览器拿到"无法连接"错误页, 看着像"launch 没跳转", 其实命令执行成功了
     # (判据: launch 日志里 `[bash-N]: process has finished cleanly`)。
     # 现在改成轮询探测, 两机**任意顺序**起都行, 本机会自己等 Orin 就绪。
@@ -119,8 +136,8 @@ def generate_launch_description():
         f'  fi; '
         f'  sleep 2; '
         f'done; '
-        f'echo "等了 2 分钟 Orin 的 8081 还没通 —— teleop_stack 起了吗? '
-        f'手动开: {MONITOR_URL}" >&2'
+        f'echo "等了 2 分钟 Orin 的 8081 还没通 —— Orin 上起 monitor 了吗? '
+        f'(ros2 launch mm_bringup monitor.launch.py) 手动开: {MONITOR_URL}" >&2'
     )
     cams = TimerAction(period=3.0, actions=[
         ExecuteProcess(
