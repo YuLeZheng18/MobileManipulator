@@ -18,16 +18,33 @@
 | `mm_bringup` | 聚合启动(仿真/实机)、mock 感知节点 |
 | `mm_navigation` | Nav2 配置与车道导航节点 |
 | `mm_perception` | 视觉感知:ArUco 定位、YOLO 盒子识别、手眼标定 |
-| `mm_task` | 任务状态机、MoveIt 抓取节点(grasp_node) |
+| `mm_grasp` | MoveIt 抓取节点(`grasp_node`)、抓放位姿标定(`config/place.yaml`)、手柄示教 |
+| `mm_task` | 任务状态机(`mission_manager`),串联导航/感知/抓取全流程 |
 | `arm` | 机械臂 MoveIt 配置(`arm_moveit_config`)与 CAN 控制桥(`arm_control`) |
 | `pymoveit2` | 第三方 MoveIt 2 Python 封装(vendored,BSD) |
+| `third_party` | 第三方驱动(vendored):`rplidar_ros` |
 | `firmware` | ESP32-S3 底盘固件(micro-ROS / PlatformIO) |
-| `docs` | 接口契约与系统架构设计文档 |
+| `docs` | 接口契约、系统架构文档与排障脚本(`docs/scripts/`) |
 
 ## 文档
 
 - [`docs/interface_contract.md`](docs/interface_contract.md) — 模块间接口契约(话题/TF/坐标系)
 - [`docs/system_architecture.md`](docs/system_architecture.md) — 系统架构、数据流、启动顺序、状态机
+- [`docs/pcan_setup.md`](docs/pcan_setup.md) — 机械臂 CAN(PEAK)驱动安装
+- [`docs/real_machine_test_log.md`](docs/real_machine_test_log.md) — 实机测试记录
+
+### 排障脚本 `docs/scripts/`
+
+真机调试期沉淀的独立诊断工具,每个脚本头部写明了判读方法:
+
+| 脚本 | 用途 |
+|---|---|
+| `wheel_diag.py` | 间歇性单轮失效定位(纯平移时四轮速度代数和应为 0,失衡即报假 wz) |
+| `odom_check.py` | 里程计标定复核(EKF `/odom` 与轮式 `/wheel_odom` 位移/航向累计对比) |
+| `imu_probe.py` | IMU yaw 异常分型(持续零偏漂移 vs 离散跳变) |
+| `scan_probe.py` | 雷达扫描角度/盲区实测 |
+| `lane_graph_check.py` | 路点净距校验(EDT 精确距离变换,判断节点能否原地自转) |
+| `lane_graph_viz.py` | 路点表可视化 |
 
 ## 环境
 
