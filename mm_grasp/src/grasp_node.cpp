@@ -2261,10 +2261,36 @@ private:
   }
 
   // 释放盒子后从规划场景摘除: detach + 移除, 以免残留碰撞体挡住回 ready 的规划.
+  // ⚠️ 必须同步。detach 之后盒子从"附着体(touch_links 豁免)"变成**普通世界障碍**, 而它此刻
+  // 还贴着吸盘 -> 场景里残留一帧, 起始状态就是碰撞态, 紧接着的笛卡尔退开直接覆盖 0%。
+  // 2026-08-14 实测: detach 与"覆盖不足 0%"只隔 55ms, 与 hideTrayBoxes 处记的 54ms 案例同型。
   void detachBox()
   {
-    move_group_->detachObject(kCarriedBoxId);
-    psi_->removeCollisionObjects({kCarriedBoxId});
+    bool synced = false;
+    if (apply_scene_cli_->wait_for_service(2s)) {
+      moveit_msgs::msg::AttachedCollisionObject aco;
+      aco.link_name = ee_link_;
+      aco.object.id = kCarriedBoxId;
+      aco.object.operation = moveit_msgs::msg::CollisionObject::REMOVE;
+
+      moveit_msgs::msg::CollisionObject co;
+      co.id = kCarriedBoxId;
+      co.header.frame_id = base_frame_;
+      co.operation = co.REMOVE;
+
+      auto req = std::make_shared<moveit_msgs::srv::ApplyPlanningScene::Request>();
+      req->scene.is_diff = true;
+      req->scene.robot_state.is_diff = true;
+      req->scene.robot_state.attached_collision_objects.push_back(aco);
+      req->scene.world.collision_objects.push_back(co);
+      auto fut = apply_scene_cli_->async_send_request(req);
+      if (fut.wait_for(5s) == std::future_status::ready) synced = fut.get()->success;
+    }
+    if (!synced) {
+      RCLCPP_WARN(logger_, "detach 同步失败, 退回异步路径 —— 后续笛卡尔可能报覆盖不足");
+      move_group_->detachObject(kCarriedBoxId);
+      psi_->removeCollisionObjects({kCarriedBoxId});
+    }
     // 盒离手, 锁存的类别随之失效: 不清则下一轮 placeCategory() 会拿上一个盒的类别去
     // 定托盘, 而下一个盒未必同类。detachBox 是盒离手的唯一出口(放置/卸货/dry_run 都过它),
     // 清在这里不会漏。
