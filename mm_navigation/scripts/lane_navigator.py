@@ -64,8 +64,12 @@ class LaneNavigator(Node):
         super().__init__('lane_navigator')
 
         self.declare_parameter('lane_graph', '')
-        # 到达判定半径(米): 触发的目标若已在此范围内, 直接忽略
-        self.declare_parameter('arrival_tolerance', 0.2)
+        # 到达判定半径(米): 触发的目标若已在此范围内, 直接忽略(不规划不走, 直接报成功)
+        # 2026-08-14: 0.2 -> 0.05。0.2 等于"差 19cm 也算到了", 是条精度黑洞: 一旦命中, 车一步
+        # 不走、末段 cspin 也不做, 朝向都不对就报 True。防重复触发靠下面 _active_target 判重
+        # (on_go_to 里), 从来不靠这个半径, 所以收紧不影响防抖。
+        # 留 5cm 而非 0: 完全为零时"重发同一目标"会让已到位的车再规划一次并原地折腾。
+        self.declare_parameter('arrival_tolerance', 0.05)
         # 起步朝向对齐(闭环 cspin): 误差 < start_yaw_tol 跳过(残差极小, 交 MPPI 边走边顺, 看不出);
         # 否则用 P 闭环转到首段切线并"沉降"(连续几拍零速且落容差内)再放行 drive -> 保证转停稳了才跑,
         # 杜绝"没转完就跑/起步划弧甩头". 旧版用开环 Nav2 Spin: 报完成时车身还在泄角速度, 同一拍 MPPI
