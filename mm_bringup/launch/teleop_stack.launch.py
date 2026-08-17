@@ -9,12 +9,12 @@
   t=18  yolo_box_detector (要相机出图 + TF 树含 Link_30->base_link, 后者靠真实 joint_states)
   t=22  joy_node + teleop_twist_joy + joy_arm_teleop (最后起: 手柄一通就能动臂)
 
-⚠️ **不含 Nav2, 也不含 twist_mux**。D4.2 之后 joy_arm_teleop 输出改到 /cmd_vel_manual
-   交 mux 仲裁, 本 launch 没起 mux -> **单跑它手柄推了车不动** (指令停在
-   /cmd_vel_manual 无人转发, 不报错, 只是车不响应)。两条正确用法:
-     - 遥控 + 导航共存(推荐): real_bringup.launch.py use_nav2:=true —— 它带起 mux,
-       按住 R1 手柄接管(优先级 100 > 导航 10), 松开 0.5s 自动交还导航;
-     - 只要遥控无臂状态机: teleop.launch.py (直发 /cmd_vel, 不经仲裁)。
+⚠️ **含 twist_mux** (D4.2 之后 joy_arm_teleop 输出走 /cmd_vel_manual 交 mux 仲裁,
+   本 launch 已起 mux 转发到 /cmd_vel)。按住 R1 手柄接管(优先级 100), 松开 0.5s 自动归零。
+   mux 的 nav(/cmd_vel_nav_out)/spin(/cmd_vel_spin) 两路本 launch 不起, 无输入时
+   mux 持续发零, 等价于"空闲态底盘静止", 无副作用。
+   与 Nav2 共存仍推荐 real_bringup.launch.py use_nav2:=true (那一份带起 controller_server
+   往 /cmd_vel_nav_out 发, 路径规划+遥控可同时工作)。
 
 ⚠️ 前置 (本 launch 管不了的):
   - `source ~/microros_ws/install/setup.bash` —— micro_ros_agent 在独立 ws, 不 source
@@ -128,6 +128,19 @@ def generate_launch_description():
     yolo = _include('mm_perception', 'yolo_box_detector.launch.py',
                     condition=IfCondition(use_perception))
 
+    # ===== t=20: twist_mux (在 teleop 之前起, 确保 /cmd_vel_manual 已被订阅) =====
+    # joy_arm_teleop (teleop_full.launch.py) 输出 remap 到 /cmd_vel_manual, 必须经 mux
+    # 才到 /cmd_vel —— 没起 mux 时手柄按 R1 推杆车不动 (指令停在 /cmd_vel_manual 无人
+    # 转发, 不报错)。mux 的输出话题名固定为 cmd_vel_out (源码硬编码), 必须 remap 到
+    # /cmd_vel。yaml 见 mm_navigation/config/twist_mux.yaml。
+    mm_nav_share = get_package_share_directory('mm_navigation')
+    twist_mux = Node(
+        package='twist_mux', executable='twist_mux', name='twist_mux', output='screen',
+        parameters=[os.path.join(mm_nav_share, 'config', 'twist_mux.yaml'),
+                    {'use_sim_time': False}],
+        remappings=[('cmd_vel_out', '/cmd_vel')],
+    )
+
     # ===== t=22: 手柄遥控 (最后起) =====
     # 放最后是有意的: joy_arm_teleop 一起来手柄就能动臂, 此前各段必须已就位.
     teleop = _include('mm_bringup', 'teleop_full.launch.py', {
@@ -153,5 +166,6 @@ def generate_launch_description():
         TimerAction(period=6.0, actions=[move_group]),
         TimerAction(period=12.0, actions=[grasp]),
         TimerAction(period=18.0, actions=[yolo, monitor]),
+        TimerAction(period=20.0, actions=[twist_mux]),
         TimerAction(period=22.0, actions=[teleop, rviz]),
     ])
